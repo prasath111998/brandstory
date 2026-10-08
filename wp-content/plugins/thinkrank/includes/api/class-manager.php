@@ -1,0 +1,2805 @@
+<?php
+
+/**
+ * API Manager Class
+ *
+ * Handles REST API endpoints registration and management
+ *
+ * @package ThinkRank\API
+ * @since 1.0.0
+ */
+
+declare(strict_types=1);
+
+namespace ThinkRank\API;
+
+// Import endpoint classes
+use ThinkRank\API\Site_Identity_Endpoint;
+use ThinkRank\API\Performance_Endpoint;
+use ThinkRank\API\Schema_Endpoint;
+use ThinkRank\API\Settings_Management_Endpoint;
+use ThinkRank\API\Content_Brief_Endpoint;
+use ThinkRank\API\Social_Media_Endpoint;
+use ThinkRank\API\Sitemap_Endpoint;
+use ThinkRank\API\SEO_Analytics_Endpoint;
+use ThinkRank\API\Usage_Analytics_Endpoint;
+use ThinkRank\API\Integrations_Endpoint;
+use ThinkRank\API\Social_Platforms_Endpoint;
+use ThinkRank\API\LLMs_Txt_Endpoint;
+use ThinkRank\API\Global_SEO_Endpoint;
+use ThinkRank\API\Image_SEO_Endpoint;
+use ThinkRank\API\External_Links_Endpoint;
+use ThinkRank\API\Instant_Indexing_Endpoint;
+use ThinkRank\API\Pillar_Content_Endpoint;
+use ThinkRank\API\Global_Robot_Meta_Endpoint;
+use ThinkRank\API\Author_Archives_Endpoint;
+use ThinkRank\API\Email_Report_Endpoint;
+use ThinkRank\Admin\Importers\Import_Controller;
+use ThinkRank\Admin\Importers\Export_Controller;
+use ThinkRank\API\Setup_Wizard_Endpoint;
+
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * API Manager Class
+ *
+ * Single Responsibility: Manage REST API endpoints
+ *
+ * @since 1.0.0
+ */
+class Manager {
+
+    /**
+     * API namespace
+     *
+     * @var string
+     */
+    private const NAMESPACE = 'thinkrank/v1';
+
+    /**
+     * Maximum accepted length (characters) for AI `content` payloads. Enforced
+     * at the REST boundary so oversized input can't drive expensive prompt
+     * building, cache hashing, and AI requests/retries. Mirrors the frontend's
+     * 5000-character trim.
+     */
+    private const AI_CONTENT_MAX_LENGTH = 5000;
+
+    /**
+     * Ceilings for the OpenAI-compatible endpoint's model listing (#721).
+     *
+     * The endpoint is a host the site owner named, not one we trust: a
+     * misconfigured or hostile server can answer `GET /models` with an
+     * unbounded body or a catalogue of thousands. Both are bounded here — the
+     * field this feeds is a suggestion list, and the UI shows the first few.
+     */
+    private const MAX_MODELS_RESPONSE_BYTES = 262144; // 256 KB.
+    private const MAX_ENDPOINT_MODELS = 200;
+
+    /**
+     * Sanitize and hard-cap an AI `content` request parameter.
+     *
+     * Used as the `sanitize_callback` for every AI endpoint's `content` arg so
+     * the server enforces its own maximum regardless of what a direct REST
+     * caller sends.
+     *
+     * @param mixed $value Raw request value.
+     * @return string Sanitized content, truncated to AI_CONTENT_MAX_LENGTH.
+     */
+    public function sanitize_ai_content($value): string {
+        return mb_substr(sanitize_textarea_field((string) $value), 0, self::AI_CONTENT_MAX_LENGTH);
+    }
+
+    /**
+     * Initialize API manager
+     *
+     * @return void
+     */
+    public function init(): void {
+        add_action('rest_api_init', [$this, 'register_routes']);
+        add_action('rest_api_init', [$this, 'register_endpoint_classes']);
+
+        // Analytics cache invalidation must listen on every request, not only
+        // REST ones — AI usage is logged from cron and WP-CLI too, and a
+        // listener bound on rest_api_init never hears those.
+        Usage_Analytics_Endpoint::boot_cache_invalidation();
+
+        // Make declared schema constraints mean something. Applied once over
+        // the whole namespace rather than at 70-odd call sites, because that is
+        // exactly how the enum on /setup-wizard/migrated-plugins and the one on
+        // /seo-analytics/dashboard came to be inert while the route next door
+        // was fine (#394). Late priority so it sees every route, including any
+        // an add-on registered.
+        add_filter('rest_endpoints', [Rest_Args::class, 'enforce_namespace'], 99);
+    }
+
+    /**
+     * Register REST API routes
+     *
+     * @return void
+     */
+    public function register_routes(): void {
+        // Core endpoints
+        register_rest_route(self::NAMESPACE, '/capabilities', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_capabilities'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/plugin-info', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_plugin_info'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/system-status', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_system_status'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+        ]);
+
+        // Integration health check for MCP/Abilities clients (see #188). This
+        // route is intentionally gated only by the admin capability, NOT by the
+        // `enable_mcp` toggle, so it stays reachable as a diagnostic even when
+        // the MCP server is off or abilities failed to register.
+        register_rest_route(self::NAMESPACE, '/connection-status', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_connection_status'],
+            'permission_callback' => [$this, 'check_admin_permissions'],
+        ]);
+
+        // Settings endpoints
+        register_rest_route(self::NAMESPACE, '/settings', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_settings'],
+            'permission_callback' => [$this, 'check_settings_permissions'],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/settings', [
+            'methods' => 'POST',
+            'callback' => [$this, 'save_settings'],
+            'permission_callback' => [$this, 'check_settings_permissions'],
+            'args' => [
+                'ai_provider' => [
+                    'type' => 'string',
+                    // Includes '' (Settings::AI_PROVIDER_NONE) so a client can
+                    // clear the selection, not just switch between providers.
+                    'enum' => \ThinkRank\Core\Settings::selectable_ai_providers(),
+                    'sanitize_callback' => 'sanitize_key',
+                    // The enum is inert without this: has_valid_params() skips
+                    // an arg entirely unless a validate_callback is set (#394).
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'openai_api_key' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'openai_model' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'claude_api_key' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'claude_model' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'gemini_api_key' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'gemini_model' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'openrouter_api_key' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'openrouter_model' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                // OpenAI-compatible endpoint (#721). The URL is not run through
+                // esc_url_raw here: Settings::sanitize_setting() validates it
+                // (scheme, SSRF guard) and save_settings() reports the reason
+                // when it refuses, which a sanitize callback cannot do.
+                'openai_compatible_base_url' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'openai_compatible_api_key' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'openai_compatible_model' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'openai_compatible_timeout' => [
+                    'type' => 'integer',
+                    'minimum' => 10,
+                    'maximum' => 600,
+                    'sanitize_callback' => 'absint',
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'openai_compatible_supports_images' => [
+                    'type' => 'boolean',
+                ],
+                'openai_compatible_json_mode' => [
+                    'type' => 'boolean',
+                ],
+                'openai_compatible_price_per_million' => [
+                    'type' => 'number',
+                    'minimum' => 0,
+                ],
+                'max_tokens' => [
+                    'type' => 'integer',
+                    'minimum' => 1,
+                    'maximum' => 32000,
+                    'sanitize_callback' => 'absint',
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'temperature' => [
+                    'type' => 'number',
+                    'minimum' => 0,
+                    'maximum' => 2,
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'cache_duration' => [
+                    'type' => 'integer',
+                    'minimum' => 0,
+                    'sanitize_callback' => 'absint',
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'keep_data_on_uninstall' => [
+                    'type' => 'boolean',
+                    'sanitize_callback' => 'rest_sanitize_boolean',
+                ],
+                'enable_mcp' => [
+                    'type' => 'boolean',
+                    'sanitize_callback' => 'rest_sanitize_boolean',
+                ],
+                'enable_migration_tools' => [
+                    'type' => 'boolean',
+                    'sanitize_callback' => 'rest_sanitize_boolean',
+                ],
+                'enable_import_export' => [
+                    'type' => 'boolean',
+                    'sanitize_callback' => 'rest_sanitize_boolean',
+                ],
+                // AI spend controls (#448). `max_requests_per_minute` is not
+                // new, but it was never reachable: registered since 1.0 and
+                // rendered nowhere, so no user could see the throttle that was
+                // limiting them.
+                'max_requests_per_minute' => [
+                    'type' => 'integer',
+                    'minimum' => 0,
+                    'sanitize_callback' => 'absint',
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'ai_daily_request_limit' => [
+                    'type' => 'integer',
+                    'minimum' => 0,
+                    'sanitize_callback' => 'absint',
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'ai_paused' => [
+                    'type' => 'boolean',
+                    'sanitize_callback' => 'rest_sanitize_boolean',
+                ],
+            ],
+        ]);
+
+
+
+        // Metadata endpoints
+        register_rest_route(self::NAMESPACE, '/metadata/(?P<post_id>\d+)', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_metadata'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'post_id' => [
+                    'type' => 'integer',
+                    'required' => true,
+                ],
+            ],
+        ]);
+
+        // AI endpoints
+        register_rest_route(self::NAMESPACE, '/ai/generate-metadata', [
+            'methods' => 'POST',
+            'callback' => [$this, 'generate_ai_metadata'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'target_keyword' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'content_type' => [
+                    'type' => 'string',
+                    'default' => 'blog_post',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'tone' => [
+                    'type' => 'string',
+                    'default' => 'professional',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'post_id' => [
+                    'type' => 'integer',
+                    'required' => false,
+                    'default' => 0,
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/improve-title', [
+            'methods' => 'POST',
+            'callback' => [$this, 'improve_ai_title'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'current_title' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'target_keyword' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'content_type' => [
+                    'type' => 'string',
+                    'default' => 'blog_post',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'tone' => [
+                    'type' => 'string',
+                    'default' => 'professional',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'suggestion' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'post_id' => [
+                    'type' => 'integer',
+                    'required' => false,
+                    'default' => 0,
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/improve-meta-description', [
+            'methods' => 'POST',
+            'callback' => [$this, 'improve_ai_meta_description'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'current_description' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_textarea_field',
+                ],
+                'target_keyword' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'content_type' => [
+                    'type' => 'string',
+                    'default' => 'blog_post',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'tone' => [
+                    'type' => 'string',
+                    'default' => 'professional',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'suggestion' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'post_id' => [
+                    'type' => 'integer',
+                    'required' => false,
+                    'default' => 0,
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/explain-suggestion', [
+            'methods' => 'POST',
+            'callback' => [$this, 'explain_ai_suggestion'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'suggestion' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'title' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'target_keyword' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'content_type' => [
+                    'type' => 'string',
+                    'default' => 'blog_post',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/add-dofollow-link', [
+            'methods' => 'POST',
+            'callback' => [$this, 'add_ai_dofollow_link'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'target_keyword' => [
+                    'type' => 'string',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'content_type' => [
+                    'type' => 'string',
+                    'default' => 'blog_post',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/add-keyword-paragraph', [
+            'methods' => 'POST',
+            'callback' => [$this, 'add_ai_keyword_paragraph'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'target_keyword' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'content_type' => [
+                    'type' => 'string',
+                    'default' => 'blog_post',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'tone' => [
+                    'type' => 'string',
+                    'default' => 'professional',
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'word_count' => [
+                    'type' => 'integer',
+                    'default' => 0,
+                    'sanitize_callback' => 'absint',
+                ],
+                'keyword_count' => [
+                    'type' => 'integer',
+                    'default' => 0,
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/schema/enable-for-post', [
+            'methods' => 'POST',
+            'callback' => [$this, 'enable_schema_for_post'],
+            'permission_callback' => [$this, 'check_schema_permissions'],
+            'args' => [
+                'post_id' => [
+                    'type' => 'integer',
+                    'required' => true,
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/test-connection', [
+            'methods' => 'POST',
+            'callback' => [$this, 'test_ai_connection'],
+            'permission_callback' => [$this, 'check_ai_tools_permissions'],
+            'args' => [
+                'api_key' => [
+                    'type' => 'string',
+                    'required' => false,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'provider' => [
+                    'type' => 'string',
+                    'required' => false,
+                    'default' => 'openai',
+                    'sanitize_callback' => 'sanitize_key',
+                ],
+                'model' => [
+                    'type' => 'string',
+                    'required' => false,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                // Only used by the openai_compatible provider: the URL on
+                // screen, so an unsaved endpoint can be tested before saving.
+                'base_url' => [
+                    'type' => 'string',
+                    'required' => false,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                // Only used by the openai_compatible provider: the JSON mode
+                // toggle on screen. Omitted, the saved setting decides.
+                'json_mode' => [
+                    'type' => 'boolean',
+                    'required' => false,
+                ],
+            ],
+        ]);
+
+        // Ask an OpenAI-compatible endpoint what models it serves. Ollama, LM
+        // Studio and vLLM all answer GET {base}/models; a gateway that does not
+        // simply leaves the user typing the id by hand (#721).
+        register_rest_route(self::NAMESPACE, '/ai/models', [
+            'methods' => 'POST',
+            'callback' => [$this, 'list_endpoint_models'],
+            'permission_callback' => [$this, 'check_ai_tools_permissions'],
+            'args' => [
+                'base_url' => [
+                    'type' => 'string',
+                    'required' => false,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+                'api_key' => [
+                    'type' => 'string',
+                    'required' => false,
+                    'sanitize_callback' => 'sanitize_text_field',
+                ],
+            ],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/providers', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_ai_providers'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+        ]);
+
+        // Register content brief endpoints
+        $content_brief_endpoint = new \ThinkRank\API\Content_Brief_Endpoint();
+        $content_brief_endpoint->register_routes();
+
+        // Register SEO score endpoints
+        try {
+            $database = new \ThinkRank\Core\Database();
+            $seo_calculator = new \ThinkRank\AI\SEOScoreCalculator($database);
+            $seo_score_endpoint = new \ThinkRank\API\SEOScoreEndpoint($seo_calculator);
+            $seo_score_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // SEO Score endpoint registration failed
+        }
+
+        // Register Usage Analytics endpoints
+        try {
+            $usage_analytics_endpoint = new \ThinkRank\API\Usage_Analytics_Endpoint();
+            $usage_analytics_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Usage Analytics endpoint registration failed
+        }
+
+        // Register Site SEO Analyzer endpoint
+        try {
+            $seo_analyzer_endpoint = new \ThinkRank\API\SEO_Analyzer_Endpoint();
+            $seo_analyzer_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Site SEO Analyzer endpoint registration failed
+        }
+
+        // Register SEO Analytics endpoints
+        try {
+            $seo_analytics_endpoint = new \ThinkRank\API\SEO_Analytics_Endpoint();
+            $seo_analytics_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register SEO Analytics endpoint
+        }
+
+        // Register Instant Indexing endpoints
+        try {
+            $instant_indexing_endpoint = new \ThinkRank\API\Instant_Indexing_Endpoint();
+            $instant_indexing_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Instant Indexing endpoint
+        }
+
+        // Register Pillar Content endpoints
+        try {
+            $pillar_content_endpoint = new \ThinkRank\API\Pillar_Content_Endpoint();
+            $pillar_content_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Pillar Content endpoint
+        }
+
+        // Register Focus Keyword Usage endpoint ("already used" status).
+        try {
+            $focus_keyword_usage_endpoint = new \ThinkRank\API\Focus_Keyword_Usage_Endpoint();
+            $focus_keyword_usage_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Focus Keyword Usage endpoint
+        }
+        // Register Global Robot Meta endpoints
+        try {
+            $global_robot_meta_endpoint = new \ThinkRank\API\Global_Robot_Meta_Endpoint();
+            $global_robot_meta_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Global Robot Meta endpoint
+        }
+
+        // Register Author Archives endpoints
+        try {
+            $author_archives_endpoint = new \ThinkRank\API\Author_Archives_Endpoint();
+            $author_archives_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Author Archives endpoint
+        }
+
+        // Register Role Manager endpoint
+        try {
+            $role_manager_endpoint = new \ThinkRank\API\Role_Manager_Endpoint();
+            $role_manager_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Role Manager endpoint
+        }
+
+        // Register Email Report endpoints
+        try {
+            $email_report_endpoint = new \ThinkRank\API\Email_Report_Endpoint();
+            $email_report_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Email Report endpoint
+        }
+
+
+        register_rest_route(self::NAMESPACE, '/ai/status', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_ai_status'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/ai/analyze-content', [
+            'methods' => 'POST',
+            'callback' => [$this, 'analyze_content'],
+            'permission_callback' => [$this, 'check_basic_permissions'],
+            'args' => [
+                'content' => [
+                    'type' => 'string',
+                    'required' => true,
+                    'sanitize_callback' => [$this, 'sanitize_ai_content'],
+                ],
+                'metadata' => [
+                    'type' => 'object',
+                    'required' => false,
+                    'sanitize_callback' => [$this, 'sanitize_metadata_object'],
+                ],
+                'post_id' => [
+                    'type' => 'integer',
+                    'required' => false,
+                    'sanitize_callback' => 'absint',
+                ],
+            ],
+        ]);
+    }
+
+    /**
+     * Check basic permissions (for logged-in users)
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return bool|WP_Error Permission status
+     */
+    public function check_basic_permissions(\WP_REST_Request $request) {
+        // Allow access for logged-in users who can edit posts
+        if (!is_user_logged_in()) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You must be logged in to access this endpoint.', 'thinkrank'),
+                ['status' => 401]
+            );
+        }
+
+        if (!current_user_can('edit_posts')) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You do not have permission to access this endpoint.', 'thinkrank'),
+                ['status' => 403]
+            );
+        }
+
+        return true;
+    }
+
+
+    /**
+     * Simple transient-based rate limiter
+     *
+     * @param string $bucket_id Unique bucket per user/IP and route
+     * @param int $limit Max requests per minute
+     * @return bool|\WP_Error True if allowed, or WP_Error when rate limited
+     */
+    private function enforce_rate_limit(string $bucket_id, int $limit) {
+        $settings = \ThinkRank\Core\Settings::instance();
+        $enabled = (bool) $settings->get('enable_rate_limiting', true);
+        if (!$enabled) {
+            return true;
+        }
+        // A non-positive limit means unlimited, matching AI\Manager and the
+        // label on the control (#448). This used to fall through to
+        // max(1, $limit) below, which turned a 0 into the most restrictive
+        // setting available rather than the least: the first request of each
+        // minute was allowed and every other one got a 429. Harmless while the
+        // field was rendered nowhere, user-facing the moment it was surfaced.
+        if ($limit <= 0) {
+            return true;
+        }
+        $now = time();
+        $window = 60;
+        $key = 'thinkrank_rl_' . md5($bucket_id);
+        $bucket = get_transient($key);
+        if (!is_array($bucket)) {
+            $bucket = ['start' => $now, 'count' => 0];
+        }
+        if ($now - ($bucket['start'] ?? 0) >= $window) {
+            $bucket = ['start' => $now, 'count' => 0];
+        }
+        if (($bucket['count'] ?? 0) >= $limit) {
+            return new \WP_Error('rate_limited', __('Rate limit exceeded. Please wait a moment and try again.', 'thinkrank'), ['status' => 429]);
+        }
+        $bucket['count']++;
+        set_transient($key, $bucket, $window);
+        return true;
+    }
+
+    /**
+     * Check admin permissions (for settings)
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return bool|WP_Error Permission status
+     */
+    public function check_admin_permissions(\WP_REST_Request $request) {
+        // Allow access for administrators only
+        if (!is_user_logged_in()) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You must be logged in to access this endpoint.', 'thinkrank'),
+                ['status' => 401]
+            );
+        }
+
+        if (!current_user_can('manage_options')) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You do not have permission to manage settings.', 'thinkrank'),
+                ['status' => 403]
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Check Settings section permissions.
+     *
+     * Delegable via Role Manager: passes for administrators (bypass) and for
+     * any role granted the `thinkrank_settings` capability. Used by the core
+     * /settings routes so the "Settings & API Keys" area can be delegated.
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return bool|\WP_Error Permission status
+     */
+    public function check_settings_permissions(\WP_REST_Request $request) {
+        if (!is_user_logged_in()) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You must be logged in to access this endpoint.', 'thinkrank'),
+                ['status' => 401]
+            );
+        }
+
+        if (!\ThinkRank\Core\Capability_Manager::current_user_can('thinkrank_settings')) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You do not have permission to manage ThinkRank settings.', 'thinkrank'),
+                ['status' => 403]
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Check Schema Manager section permissions.
+     *
+     * Delegable via Role Manager: route_map() maps the `schema` prefix to
+     * thinkrank_schema. /schema/enable-for-post is what the editor's "enable
+     * structured data" suggestion posts to, so gating it on manage_options made
+     * that button fail for exactly the roles the Schema grant was meant to
+     * serve (#844).
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return bool|\WP_Error Permission status
+     */
+    public function check_schema_permissions(\WP_REST_Request $request) {
+        return $this->check_mapped_capability('thinkrank_schema');
+    }
+
+    /**
+     * Check AI Tools section permissions.
+     *
+     * Delegable via Role Manager: route_map() maps the `ai` prefix to
+     * thinkrank_content_tools. Testing a provider and listing its models are
+     * configuration reads that report whether the stored key works; neither
+     * returns the key.
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return bool|\WP_Error Permission status
+     */
+    public function check_ai_tools_permissions(\WP_REST_Request $request) {
+        return $this->check_mapped_capability('thinkrank_content_tools');
+    }
+
+    /**
+     * Logged in, and holding a ThinkRank capability from the map.
+     *
+     * One body for the per-section callbacks above so they cannot drift apart
+     * the way the hardcoded manage_options checks drifted from the map.
+     * Administrators are unaffected: Role_Manager grants every ThinkRank
+     * capability to manage_options holders through `user_has_cap`.
+     *
+     * @param string $capability ThinkRank capability slug.
+     * @return bool|\WP_Error Permission status
+     */
+    private function check_mapped_capability(string $capability) {
+        if (!is_user_logged_in()) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You must be logged in to access this endpoint.', 'thinkrank'),
+                ['status' => 401]
+            );
+        }
+
+        if (!\ThinkRank\Core\Capability_Manager::current_user_can($capability)) {
+            return new \WP_Error(
+                'rest_forbidden',
+                __('You do not have permission to access this ThinkRank feature.', 'thinkrank'),
+                ['status' => 403]
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Get user capabilities
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_capabilities(\WP_REST_Request $request): \WP_REST_Response {
+        return new \WP_REST_Response([
+            'manage_settings' => current_user_can('manage_options'),
+            'view_analytics' => current_user_can('edit_posts'),
+
+            'use_ai_features' => current_user_can('edit_posts'),
+        ]);
+    }
+
+    /**
+     * Get plugin information
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_plugin_info(\WP_REST_Request $request): \WP_REST_Response {
+        return new \WP_REST_Response([
+            'version' => THINKRANK_VERSION,
+            'name' => 'ThinkRank',
+            'description' => 'AI-native SEO plugin for WordPress',
+        ]);
+    }
+
+    /**
+     * Get system status
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_system_status(\WP_REST_Request $request): \WP_REST_Response {
+        return new \WP_REST_Response([
+            'status' => 'healthy',
+            'issues' => [],
+            'php_version' => PHP_VERSION,
+            'wp_version' => get_bloginfo('version'),
+        ]);
+    }
+
+    /**
+     * Get ThinkRank integration health for MCP/Abilities clients (see #188).
+     *
+     * Admin-gated diagnostic; never returns secret material. Delegates to the
+     * shared reporter so the ability and this route stay in lock-step.
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_connection_status(\WP_REST_Request $request): \WP_REST_Response {
+        return new \WP_REST_Response(\ThinkRank\Diagnostics\Connection_Status::report());
+    }
+
+
+
+    /**
+     * Get settings
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_settings(\WP_REST_Request $request): \WP_REST_Response {
+        // Use Settings class for consistent access (handles decryption automatically)
+        $settings_instance = \ThinkRank\Core\Settings::instance();
+
+        $settings = [
+            'ai_provider' => $settings_instance->get('ai_provider', \ThinkRank\Core\Settings::AI_PROVIDER_NONE),
+            'openai_api_key' => $settings_instance->get('openai_api_key', ''),
+            'openai_model' => $settings_instance->get('openai_model', \ThinkRank\Core\Settings::DEFAULT_OPENAI_MODEL),
+            'claude_api_key' => $settings_instance->get('claude_api_key', ''),
+            'claude_model' => $settings_instance->get('claude_model', \ThinkRank\Core\Settings::DEFAULT_CLAUDE_MODEL),
+            'gemini_api_key' => $settings_instance->get('gemini_api_key', ''),
+            'gemini_model' => $settings_instance->get('gemini_model', \ThinkRank\Core\Settings::DEFAULT_GEMINI_MODEL),
+            'openrouter_api_key' => $settings_instance->get('openrouter_api_key', ''),
+            'openrouter_model' => $settings_instance->get('openrouter_model', \ThinkRank\Core\Settings::DEFAULT_OPENROUTER_MODEL),
+            'openai_compatible_base_url' => $settings_instance->get('openai_compatible_base_url', ''),
+            'openai_compatible_api_key' => $settings_instance->get('openai_compatible_api_key', ''),
+            'openai_compatible_model' => $settings_instance->get('openai_compatible_model', ''),
+            'openai_compatible_timeout' => (int) $settings_instance->get('openai_compatible_timeout', \ThinkRank\Core\Settings::DEFAULT_OPENAI_COMPATIBLE_TIMEOUT),
+            'openai_compatible_supports_images' => (bool) $settings_instance->get('openai_compatible_supports_images', false),
+            'openai_compatible_json_mode' => (bool) $settings_instance->get('openai_compatible_json_mode', false),
+            'openai_compatible_price_per_million' => (float) $settings_instance->get('openai_compatible_price_per_million', 0),
+            'max_tokens' => $settings_instance->get('max_tokens', 1000),
+            'temperature' => $settings_instance->get('temperature', 0.7),
+            'cache_duration' => $settings_instance->get('cache_duration', 3600),
+            'keep_data_on_uninstall' => (bool) $settings_instance->get('keep_data_on_uninstall', true),
+            'enable_migration_tools' => (bool) $settings_instance->get('enable_migration_tools', false),
+            'enable_import_export' => (bool) $settings_instance->get('enable_import_export', false),
+            'google_account_connected' => (bool) $settings_instance->get('google_account_connected', false),
+            'enable_mcp' => (bool) $settings_instance->get('enable_mcp', false),
+            'max_requests_per_minute' => (int) $settings_instance->get('max_requests_per_minute', 0),
+            'ai_daily_request_limit' => (int) $settings_instance->get('ai_daily_request_limit', 0),
+            'ai_paused' => (bool) $settings_instance->get('ai_paused', false),
+        ];
+
+
+
+        // Don't send full API keys to frontend for security - mask them,
+        // revealing the first 5 and last 3 chars so the saved key is recognizable.
+        if (!empty($settings['openai_api_key'])) {
+            $settings['openai_api_key'] = $this->mask_ai_api_key($settings['openai_api_key']);
+        }
+        if (!empty($settings['claude_api_key'])) {
+            $settings['claude_api_key'] = $this->mask_ai_api_key($settings['claude_api_key']);
+        }
+        if (!empty($settings['gemini_api_key'])) {
+            $settings['gemini_api_key'] = $this->mask_ai_api_key($settings['gemini_api_key']);
+        }
+        if (!empty($settings['openrouter_api_key'])) {
+            $settings['openrouter_api_key'] = $this->mask_ai_api_key($settings['openrouter_api_key']);
+        }
+        if (!empty($settings['openai_compatible_api_key'])) {
+            $settings['openai_compatible_api_key'] = $this->mask_ai_api_key($settings['openai_compatible_api_key']);
+        }
+
+        return new \WP_REST_Response($settings);
+    }
+
+    /**
+     * Mask an AI provider API key for display.
+     *
+     * Reveals the first 5 and last 3 characters with a bullet run in between
+     * (e.g. "sk-pr••••••••abc"). Keys of 8 chars or fewer are fully masked so
+     * head + tail can't reconstruct the whole value. The "••••••••" sentinel is
+     * what save_settings() looks for to skip re-saving a resubmitted mask.
+     *
+     * @param string $key Raw API key.
+     * @return string Masked key safe to send to the frontend.
+     */
+    private function mask_ai_api_key(string $key): string {
+        if (strlen($key) <= 8) {
+            return '••••••••';
+        }
+
+        return substr($key, 0, 5) . '••••••••' . substr($key, -3);
+    }
+
+    /**
+     * Save settings
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function save_settings(\WP_REST_Request $request): \WP_REST_Response {
+        $params = $request->get_params();
+
+        // Get Settings instance for proper encryption handling
+        $settings = \ThinkRank\Core\Settings::instance();
+
+        // Capture the pre-save MCP state so we can detect an on/off transition
+        // below and mint/revoke the connection token to match (see #244).
+        $mcp_was_enabled = (bool) $settings->get('enable_mcp', false);
+
+        // Pointing the site's AI at an arbitrary host — including loopback and
+        // LAN addresses, which this provider deliberately allows — is an
+        // administrator's decision, not a delegated one. The settings route
+        // itself is delegable through the Role Manager's `thinkrank_settings`
+        // capability, so an editor granted "manage ThinkRank settings" could
+        // otherwise aim server-side requests (with an Authorization header of
+        // their choosing) at internal services. Every other field on this route
+        // stays delegable; only these are held back (#721).
+        $endpoint_fields = [
+            'openai_compatible_base_url',
+            'openai_compatible_api_key',
+            'openai_compatible_model',
+            'openai_compatible_timeout',
+            'openai_compatible_supports_images',
+            'openai_compatible_json_mode',
+            'openai_compatible_price_per_million',
+        ];
+
+        foreach ($endpoint_fields as $endpoint_field) {
+            if (!isset($params[$endpoint_field])) {
+                continue;
+            }
+
+            // Only an actual change needs the capability: a client that echoes
+            // the whole settings payload back unchanged is not reconfiguring
+            // anything, and failing that save would break the Settings screen
+            // for delegated users editing an unrelated field.
+            //
+            // The key needs the mask rule the persistence loop below already
+            // uses. GET /settings returns it masked ("sk-pr••••••••abc"), so
+            // comparing that against the stored plaintext always differs, and
+            // every echoed payload would read as "an administrator changed the
+            // key" — locking delegated users out of saving anything at all.
+            $submitted = $params[$endpoint_field];
+            if (is_string($submitted) && false !== strpos($submitted, '••••••••')) {
+                continue;
+            }
+
+            $stored = $settings->get($endpoint_field);
+
+            // Booleans and numbers arrive typed from the REST layer but are
+            // stored as '1'/'' and '120'; compare them as the values they are.
+            if (is_bool($submitted) || is_bool($stored)) {
+                if ((bool) $stored === (bool) $submitted) {
+                    continue;
+                }
+            } elseif (is_numeric($submitted) && is_numeric($stored)) {
+                if ((float) $stored === (float) $submitted) {
+                    continue;
+                }
+            } elseif ((string) $stored === (string) $submitted) {
+                continue;
+            }
+
+            if (!current_user_can('manage_options')) {
+                return new \WP_REST_Response([
+                    'success' => false,
+                    'message' => __('Only an administrator can configure a custom AI endpoint.', 'thinkrank'),
+                    'field' => $endpoint_field,
+                ], 403);
+            }
+
+            break;
+        }
+
+        // Selecting the provider is the same decision by another name.
+        if (isset($params['ai_provider'])
+            && 'openai_compatible' === $params['ai_provider']
+            && 'openai_compatible' !== (string) $settings->get('ai_provider', \ThinkRank\Core\Settings::AI_PROVIDER_NONE)
+            && !current_user_can('manage_options')
+        ) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => __('Only an administrator can configure a custom AI endpoint.', 'thinkrank'),
+                'field' => 'ai_provider',
+            ], 403);
+        }
+
+        // A refused endpoint URL has to say why. Settings::sanitize_setting()
+        // stores '' for one that fails validation — right, since an unvalidated
+        // URL must never become a URL we fetch — but silent, so the user would
+        // see "Settings saved" and an endpoint that vanished. Validate here,
+        // where the reason can be returned, and reject the whole save: a
+        // half-applied AI provider is worse than none (#721).
+        if (!empty($params['openai_compatible_base_url'])) {
+            $validated_base_url = \ThinkRank\AI\Endpoint_URL_Validator::validate((string) $params['openai_compatible_base_url']);
+            if (is_wp_error($validated_base_url)) {
+                return new \WP_REST_Response([
+                    'success' => false,
+                    'message' => $validated_base_url->get_error_message(),
+                    'field' => 'openai_compatible_base_url',
+                ], 400);
+            }
+
+            $params['openai_compatible_base_url'] = $validated_base_url;
+        }
+
+        // Map frontend parameter names to setting keys
+        $settings_map = [
+            'ai_provider' => 'ai_provider',
+            'openai_api_key' => 'openai_api_key',
+            'openai_model' => 'openai_model',
+            'claude_api_key' => 'claude_api_key',
+            'claude_model' => 'claude_model',
+            'gemini_api_key' => 'gemini_api_key',
+            'gemini_model' => 'gemini_model',
+            'openrouter_api_key' => 'openrouter_api_key',
+            'openrouter_model' => 'openrouter_model',
+            'openai_compatible_base_url' => 'openai_compatible_base_url',
+            'openai_compatible_api_key' => 'openai_compatible_api_key',
+            'openai_compatible_model' => 'openai_compatible_model',
+            'openai_compatible_timeout' => 'openai_compatible_timeout',
+            'openai_compatible_supports_images' => 'openai_compatible_supports_images',
+            'openai_compatible_json_mode' => 'openai_compatible_json_mode',
+            'openai_compatible_price_per_million' => 'openai_compatible_price_per_million',
+            'max_tokens' => 'max_tokens',
+            'temperature' => 'temperature',
+            'cache_duration' => 'cache_duration',
+            'keep_data_on_uninstall' => 'keep_data_on_uninstall',
+            'enable_mcp' => 'enable_mcp',
+            'enable_migration_tools' => 'enable_migration_tools',
+            'enable_import_export' => 'enable_import_export',
+            'max_requests_per_minute' => 'max_requests_per_minute',
+            'ai_daily_request_limit' => 'ai_daily_request_limit',
+            'ai_paused' => 'ai_paused',
+        ];
+
+        // Processing settings save request
+
+        foreach ($settings_map as $param_key => $setting_key) {
+            if (isset($params[$param_key])) {
+                $value = $params[$param_key];
+
+                // Handle API keys specially - check for masked values
+                if (in_array($param_key, ['openai_api_key', 'claude_api_key', 'gemini_api_key', 'openrouter_api_key', 'openai_compatible_api_key'], true)) {
+                    // Don't update if the value carries the mask sentinel (the
+                    // preview now keeps real head/tail chars around it, so match
+                    // anywhere rather than only at the start). Empty still clears.
+                    if (strpos($value, '••••••••') !== false) {
+                        continue;
+                    }
+                }
+
+                // Use Settings class for all operations (handles encryption automatically)
+                // A failed write is skipped rather than aborting the batch, so
+                // one bad setting cannot block the rest of the save.
+                $settings->set($setting_key, $value);
+            }
+        }
+
+        // MCP is a single master switch (see #244): enabling it auto-mints a
+        // read/write connection token so the connect recipes are ready without
+        // a separate "Generate token" step.
+        //
+        // Disabling is a PAUSE, not a wipe: the switch alone already denies all
+        // access (Mcp_Server 403s and the OAuth/discovery endpoints refuse while
+        // off), so stored tokens and OAuth grants are inert. We keep them so
+        // re-enabling restores every previously connected app with no
+        // re-approval. Explicit revocation stays available per-app (the
+        // Connected AI apps trash button) and for the shared token (Reset
+        // token / rotate). Only act on an actual on->off->on transition so
+        // saving unrelated settings never touches the connection.
+        if (isset($params['enable_mcp'])) {
+            $mcp_now_enabled = (bool) $settings->get('enable_mcp', false);
+            if ($mcp_now_enabled && !$mcp_was_enabled) {
+                \ThinkRank\Mcp\Mcp_Pairing::connect();
+            }
+        }
+
+        // Auto-dismiss welcome notice if API key was saved
+        $this->maybe_dismiss_welcome_notice($params);
+
+        // Force AI Manager to re-initialize client with new settings
+        if (isset($params['ai_provider']) || isset($params['openai_api_key']) || isset($params['claude_api_key']) || isset($params['gemini_api_key']) || isset($params['openrouter_api_key']) || isset($params['openai_compatible_base_url']) || isset($params['openai_compatible_api_key']) || isset($params['openai_compatible_model'])) {
+            // Clear any cached AI Manager instances to force re-initialization
+            wp_cache_delete('thinkrank_ai_manager', 'thinkrank');
+
+            // If we have an AI Manager instance, force it to re-initialize
+            try {
+                $ai_manager = new \ThinkRank\AI\Manager($settings);
+                $ai_manager->reinitialize_client();
+            } catch (\Exception $e) {
+                // Ignore initialization errors at this point
+            }
+        }
+
+        return new \WP_REST_Response([
+            'success' => true,
+            'message' => __('Settings saved successfully', 'thinkrank'),
+            'settings' => $this->get_settings($request)->get_data(),
+        ]);
+    }
+
+    /**
+     * Maybe dismiss welcome notice if API key was saved
+     *
+     * @param array $params Request parameters
+     * @return void
+     */
+    private function maybe_dismiss_welcome_notice(array $params): void {
+        // Check if an API key was saved (not cleared)
+        $api_key_saved = false;
+
+        if (!empty($params['openai_api_key']) && $params['openai_api_key'] !== '') {
+            $api_key_saved = true;
+        }
+
+        if (!empty($params['claude_api_key']) && $params['claude_api_key'] !== '') {
+            $api_key_saved = true;
+        }
+
+        // Auto-dismiss welcome notice if API key was configured
+        if ($api_key_saved && get_option('thinkrank_show_welcome')) {
+            delete_option('thinkrank_show_welcome');
+        }
+    }
+
+    /**
+     * Get metadata for post
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_metadata(\WP_REST_Request $request): \WP_REST_Response {
+        $post_id = (int) $request->get_param('post_id');
+
+        // Object-level guard: only expose a post's stored SEO meta to a user who
+        // can edit that specific post (the section capability gate handles the
+        // AI Tools toggle; this adds per-post ownership).
+        if (!current_user_can('edit_post', $post_id)) {
+            return new \WP_REST_Response(['message' => 'You are not allowed to view this metadata.'], 403);
+        }
+
+        // Read the pending flag BEFORE the meta below, never after. A writer
+        // that finishes mid-request writes the meta and *then* clears the
+        // flag; reading the flag last could therefore observe "no value" and
+        // "not pending" for the same run and stop the editor panel polling one
+        // tick before the value it was waiting for lands (#329).
+        $pending = \ThinkRank\SEO\Metadata_Pending::is_pending($post_id);
+
+        // Get existing metadata. These must read the same canonical meta keys
+        // the rest of the plugin writes/reads (frontend, metabox, scoring),
+        // otherwise the response is always empty:
+        //   title/description → _thinkrank_seo_title / _thinkrank_meta_description
+        //   keywords          → Focus_Keywords (stored as _thinkrank_focus_keywords)
+        //   last_generated    → _thinkrank_generated_at (written by Metadata_Generator)
+        $metadata = [
+            'title' => get_post_meta($post_id, '_thinkrank_seo_title', true),
+            'description' => get_post_meta($post_id, '_thinkrank_meta_description', true),
+            'keywords' => \ThinkRank\SEO\Focus_Keywords::get($post_id),
+            'seo_score' => get_post_meta($post_id, '_thinkrank_seo_score', true) ?: 0,
+            'last_generated' => get_post_meta($post_id, '_thinkrank_generated_at', true),
+            // Whether a background writer (Auto AI on publish, bulk
+            // optimization, imports) is about to fill these fields. The editor
+            // panel polls only while this is true.
+            'pending' => $pending,
+        ];
+
+        return new \WP_REST_Response($metadata);
+    }
+
+    /**
+     * Generate AI-powered SEO metadata
+     *
+     * @param \WP_REST_Request $request Request object containing content and generation options
+     * @return \WP_REST_Response Response object with generated metadata or error message
+     * @throws \Exception When AI metadata generation fails or AI client is unavailable
+     */
+    public function generate_ai_metadata(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $options = [
+            'target_keyword' => $request->get_param('target_keyword'),
+            'content_type' => $request->get_param('content_type'),
+            'tone' => $request->get_param('tone'),
+            // Instruct the model to write in the post/site language instead of
+            // defaulting to English on non-English sites (issue #234).
+            'language' => \ThinkRank\AI\Language_Resolver::resolve((int) $request->get_param('post_id')),
+        ];
+
+        // Rate limiting: per user/IP per route
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_generate|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            // Get AI manager instance
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            // Run through the generator so title/description are capped to the
+            // configured limits and the character counts are returned.
+            $generator = new \ThinkRank\AI\Metadata_Generator($ai_manager);
+            $metadata = $generator->generate_for_content($content, $options);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $metadata,
+                'message' => __('SEO metadata generated successfully', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Generate and return an improved SEO title for an "Apply" suggestion action.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response with the improved title under data.title.
+     * @throws \Exception When title improvement fails or the AI client is unavailable.
+     */
+    public function improve_ai_title(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $options = [
+            'current_title' => $request->get_param('current_title'),
+            'target_keyword' => $request->get_param('target_keyword'),
+            'content_type' => $request->get_param('content_type'),
+            'tone' => $request->get_param('tone'),
+            'suggestion' => $request->get_param('suggestion'),
+            'language' => \ThinkRank\AI\Language_Resolver::resolve((int) $request->get_param('post_id')),
+        ];
+
+        // Rate limiting: shares the AI generation bucket.
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_generate|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            $result = $ai_manager->improve_seo_title($content, $options);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $result,
+                'message' => __('SEO title improved successfully', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Generate and return an improved meta description for an "Apply" action.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response with the description under data.description.
+     * @throws \Exception When generation fails or the AI client is unavailable.
+     */
+    public function improve_ai_meta_description(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $options = [
+            'current_description' => $request->get_param('current_description'),
+            'target_keyword' => $request->get_param('target_keyword'),
+            'content_type' => $request->get_param('content_type'),
+            'tone' => $request->get_param('tone'),
+            'suggestion' => $request->get_param('suggestion'),
+            'language' => \ThinkRank\AI\Language_Resolver::resolve((int) $request->get_param('post_id')),
+        ];
+
+        // Rate limiting: shares the AI generation bucket.
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_generate|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            $result = $ai_manager->improve_meta_description($content, $options);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $result,
+                'message' => __('Meta description generated successfully', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Explain a single SEO suggestion in plain, post-specific language.
+     *
+     * Read-only copilot action: returns a short AI explanation of why the
+     * suggestion matters for this post and how to resolve it. Does not modify
+     * any content.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response with the explanation under data.explanation.
+     * @throws \Exception When generation fails or the AI client is unavailable.
+     */
+    public function explain_ai_suggestion(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $options = [
+            'suggestion' => $request->get_param('suggestion'),
+            'title' => $request->get_param('title'),
+            'target_keyword' => $request->get_param('target_keyword'),
+            'content_type' => $request->get_param('content_type'),
+        ];
+
+        // Rate limiting: shares the AI generation bucket.
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_generate|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            $result = $ai_manager->explain_seo_suggestion($content, $options);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $result,
+                'message' => __('Explanation generated successfully', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Generate a content fragment with one authoritative external dofollow link.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response with the HTML fragment under data.html.
+     * @throws \Exception When generation fails or the AI client is unavailable.
+     */
+    public function add_ai_dofollow_link(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $options = [
+            'target_keyword' => $request->get_param('target_keyword'),
+            'content_type' => $request->get_param('content_type'),
+        ];
+
+        // Rate limiting: shares the AI generation bucket.
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_generate|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            $result = $ai_manager->generate_dofollow_link($content, $options);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $result,
+                'message' => __('Added an authoritative source link', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Generate a keyword-rich paragraph to lift keyword density into band.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response with the HTML fragment under data.html.
+     * @throws \Exception When generation fails or the AI client is unavailable.
+     */
+    public function add_ai_keyword_paragraph(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $options = [
+            'target_keyword' => $request->get_param('target_keyword'),
+            'content_type' => $request->get_param('content_type'),
+            'tone' => $request->get_param('tone'),
+            'word_count' => $request->get_param('word_count'),
+            'keyword_count' => $request->get_param('keyword_count'),
+        ];
+
+        // Rate limiting: shares the AI generation bucket.
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_generate|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            $result = $ai_manager->generate_keyword_paragraph($content, $options);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $result,
+                'message' => __('Added a keyword-focused paragraph', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Enable ThinkRank's Global SEO schema output for a post's post type.
+     *
+     * Sets a sensible default schema type (Article for posts, WebPage for pages)
+     * when none is configured yet, so ThinkRank emits JSON-LD for the post. This
+     * resolves the "add structured data" suggestion, which the scorer now credits
+     * when ThinkRank schema is active.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response describing the enabled schema type.
+     */
+    public function enable_schema_for_post(\WP_REST_Request $request): \WP_REST_Response {
+        $post_id = (int) $request->get_param('post_id');
+        $post = get_post($post_id);
+        if (!$post) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => __('Post not found.', 'thinkrank'),
+            ], 404);
+        }
+
+        $post_type = $post->post_type;
+        $settings = get_option('thinkrank_global_seo_settings', []);
+        if (!is_array($settings)) {
+            $settings = [];
+        }
+        if (!isset($settings[$post_type]) || !is_array($settings[$post_type])) {
+            $settings[$post_type] = [];
+        }
+
+        $already_enabled = !empty($settings[$post_type]['schema_type']);
+        if (!$already_enabled) {
+            if ($post_type === 'page') {
+                $settings[$post_type]['schema_type'] = 'WebPage';
+            } else {
+                $settings[$post_type]['schema_type'] = 'Article';
+                if (empty($settings[$post_type]['article_type'])) {
+                    $settings[$post_type]['article_type'] = 'BlogPosting';
+                }
+            }
+            update_option('thinkrank_global_seo_settings', $settings);
+        }
+
+        $schema_type = $settings[$post_type]['schema_type'];
+
+        return new \WP_REST_Response([
+            'success' => true,
+            'data' => [
+                'schema_type' => $schema_type,
+                'post_type' => $post_type,
+                'already_enabled' => $already_enabled,
+            ],
+            'message' => $already_enabled
+                ? __('Schema was already enabled for this post type.', 'thinkrank')
+                /* translators: %s: schema type. */
+                : sprintf(__('Enabled %s schema for this post type.', 'thinkrank'), $schema_type),
+        ]);
+    }
+
+    /**
+     * Test AI connection for specified provider
+     *
+     * @param \WP_REST_Request $request Request object containing api_key and provider parameters
+     * @return \WP_REST_Response Response object with connection test results
+     * @throws \Exception When API connection test encounters unexpected errors
+     */
+    public function test_ai_connection(\WP_REST_Request $request): \WP_REST_Response {
+        // Rate limiting: per user/IP per route
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_test|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            $api_key = $request->get_param('api_key');
+            $provider = $request->get_param('provider') ?: 'openai';
+            // The model the caller is asking about. Empty means "whatever is
+            // saved" — the settings screen sends the model currently on screen
+            // so an unsaved pick or a hand-typed id is what actually gets
+            // tested, rather than the last saved one.
+            $model = trim((string) $request->get_param('model'));
+
+            // An unrecognised provider used to fall through to the Gemini arm
+            // below, so a typo silently tested the wrong provider's key.
+            if (!in_array($provider, \ThinkRank\Core\Settings::SUPPORTED_AI_PROVIDERS, true)) {
+                return new \WP_REST_Response([
+                    'success' => false,
+                    /* translators: %s: the unrecognised provider value. */
+                    'message' => sprintf(__('Unknown AI provider: %s', 'thinkrank'), $provider),
+                ], 400);
+            }
+
+            // The OpenAI-compatible endpoint is tested by URL, not by key: a
+            // local Ollama or LM Studio server wants no key, so the key checks
+            // below would refuse to test a perfectly good endpoint (#721).
+            if ('openai_compatible' === $provider) {
+                $base_url = trim((string) $request->get_param('base_url'));
+                if ('' === $base_url) {
+                    $base_url = (string) \ThinkRank\Core\Settings::instance()->get('openai_compatible_base_url', '');
+                }
+
+                if (empty($api_key)) {
+                    $api_key = (string) \ThinkRank\Core\Settings::instance()->get('openai_compatible_api_key', '');
+                }
+
+                if ('' === $model) {
+                    $model = trim((string) \ThinkRank\Core\Settings::instance()->get('openai_compatible_model', ''));
+                }
+
+                $json_mode = $request->has_param('json_mode')
+                    ? (bool) $request->get_param('json_mode')
+                    : (bool) \ThinkRank\Core\Settings::instance()->get('openai_compatible_json_mode', false);
+
+                $result = $this->test_openai_compatible_connection($base_url, $api_key, $model, $json_mode);
+
+                return new \WP_REST_Response($result, $result['success'] ? 200 : 400);
+            }
+
+            // If no API key provided in request, try to get from saved settings
+            if (empty($api_key)) {
+                $settings = \ThinkRank\Core\Settings::instance();
+                if ($provider === 'openai') {
+                    $api_key = (string) $settings->get('openai_api_key', '');
+                } elseif ($provider === 'claude') {
+                    $api_key = (string) $settings->get('claude_api_key', '');
+                } elseif ($provider === 'openrouter') {
+                    $api_key = (string) $settings->get('openrouter_api_key', '');
+                } else {
+                    $api_key = (string) $settings->get('gemini_api_key', '');
+                }
+
+                if (empty($api_key)) {
+                    return new \WP_REST_Response([
+                        'success' => false,
+                        'message' => __('No API key provided or saved for the selected provider.', 'thinkrank'),
+                    ], 400);
+                }
+            }
+
+            // Test the connection with a simple API call
+            if ($provider === 'openai') {
+                $result = $this->test_openai_connection($api_key, $model);
+            } elseif ($provider === 'claude') {
+                $result = $this->test_claude_connection($api_key, $model);
+            } elseif ($provider === 'openrouter') {
+                $result = $this->test_openrouter_connection($api_key, $model);
+            } else {
+                $result = $this->test_gemini_connection($api_key, $model);
+            }
+
+            return new \WP_REST_Response($result, $result['success'] ? 200 : 400);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Test an OpenAI-compatible endpoint with a real (tiny) completion.
+     *
+     * Deliberately not a GET /models probe: a server can list models and still
+     * fail to complete (wrong model id, model not pulled, gateway that only
+     * proxies /models). The one-token chat completion answers the question the
+     * user is actually asking — "can ThinkRank generate with this?" — and its
+     * reply plus latency is what the settings screen shows (#721).
+     *
+     * @since 2.8.0
+     *
+     * @param string $base_url Base URL as typed (validated here).
+     * @param string $api_key  Optional API key.
+     * @param string $model     Model id to complete with.
+     * @param bool   $json_mode Also check the server accepts response_format json_object.
+     * @return array Test result.
+     */
+    private function test_openai_compatible_connection(string $base_url, string $api_key, string $model, bool $json_mode = false): array {
+        $validated = \ThinkRank\AI\Endpoint_URL_Validator::validate($base_url);
+        if (is_wp_error($validated)) {
+            return [
+                'success' => false,
+                'message' => $validated->get_error_message(),
+            ];
+        }
+
+        if ('' === trim($model)) {
+            return [
+                'success' => false,
+                'message' => __('Enter the model id your endpoint should use, for example llama3.1 or gpt-4o.', 'thinkrank'),
+            ];
+        }
+
+        $headers = ['Content-Type' => 'application/json'];
+        if ('' !== $api_key) {
+            $headers['Authorization'] = 'Bearer ' . $api_key;
+            $headers['api-key'] = $api_key;
+        }
+
+        // A "Reply with OK" answer is tiny; anything approaching this is a
+        // server misbehaving, and the guard caps it before it is buffered.
+        $max_bytes = 131072;
+
+        $started = microtime(true);
+
+        $response = \ThinkRank\AI\Endpoint_URL_Validator::guarded_request(\ThinkRank\AI\Endpoint_URL_Validator::route($validated, 'chat/completions'), [
+            'method' => 'POST',
+            // Long enough for a cold local model to load its weights, short
+            // enough that a wrong URL does not hang the settings screen.
+            'timeout' => 30,
+            'headers' => $headers,
+            'limit_response_size' => $max_bytes,
+            'body' => wp_json_encode([
+                'model' => trim($model),
+                'messages' => [['role' => 'user', 'content' => 'Reply with OK']],
+                // Not 16: a local reasoning model (deepseek-r1, a qwen3
+                // thinking build) spends its first tokens on hidden reasoning
+                // and returns empty content if the budget runs out there, which
+                // would report a working endpoint as broken.
+                'max_tokens' => 128,
+            ]),
+        ]);
+
+        $latency_ms = (int) round((microtime(true) - $started) * 1000);
+
+        if (is_wp_error($response)) {
+            return [
+                'success' => false,
+                /* translators: %s: transport error, e.g. "cURL error 7: Connection refused". */
+                'message' => sprintf(__('Could not reach the endpoint: %s', 'thinkrank'), $response->get_error_message()),
+            ];
+        }
+
+        $status = (int) wp_remote_retrieve_response_code($response);
+        $raw_body = wp_remote_retrieve_body($response);
+
+        // Redirects are never followed (the key would go wherever the endpoint
+        // points). Say so, rather than letting the empty 3xx body read as a
+        // wrong model id: an http-to-https upgrade is the usual cause.
+        if ($status >= 300 && $status < 400) {
+            $location = (string) wp_remote_retrieve_header($response, 'location');
+
+            return [
+                'success' => false,
+                'status' => $status,
+                'message' => '' !== $location
+                    ? sprintf(
+                        /* translators: 1: HTTP status code, 2: the URL the endpoint redirected to. */
+                        __('The endpoint redirected (%1$d) to %2$s. Redirects are refused so your API key cannot follow them. Enter the final URL instead, for example https:// in place of http://.', 'thinkrank'),
+                        $status,
+                        esc_url_raw($location)
+                    )
+                    : sprintf(
+                        /* translators: %d: HTTP status code. */
+                        __('The endpoint redirected (%d). Redirects are refused so your API key cannot follow them. Enter the final URL instead, for example https:// in place of http://.', 'thinkrank'),
+                        $status
+                    ),
+            ];
+        }
+
+        // A body that reached the cap was cut mid-JSON. Report that, not a
+        // missing completion: the model id was never the problem.
+        if (strlen($raw_body) >= $max_bytes) {
+            return [
+                'success' => false,
+                'status' => $status,
+                'message' => __('The endpoint sent more than ThinkRank will read for a connection test (128 KB). It is misconfigured or is not answering with a chat completion.', 'thinkrank'),
+            ];
+        }
+
+        $body = json_decode($raw_body, true);
+
+        if ($status >= 400) {
+            $error = '';
+            if (is_array($body)) {
+                $error = (string) ($body['error']['message'] ?? ($body['error'] ?? ($body['message'] ?? '')));
+            }
+            if ('' === $error) {
+                $error = wp_remote_retrieve_response_message($response);
+            }
+
+            return [
+                'success' => false,
+                'status' => $status,
+                /* translators: 1: HTTP status code, 2: error message from the server. */
+                'message' => sprintf(__('The endpoint answered %1$d: %2$s', 'thinkrank'), $status, $error),
+            ];
+        }
+
+        $reply = '';
+        $reasoning_only = false;
+        if (is_array($body)) {
+            $message = is_array($body['choices'][0]['message'] ?? null) ? $body['choices'][0]['message'] : [];
+            $reply = trim((string) ($message['content'] ?? ''));
+
+            // Ollama and vLLM expose a thinking model's hidden reasoning
+            // separately. Reasoning with no content still proves the endpoint
+            // and the model work — it means the model thinks before answering,
+            // which is worth saying out loud because it makes every generation
+            // slower.
+            if ('' === $reply) {
+                $reasoning = trim((string) ($message['reasoning'] ?? ($message['reasoning_content'] ?? '')));
+                if ('' !== $reasoning) {
+                    $reply = $reasoning;
+                    $reasoning_only = true;
+                }
+            }
+        }
+
+        if ('' === $reply) {
+            return [
+                'success' => false,
+                'status' => $status,
+                'message' => __('The endpoint replied, but with no completion text. Check that the model id is one this server serves.', 'thinkrank'),
+            ];
+        }
+
+        $result = [
+            'success' => true,
+            'model' => trim($model),
+            'model_available' => true,
+            'latency_ms' => $latency_ms,
+            'reply' => mb_substr($reply, 0, 200),
+            'reasoning_only' => $reasoning_only,
+            'message' => $reasoning_only
+                ? sprintf(
+                    /* translators: 1: model id, 2: latency in milliseconds. */
+                    __('Connected: "%1$s" answered in %2$d ms. It is a reasoning model: it thinks before replying, so generation will be slower and may need a higher timeout.', 'thinkrank'),
+                    trim($model),
+                    $latency_ms
+                )
+                : sprintf(
+                    /* translators: 1: model id, 2: latency in milliseconds, 3: the model's reply. */
+                    __('Connected: "%1$s" replied in %2$d ms: %3$s', 'thinkrank'),
+                    trim($model),
+                    $latency_ms,
+                    mb_substr($reply, 0, 80)
+                ),
+        ];
+
+        return $json_mode
+            ? $this->probe_openai_compatible_json_mode($validated, $headers, trim($model), $result)
+            : $result;
+    }
+
+    /**
+     * Check that an endpoint takes response_format json_object.
+     *
+     * Runs only after the plain completion worked, so a failure here can mean
+     * one thing: the endpoint works, but not with "Force valid JSON answers"
+     * on. Generation still works then, because OpenAI_Client falls back to a
+     * plain request, but every JSON call pays a failed round trip first. The
+     * connection stays a success; the result carries json_mode_supported so
+     * the screen can warn instead of reporting a broken endpoint.
+     *
+     * @since 2.8.0
+     *
+     * @param string $base_url Validated base URL.
+     * @param array  $headers  Request headers, key included.
+     * @param string $model    Model id.
+     * @param array  $result   Successful connection result to extend.
+     * @return array The result, with json_mode_supported and, when false, a warning message.
+     */
+    private function probe_openai_compatible_json_mode(string $base_url, array $headers, string $model, array $result): array {
+        $response = \ThinkRank\AI\Endpoint_URL_Validator::guarded_request(\ThinkRank\AI\Endpoint_URL_Validator::route($base_url, 'chat/completions'), [
+            'method' => 'POST',
+            'timeout' => 30,
+            'headers' => $headers,
+            'limit_response_size' => 131072,
+            'body' => wp_json_encode([
+                'model' => $model,
+                // OpenAI refuses json_object unless the messages mention JSON.
+                'messages' => [['role' => 'user', 'content' => 'Reply with the JSON object {"ok": true}']],
+                'max_tokens' => 128,
+                'response_format' => ['type' => 'json_object'],
+            ]),
+        ]);
+
+        // A timeout or dropped connection says nothing about JSON mode. Leave
+        // the result alone rather than warn about a field that was never judged.
+        if (is_wp_error($response)) {
+            return $result;
+        }
+
+        $status = (int) wp_remote_retrieve_response_code($response);
+        if ($status < 400) {
+            $result['json_mode_supported'] = true;
+            return $result;
+        }
+
+        $body = json_decode((string) wp_remote_retrieve_body($response), true);
+        $error = '';
+        if (is_array($body)) {
+            // OpenAI and vLLM nest the text under error.message; Ollama sends a bare error string.
+            $error = is_string($body['error'] ?? null)
+                ? $body['error']
+                : (string) ($body['error']['message'] ?? ($body['message'] ?? ''));
+        }
+        if ('' === $error) {
+            $error = (string) wp_remote_retrieve_response_message($response);
+        }
+
+        $result['json_mode_supported'] = false;
+        $result['message'] = sprintf(
+            /* translators: 1: model id, 2: HTTP status code, 3: error message from the server. */
+            __('Connected to "%1$s", but the endpoint rejected JSON mode (%2$d: %3$s). Turn off "Force valid JSON answers": generation still works, but each request is sent twice.', 'thinkrank'),
+            $model,
+            $status,
+            $error
+        );
+
+        return $result;
+    }
+
+    /**
+     * List the models an OpenAI-compatible endpoint serves.
+     *
+     * @since 2.8.0
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response Response object.
+     */
+    public function list_endpoint_models(\WP_REST_Request $request): \WP_REST_Response {
+        $settings = \ThinkRank\Core\Settings::instance();
+
+        $base_url = trim((string) $request->get_param('base_url'));
+        if ('' === $base_url) {
+            $base_url = (string) $settings->get('openai_compatible_base_url', '');
+        }
+
+        $validated = \ThinkRank\AI\Endpoint_URL_Validator::validate($base_url);
+        if (is_wp_error($validated)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $validated->get_error_message(),
+            ], 400);
+        }
+
+        $api_key = trim((string) $request->get_param('api_key'));
+        if ('' === $api_key || false !== strpos($api_key, '••••••••')) {
+            $api_key = (string) $settings->get('openai_compatible_api_key', '');
+        }
+
+        $headers = ['Content-Type' => 'application/json'];
+        if ('' !== $api_key) {
+            $headers['Authorization'] = 'Bearer ' . $api_key;
+            $headers['api-key'] = $api_key;
+        }
+
+        $response = \ThinkRank\AI\Endpoint_URL_Validator::guarded_request(\ThinkRank\AI\Endpoint_URL_Validator::route($validated, 'models'), [
+            'method' => 'GET',
+            'timeout' => 15,
+            'headers' => $headers,
+            // A hostile or misconfigured endpoint can answer with an unbounded
+            // body; buffering it whole would spend the worker's memory on a
+            // list we cap at MAX_ENDPOINT_MODELS anyway.
+            'limit_response_size' => self::MAX_MODELS_RESPONSE_BYTES,
+        ]);
+
+        if (is_wp_error($response)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                /* translators: %s: transport error. */
+                'message' => sprintf(__('Could not reach the endpoint: %s', 'thinkrank'), $response->get_error_message()),
+            ], 400);
+        }
+
+        $status = (int) wp_remote_retrieve_response_code($response);
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($status >= 400 || !is_array($body)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                /* translators: %d: HTTP status code. */
+                'message' => sprintf(__('This endpoint does not list its models (HTTP %d). Type the model id by hand instead.', 'thinkrank'), $status),
+            ], 400);
+        }
+
+        // OpenAI's shape is {data: [{id: …}]}; some gateways answer a bare list.
+        $entries = isset($body['data']) && is_array($body['data']) ? $body['data'] : $body;
+        $models = [];
+        $truncated = false;
+        foreach ($entries as $entry) {
+            if (count($models) >= self::MAX_ENDPOINT_MODELS) {
+                // A gateway fronting a public catalogue can list thousands of
+                // models. Sanitising and sorting all of them is work nobody
+                // asked for — the field is a suggestion list, not a registry.
+                $truncated = true;
+                break;
+            }
+
+            if (is_array($entry) && !empty($entry['id'])) {
+                $models[] = sanitize_text_field((string) $entry['id']);
+            } elseif (is_string($entry) && '' !== $entry) {
+                $models[] = sanitize_text_field($entry);
+            }
+        }
+
+        $models = array_values(array_unique($models));
+        sort($models);
+
+        if (empty($models)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => __('The endpoint answered, but listed no models. Type the model id by hand instead.', 'thinkrank'),
+            ], 400);
+        }
+
+        return new \WP_REST_Response([
+            'success' => true,
+            'models' => $models,
+            'truncated' => $truncated,
+        ]);
+    }
+
+    /**
+     * Test OpenAI API connection
+     *
+     * The models endpoint doubles as the model check: it answers with every id
+     * this key may call, so an unknown or unentitled model is caught here
+     * instead of at the first real generation.
+     *
+     * @param string $api_key API key to test
+     * @param string $model   Model id to verify, or '' to use the saved one
+     * @return array Test result
+     */
+    private function test_openai_connection(string $api_key, string $model = ''): array {
+        $model = $model !== ''
+            ? $model
+            : (string) \ThinkRank\Core\Settings::instance()->get('openai_model', \ThinkRank\Core\Settings::DEFAULT_OPENAI_MODEL);
+
+        $url = 'https://api.openai.com/v1/models';
+
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $api_key,
+                'Content-Type' => 'application/json',
+            ],
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($response)) {
+            return [
+                'success' => false,
+                'message' => __('Failed to connect to OpenAI API: ', 'thinkrank') . $response->get_error_message(),
+            ];
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        if ($status_code === 200) {
+            $data = json_decode($body, true);
+            if (isset($data['data']) && is_array($data['data'])) {
+                $ids = array_column($data['data'], 'id');
+
+                if ($model !== '' && !in_array($model, $ids, true)) {
+                    return [
+                        'success' => false,
+                        'model' => $model,
+                        'model_available' => false,
+                        /* translators: %s: the model id that was tested. */
+                        'message' => sprintf(__('API key works, but the model "%s" is not available to this account.', 'thinkrank'), $model),
+                    ];
+                }
+
+                return [
+                    'success' => true,
+                    'model' => $model,
+                    'model_available' => $model !== '',
+                    'message' => $model !== ''
+                        /* translators: %s: the model id that was tested. */
+                        ? sprintf(__('OpenAI API connection successful. Model "%s" is available.', 'thinkrank'), $model)
+                        : __('OpenAI API connection successful!', 'thinkrank'),
+                    'models_count' => count($data['data']),
+                ];
+            }
+        }
+
+        // Handle error response
+        $error_data = json_decode($body, true);
+        $error_message = $error_data['error']['message'] ?? __('Unknown API error', 'thinkrank');
+
+        return [
+            'success' => false,
+            'message' => __('OpenAI API Error: ', 'thinkrank') . $error_message,
+        ];
+    }
+
+    /**
+     * Test OpenRouter API connection
+     *
+     * @param string $api_key API key to test
+     * @param string $model   Model id to verify, or '' to use the saved one
+     * @return array Test result
+     */
+    private function test_openrouter_connection(string $api_key, string $model = ''): array {
+        $model = $model !== ''
+            ? $model
+            : (string) \ThinkRank\Core\Settings::instance()->get('openrouter_model', \ThinkRank\Core\Settings::DEFAULT_OPENROUTER_MODEL);
+
+        // Validate the key format first (OpenRouter keys start with "sk-or-").
+        if (!str_starts_with($api_key, 'sk-or-')) {
+            return [
+                'success' => false,
+                'message' => __('Invalid OpenRouter API key format. Should start with "sk-or-"', 'thinkrank'),
+            ];
+        }
+
+        // The key endpoint validates the credential and returns its metadata.
+        $url = 'https://openrouter.ai/api/v1/key';
+
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $api_key,
+                'Content-Type' => 'application/json',
+                'HTTP-Referer' => home_url('/'),
+                'X-Title' => 'ThinkRank',
+            ],
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($response)) {
+            return [
+                'success' => false,
+                'message' => __('Failed to connect to OpenRouter API: ', 'thinkrank') . $response->get_error_message(),
+            ];
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        if ($status_code === 200) {
+            $data = json_decode($body, true);
+            if (isset($data['data']) && is_array($data['data'])) {
+                // The key is good; the catalogue is a separate document, so
+                // the model needs its own lookup.
+                if ($model !== '') {
+                    $model_check = $this->check_openrouter_model($api_key, $model);
+                    if ($model_check !== null) {
+                        return $model_check;
+                    }
+                }
+
+                return [
+                    'success' => true,
+                    'model' => $model,
+                    'model_available' => $model !== '',
+                    'message' => $model !== ''
+                        /* translators: %s: the model id that was tested. */
+                        ? sprintf(__('OpenRouter API connection successful. Model "%s" is available.', 'thinkrank'), $model)
+                        : __('OpenRouter API connection successful!', 'thinkrank'),
+                ];
+            }
+        }
+
+        // Handle error response
+        $error_data = json_decode($body, true);
+        $error_message = $error_data['error']['message'] ?? __('Unknown API error', 'thinkrank');
+
+        return [
+            'success' => false,
+            'message' => __('OpenRouter API Error: ', 'thinkrank') . $error_message,
+        ];
+    }
+
+    /**
+     * Verify a model id against OpenRouter's public catalogue.
+     *
+     * @param string $api_key API key to authenticate the lookup
+     * @param string $model   Model id to look for
+     * @return array|null Failure payload when the model is unknown, null when it
+     *                    is available or when the catalogue could not be read —
+     *                    a listing hiccup must not fail an otherwise good key.
+     */
+    private function check_openrouter_model(string $api_key, string $model): ?array {
+        $response = wp_remote_get('https://openrouter.ai/api/v1/models', [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $api_key,
+                'Content-Type' => 'application/json',
+                'HTTP-Referer' => home_url('/'),
+                'X-Title' => 'ThinkRank',
+            ],
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+            return null;
+        }
+
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+        if (!isset($data['data']) || !is_array($data['data'])) {
+            return null;
+        }
+
+        $ids = array_column($data['data'], 'id');
+        if (in_array($model, $ids, true)) {
+            return null;
+        }
+
+        return [
+            'success' => false,
+            'model' => $model,
+            'model_available' => false,
+            /* translators: %s: the model id that was tested. */
+            'message' => sprintf(__('API key works, but "%s" is not a model OpenRouter offers.', 'thinkrank'), $model),
+        ];
+    }
+
+    /**
+     * Test Claude API connection
+     *
+     * @param string $api_key API key to test
+     * @param string $model   Model id to verify, or '' to use the saved one
+     * @return array Test result
+     */
+    private function test_claude_connection(string $api_key, string $model = ''): array {
+        // First validate the key format
+        if (!str_starts_with($api_key, 'sk-ant-')) {
+            return [
+                'success' => false,
+                'message' => __('Invalid Claude API key format. Should start with "sk-ant-"', 'thinkrank'),
+            ];
+        }
+
+        // Test with a simple API call
+        $url = 'https://api.anthropic.com/v1/messages';
+
+        // A model sent with the request is tested verbatim: normalizing it would
+        // quietly swap a typo for a working id and report success for a model
+        // the user never asked for. Only the saved fallback is self-healed, as
+        // that is the path where a retired id from an older release shows up.
+        if ($model !== '') {
+            $claude_model = $model;
+        } else {
+            $claude_model = \ThinkRank\Core\Settings::instance()->get('claude_model', \ThinkRank\Core\Settings::DEFAULT_CLAUDE_MODEL);
+            $claude_model = \ThinkRank\AI\Claude_Client::normalize_model($claude_model);
+        }
+
+        $body = [
+            'model' => $claude_model,
+            'max_tokens' => 10,
+            'messages' => [
+                [
+                    'role' => 'user',
+                    'content' => 'Hello'
+                ]
+            ]
+        ];
+
+        $response = wp_remote_post($url, [
+            'headers' => [
+                'x-api-key' => $api_key,
+                'Content-Type' => 'application/json',
+                'anthropic-version' => '2023-06-01',
+            ],
+            'body' => wp_json_encode($body),
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($response)) {
+            return [
+                'success' => false,
+                'message' => __('Failed to connect to Claude API: ', 'thinkrank') . $response->get_error_message(),
+            ];
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+
+        if ($status_code === 200) {
+            return [
+                'success' => true,
+                'model' => $claude_model,
+                'model_available' => true,
+                /* translators: %s: the model id that was tested. */
+                'message' => sprintf(__('Claude API connection successful. Model "%s" is available.', 'thinkrank'), $claude_model),
+            ];
+        } else {
+            $error_data = json_decode($response_body, true);
+            $error_message = $error_data['error']['message'] ?? __('Unknown API error', 'thinkrank');
+
+            // 404 on /v1/messages means the key authenticated but the model id
+            // does not exist — say so, instead of blaming the key.
+            if ($status_code === 404) {
+                return [
+                    'success' => false,
+                    'model' => $claude_model,
+                    'model_available' => false,
+                    /* translators: %s: the model id that was tested. */
+                    'message' => sprintf(__('API key works, but the model "%s" was not found.', 'thinkrank'), $claude_model),
+                ];
+            }
+
+            return [
+                'success' => false,
+                'model' => $claude_model,
+                /* translators: %1$d: HTTP status code, %2$s: error message from Claude API */
+                'message' => sprintf(__('Claude API error (%1$d): %2$s', 'thinkrank'), $status_code, $error_message),
+            ];
+        }
+    }
+
+    /**
+     * Test Gemini API connection
+     *
+     * @param string $api_key API key to test
+     * @param string $model   Model id to verify, or '' to use the saved one
+     * @return array Test result
+     */
+    private function test_gemini_connection(string $api_key, string $model = ''): array {
+        // Test with a simple API call
+        $gemini_model = $model !== ''
+            ? $model
+            : (string) \ThinkRank\Core\Settings::instance()->get('gemini_model', \ThinkRank\Core\Settings::DEFAULT_GEMINI_MODEL);
+
+        // The model is a path segment, and ids may arrive with the "models/"
+        // prefix Google's own docs use.
+        $gemini_model = ltrim($gemini_model, '/');
+        $gemini_model = preg_replace('#^models/#', '', $gemini_model);
+
+        $url = 'https://generativelanguage.googleapis.com/v1beta/models/'
+            . rawurlencode($gemini_model)
+            . ':generateContent?key=' . rawurlencode($api_key);
+
+        $body = [
+            'contents' => [
+                [
+                    'parts' => [
+                        ['text' => 'Hello']
+                    ]
+                ]
+            ],
+            'generationConfig' => [
+                'maxOutputTokens' => 10,
+                'temperature' => 0.1,
+            ]
+        ];
+
+        $response = wp_remote_post($url, [
+            'headers' => [
+                'Content-Type' => 'application/json',
+            ],
+            'body' => wp_json_encode($body),
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($response)) {
+            return [
+                'success' => false,
+                'message' => __('Failed to connect to Gemini API: ', 'thinkrank') . $response->get_error_message(),
+            ];
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+
+        if ($status_code === 200) {
+            return [
+                'success' => true,
+                'model' => $gemini_model,
+                'model_available' => true,
+                /* translators: %s: the model id that was tested. */
+                'message' => sprintf(__('Gemini API connection successful. Model "%s" is available.', 'thinkrank'), $gemini_model),
+            ];
+        } else {
+            $error_data = json_decode($response_body, true);
+            $error_message = $error_data['error']['message'] ?? __('Unknown API error', 'thinkrank');
+
+            // Gemini answers 404 for a model id it does not serve; the key
+            // itself authenticated fine, so name the real problem.
+            if ($status_code === 404) {
+                return [
+                    'success' => false,
+                    'model' => $gemini_model,
+                    'model_available' => false,
+                    /* translators: %s: the model id that was tested. */
+                    'message' => sprintf(__('API key works, but the model "%s" was not found.', 'thinkrank'), $gemini_model),
+                ];
+            }
+
+            return [
+                'success' => false,
+                'model' => $gemini_model,
+                /* translators: %1$d: HTTP status code, %2$s: error message from Gemini API */
+                'message' => sprintf(__('Gemini API error (%1$d): %2$s', 'thinkrank'), $status_code, $error_message),
+            ];
+        }
+    }
+
+    /**
+     * Get AI providers
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_ai_providers(\WP_REST_Request $request): \WP_REST_Response {
+        $ai_manager = new \ThinkRank\AI\Manager();
+        $providers = $ai_manager->get_available_providers();
+
+        return new \WP_REST_Response($providers);
+    }
+
+    /**
+     * Get AI status
+     *
+     * @param \WP_REST_Request $request Request object
+     * @return \WP_REST_Response Response object
+     */
+    public function get_ai_status(\WP_REST_Request $request): \WP_REST_Response {
+        $ai_manager = new \ThinkRank\AI\Manager();
+        $status = $ai_manager->get_provider_status();
+
+        // The spend ceiling and kill switch ride on the status the AI screen
+        // already polls, rather than a route of their own: a counter the user
+        // has to refresh separately to trust is a counter they will not trust
+        // (#448).
+        $status['budget'] = \ThinkRank\AI\Spend_Guard::status();
+
+        return new \WP_REST_Response($status);
+    }
+
+    /**
+     * Analyze content for SEO optimization
+     *
+     * @param \WP_REST_Request $request Request object containing content, metadata, and optional post_id
+     * @return \WP_REST_Response Response object with analysis results or error message
+     * @throws \Exception When AI analysis fails or AI client initialization fails
+     */
+    public function analyze_content(\WP_REST_Request $request): \WP_REST_Response {
+        $content = $request->get_param('content');
+        $metadata = $request->get_param('metadata') ?: [];
+        $post_id = $request->get_param('post_id');
+
+        // Rate limiting: per user/IP per route
+        $user_id = get_current_user_id();
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : 'unknown'; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+        $bucket_id = 'ai_analyze|' . ($user_id ?: $ip);
+        $limit = (int) \ThinkRank\Core\Settings::instance()->get('max_requests_per_minute', 0);
+        $allowed = $this->enforce_rate_limit($bucket_id, $limit);
+        if (is_wp_error($allowed)) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $allowed->get_error_message(),
+            ], $allowed->get_error_data()['status'] ?? 429);
+        }
+
+        try {
+            // Get AI manager instance
+            $ai_manager = new \ThinkRank\AI\Manager();
+            $ai_manager->initialize_client();
+
+            // Perform content analysis
+            $analysis = $ai_manager->analyze_content($content, $metadata);
+
+            return new \WP_REST_Response([
+                'success' => true,
+                'data' => $analysis,
+                'message' => __('Content analyzed successfully', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            return new \WP_REST_Response([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 400);
+        }
+    }
+
+    /**
+     * Sanitize metadata object for API endpoints
+     *
+     * @param mixed $metadata Metadata to sanitize
+     * @return array Sanitized metadata array
+     */
+    public function sanitize_metadata_object($metadata): array {
+        if (!is_array($metadata)) {
+            return [];
+        }
+
+        $sanitized = [];
+        foreach ($metadata as $key => $value) {
+            $sanitized_key = sanitize_key($key);
+
+            if (is_string($value)) {
+                $sanitized[$sanitized_key] = sanitize_text_field($value);
+            } elseif (is_array($value)) {
+                // Recursively sanitize nested arrays
+                $sanitized[$sanitized_key] = array_map('sanitize_text_field', $value);
+            } elseif (is_numeric($value)) {
+                $sanitized[$sanitized_key] = (float) $value;
+            } elseif (is_bool($value)) {
+                $sanitized[$sanitized_key] = (bool) $value;
+            }
+            // Skip other data types for security
+        }
+
+        return $sanitized;
+    }
+
+    /**
+     * Register endpoint classes
+     *
+     * @return void
+     */
+    public function register_endpoint_classes(): void {
+        // Register endpoint classes that exist
+        try {
+            $site_identity_endpoint = new Site_Identity_Endpoint();
+            $site_identity_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Site Identity endpoint
+        }
+
+        try {
+            $ai_insights_endpoint = new Ai_Insights_Endpoint();
+            $ai_insights_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register AI Insights endpoint
+        }
+
+        try {
+            $performance_endpoint = new Performance_Endpoint();
+            $performance_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Performance endpoint
+        }
+
+        try {
+            $schema_endpoint = new Schema_Endpoint();
+            $schema_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Schema endpoint
+        }
+
+        try {
+            $settings_endpoint = new Settings_Management_Endpoint();
+            $settings_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Settings Management endpoint
+        }
+
+        try {
+            $integrations_endpoint = new Integrations_Endpoint();
+            $integrations_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Integrations endpoint
+        }
+
+        try {
+            $social_platforms_endpoint = new Social_Platforms_Endpoint();
+            $social_platforms_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Social Platforms endpoint
+        }
+
+        try {
+            $content_brief_endpoint = new Content_Brief_Endpoint();
+            $content_brief_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Content Brief endpoint
+        }
+
+        try {
+            $social_media_endpoint = new Social_Media_Endpoint();
+            $social_media_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Social Media endpoint
+        }
+
+        try {
+            $sitemap_endpoint = new Sitemap_Endpoint();
+            $sitemap_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Sitemap endpoint
+        }
+
+        try {
+            $llms_txt_endpoint = new LLMs_Txt_Endpoint();
+            $llms_txt_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register LLMs.txt endpoint
+        }
+
+        try {
+            $global_seo_endpoint = new Global_SEO_Endpoint();
+            $global_seo_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Global SEO endpoint
+        }
+
+        try {
+            $content_type_matrix_endpoint = new \ThinkRank\API\Content_Type_Matrix_Endpoint();
+            $content_type_matrix_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Content Type Matrix endpoint
+        }
+
+        try {
+            // Bulk Snippets (#727): lives under global-seo/, so the Role
+            // Manager's Bulk SEO Optimization capability covers it.
+            $snippets_endpoint = new \ThinkRank\API\Snippets_Endpoint();
+            $snippets_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Bulk Snippets endpoint
+        }
+
+        try {
+            // Thin content report (#565): also under global-seo/, so the same
+            // Bulk SEO Optimization capability covers it.
+            $thin_content_endpoint = new \ThinkRank\API\Thin_Content_Endpoint();
+            $thin_content_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Thin Content endpoint
+        }
+
+        try {
+            $image_seo_endpoint = new Image_SEO_Endpoint();
+            $image_seo_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Image SEO endpoint
+        }
+
+        try {
+            $external_links_endpoint = new External_Links_Endpoint();
+            $external_links_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register External Links endpoint
+        }
+
+        // Import_Controller is deliberately NOT gated on enable_migration_tools.
+        // /import/detect backs the setup wizard's migration step and the record
+        // count on Settings > Import / Export, and /import/snapshot + /migrate
+        // run the wizard's actual import — all on a fresh install, where the
+        // setting is off. Gating them would break onboarding, which is a worse
+        // bug than the one #583 reports.
+        try {
+            $import_controller = new Import_Controller();
+            $import_controller->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Import endpoint
+        }
+
+        // Export/restore is gated on the setting that gates its admin screen,
+        // so turning Import / Export off removes its REST surface along with
+        // its menu item (#583). Nothing in the setup wizard calls these:
+        // MigrationPluginRow takes startExport/startMigration/cancel from
+        // useImportWorkflow and never uploadFile. rest_api_init runs per
+        // request, so a toggle takes effect on the next one — no flush.
+        if ((bool) \ThinkRank\Core\Settings::instance()->get('enable_import_export', false)) {
+            try {
+                $export_controller = new Export_Controller();
+                $export_controller->register_routes();
+            } catch (\Exception $e) {
+                // Failed to register Export endpoint
+            }
+        }
+
+        try {
+            $setup_wizard_endpoint = new Setup_Wizard_Endpoint();
+            $setup_wizard_endpoint->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register Setup Wizard endpoint
+        }
+
+        // Simple / Advanced navigation, per user (#730)
+        try {
+            (new UI_Mode_Endpoint())->register_routes();
+        } catch (\Exception $e) {
+            // Failed to register UI mode endpoint
+        }
+    }
+}

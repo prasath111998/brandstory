@@ -1,0 +1,1672 @@
+<?php
+
+/**
+ * Meta Box Manager
+ * 
+ * Handles ThinkRank meta boxes in post/page edit screens
+ * 
+ * @package ThinkRank\Admin
+ * @since 1.0.0
+ */
+
+declare(strict_types=1);
+
+namespace ThinkRank\Admin;
+
+use ThinkRank\AI\Metadata_Generator;
+use ThinkRank\AI\SEOScoreCalculator;
+use ThinkRank\Core\Settings;
+use ThinkRank\Core\Database;
+use ThinkRank\Core\Plan_Config;
+use ThinkRank\SEO\Focus_Keywords;
+use ThinkRank\SEO\Object_Redirect;
+use ThinkRank\SEO\Pattern_Resolver;
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Meta Box Manager Class
+ * 
+ * Single Responsibility: Manage post/page meta boxes
+ * 
+ * @since 1.0.0
+ */
+class Metabox_Manager {
+
+    /**
+     * Settings instance
+     * 
+     * @var Settings
+     */
+    private Settings $settings;
+
+    /**
+     * Metadata generator instance
+     *
+     * @var Metadata_Generator
+     */
+    private Metadata_Generator $metadata_generator;
+
+    /**
+     * SEO Score Calculator instance
+     *
+     * @var SEOScoreCalculator
+     */
+    private SEOScoreCalculator $seo_calculator;
+
+    /**
+     * Constructor
+     *
+     * @param Settings|null $settings Settings instance
+     * @param Metadata_Generator|null $metadata_generator Metadata generator instance
+     * @param SEOScoreCalculator|null $seo_calculator SEO Score Calculator instance
+     */
+    public function __construct(?Settings $settings = null, ?Metadata_Generator $metadata_generator = null, ?SEOScoreCalculator $seo_calculator = null) {
+        $this->settings = $settings ?? Settings::instance();
+        $this->metadata_generator = $metadata_generator ?? new Metadata_Generator();
+        $this->seo_calculator = $seo_calculator ?? new SEOScoreCalculator(new Database());
+    }
+
+    /**
+     * Initialize meta box manager
+     * 
+     * @return void
+     */
+    public function init(): void {
+        add_action('add_meta_boxes', [$this, 'add_meta_boxes']);
+        add_action('save_post', [$this, 'save_meta_boxes'], 10, 2);
+        add_action('admin_enqueue_scripts', [$this, 'enqueue_metabox_scripts']);
+        add_action('admin_notices', [$this, 'render_redirect_notice']);
+        add_action('init', [$this, 'register_meta_fields']);
+
+        // AJAX handlers for meta box functionality
+        add_action('wp_ajax_thinkrank_generate_post_metadata', [$this, 'ajax_generate_post_metadata']);
+
+        // Full metabox save used by editors that don't submit the #post form
+        // (e.g. the Elementor editor). Persists every metabox field at once.
+        add_action('wp_ajax_thinkrank_save_metabox', [$this, 'ajax_save_metabox']);
+
+        // Removed debug hooks
+    }
+
+    /**
+     * Register meta fields for REST API access
+     *
+     * @return void
+     */
+    public function register_meta_fields(): void {
+        // Register schema form data meta fields
+        register_post_meta('', '_thinkrank_schema_form_data', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'string',
+            'sanitize_callback' => [$this, 'sanitize_json_meta_field'],
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', '_thinkrank_selected_schema_type', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'string',
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', '_thinkrank_additional_schemas', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'string',
+            'sanitize_callback' => [$this, 'sanitize_json_ld_field'],
+            'auth_callback' => function() {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        // SEO meta fields for import support
+        $string_meta_fields = [
+            '_thinkrank_canonical_url',
+            '_thinkrank_og_title',
+            '_thinkrank_og_description',
+            '_thinkrank_og_image',
+            '_thinkrank_twitter_title',
+            '_thinkrank_twitter_description',
+            '_thinkrank_twitter_image',
+            '_thinkrank_imported_from',
+        ];
+
+        foreach ($string_meta_fields as $meta_key) {
+            register_post_meta('', $meta_key, [
+                'show_in_rest' => true,
+                'single' => true,
+                'type' => 'string',
+                'auth_callback' => function () {
+                    return current_user_can('edit_posts') || current_user_can('edit_pages');
+                }
+            ]);
+        }
+
+        // Multiple focus keywords (array). The legacy single-value
+        // `_thinkrank_focus_keyword` is kept in sync by Focus_Keywords for
+        // backward compatibility and registered for REST as a string elsewhere.
+        register_post_meta('', Focus_Keywords::META_KEY, [
+            'show_in_rest' => [
+                'schema' => [
+                    'type'  => 'array',
+                    'items' => ['type' => 'string'],
+                ],
+            ],
+            'single' => true,
+            'type' => 'array',
+            'sanitize_callback' => function ($value) {
+                return Focus_Keywords::normalize($value);
+            },
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', Focus_Keywords::LEGACY_META_KEY, [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'string',
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', '_thinkrank_robots_meta_enabled', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'integer',
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', '_thinkrank_robots_meta', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'string',
+            'sanitize_callback' => [$this, 'sanitize_json_meta_field'],
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', '_thinkrank_advanced_robots_meta', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'string',
+            'sanitize_callback' => [$this, 'sanitize_json_meta_field'],
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', \ThinkRank\SEO\Content_Visibility::SEARCH_META, [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'integer',
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', \ThinkRank\SEO\Content_Visibility::ARCHIVE_META, [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'integer',
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+
+        register_post_meta('', '_thinkrank_primary_category', [
+            'show_in_rest' => true,
+            'single' => true,
+            'type' => 'integer',
+            'auth_callback' => function () {
+                return current_user_can('edit_posts') || current_user_can('edit_pages');
+            }
+        ]);
+    }
+
+    /**
+     * Sanitize JSON meta field data
+     *
+     * Validates JSON structure and recursively sanitizes all string values
+     * to prevent XSS and injection attacks.
+     *
+     * @param string $value Raw JSON string value
+     * @return string Sanitized JSON string or empty string if invalid
+     */
+    public function sanitize_json_meta_field(string $value): string {
+        // Return empty string for non-string values
+        if (!is_string($value) || empty($value)) {
+            return '';
+        }
+
+        // Validate JSON structure
+        $decoded = json_decode($value, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            // Invalid JSON - return empty string
+            return '';
+        }
+
+        // Check for reasonable data size (prevent JSON bombs)
+        if (strlen($value) > 50000) { // 50KB limit
+            return '';
+        }
+
+        // Recursively sanitize all values
+        $sanitized = $this->sanitize_json_recursively($decoded);
+
+        // Re-encode as JSON
+        $result = wp_json_encode($sanitized);
+        return $result !== false ? $result : '';
+    }
+
+    /**
+     * Recursively sanitize JSON data
+     *
+     * @param mixed $data Data to sanitize
+     * @param int $depth Current recursion depth
+     * @return mixed Sanitized data
+     */
+    private function sanitize_json_recursively($data, int $depth = 0) {
+        // Prevent deep recursion attacks
+        if ($depth > 10) {
+            return null;
+        }
+
+        if (is_array($data)) {
+            $sanitized = [];
+            foreach ($data as $key => $value) {
+                $clean_key = sanitize_key($key);
+                $sanitized[$clean_key] = $this->sanitize_json_recursively($value, $depth + 1);
+            }
+            return $sanitized;
+        }
+
+        if (is_string($data)) {
+            // Sanitize string data to prevent XSS
+            return sanitize_textarea_field($data);
+        }
+
+        if (is_numeric($data)) {
+            return $data;
+        }
+
+        if (is_bool($data)) {
+            return $data;
+        }
+
+        // For any other data type, return null
+        return null;
+    }
+
+	/**
+	 * Sanitize JSON-LD meta field data
+	 *
+	 * Validates JSON structure, recursively sanitizes all string values,
+	 * and preserves @ characters in keys (crucial for JSON-LD).
+	 *
+	 * @param string $value Raw JSON string value
+	 *
+	 * @return string Sanitized JSON string or empty string if invalid
+	 */
+	public function sanitize_json_ld_field( string $value ): string {
+		// Return empty string for non-string values
+		if ( ! is_string( $value ) || empty( $value ) ) {
+			return '';
+		}
+
+		// Validate JSON structure
+		$decoded = json_decode( $value, true );
+		if ( json_last_error() !== JSON_ERROR_NONE ) {
+			// Invalid JSON - return empty string
+			return '';
+		}
+
+		// Check for reasonable data size (prevent JSON bombs)
+		if ( strlen( $value ) > 200000 ) { // Limit to 200KB for larger schemas
+			return '';
+		}
+
+		// Recursively sanitize all values
+		$sanitized = $this->sanitize_json_ld_recursively( $decoded );
+
+		// Re-encode as JSON
+		$result = wp_json_encode( $sanitized );
+
+		return $result !== false ? $result : '';
+	}
+
+	/**
+	 * Recursively sanitize JSON-LD data
+	 *
+	 * Similar to sanitize_json_recursively but preserves @ symbol and case in keys.
+	 *
+	 * @param mixed $data Data to sanitize
+	 * @param int $depth Current recursion depth
+	 *
+	 * @return mixed Sanitized data
+	 */
+	private function sanitize_json_ld_recursively( $data, int $depth = 0 ) {
+		// Prevent deep recursion attacks
+		if ( $depth > 10 ) {
+			return null;
+		}
+
+		if ( is_array( $data ) ) {
+			$sanitized = [];
+			foreach ( $data as $key => $value ) {
+				// Allow alphanumeric, underscore, dash, and @ (crucial for JSON-LD)
+				// Also preserve case as JSON-LD keys are case-sensitive
+				$clean_key               = preg_replace( '/[^a-zA-Z0-9_\-@]/', '', (string) $key );
+				$sanitized[ $clean_key ] = $this->sanitize_json_ld_recursively( $value, $depth + 1 );
+			}
+
+			return $sanitized;
+		}
+
+		if ( is_string( $data ) ) {
+			// Sanitize string data to prevent XSS
+			return sanitize_textarea_field( $data );
+		}
+
+		if ( is_numeric( $data ) ) {
+			return $data;
+		}
+
+		if ( is_bool( $data ) ) {
+			return $data;
+		}
+
+		// For any other data type, return null
+		return null;
+	}
+
+    // Removed debug methods
+
+    /**
+     * Add ThinkRank meta boxes
+     *
+     * @return void
+     */
+    public function add_meta_boxes(): void {
+        $post_types = $this->get_supported_post_types();
+
+        $is_block_editor = $this->is_block_editor_screen();
+
+        foreach ($post_types as $post_type) {
+            add_meta_box(
+                'thinkrank-seo-metabox',
+                __('ThinkRank SEO', 'thinkrank'),
+                [$this, 'render_seo_metabox'],
+                $post_type,
+                'normal',
+                'high'
+            );
+
+            // Classic Editor sidebar quick-access widget (mirrors SureRank's
+            // "Manage your SEO" sidebar box). Skipped in the Block Editor, which
+            // surfaces the full panel below the content instead.
+            if (!$is_block_editor) {
+                add_meta_box(
+                    'thinkrank-seo-sidebar',
+                    __('ThinkRank', 'thinkrank'),
+                    [$this, 'render_sidebar_meta_box'],
+                    $post_type,
+                    'side',
+                    'high'
+                );
+            }
+        }
+    }
+
+    /**
+     * Whether the current edit screen is using the Block Editor.
+     *
+     * @return bool True when the Block Editor is active, false for Classic Editor.
+     */
+    private function is_block_editor_screen(): bool {
+        if (!function_exists('get_current_screen')) {
+            return false;
+        }
+
+        $screen = get_current_screen();
+
+        return $screen instanceof \WP_Screen
+            && method_exists($screen, 'is_block_editor')
+            && $screen->is_block_editor();
+    }
+
+    /**
+     * Render the Classic Editor sidebar quick-access widget.
+     *
+     * Shows a short label plus a button that scrolls to (and expands) the full
+     * "ThinkRank SEO" panel in the main column.
+     *
+     * @param \WP_Post $post Post object.
+     * @return void
+     */
+    public function render_sidebar_meta_box(\WP_Post $post): void {
+        $box_title = apply_filters('thinkrank_seo_sidebar_box_title', __('Optimize this content for search & AI with ThinkRank.', 'thinkrank'), $post);
+        $cta_label = apply_filters('thinkrank_seo_sidebar_cta_label', __('Open ThinkRank SEO', 'thinkrank'), $post);
+        ?>
+        <div class="thinkrank-classic-sidebar-box">
+            <p class="thinkrank-classic-sidebar-box-title"><?php echo esc_html($box_title); ?></p>
+            <button
+                type="button"
+                class="button button-primary thinkrank-classic-sidebar-box-cta"
+            >
+                <?php echo esc_html($cta_label); ?>
+            </button>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render SEO meta box
+     * 
+     * @param \WP_Post $post Post object
+     * @return void
+     */
+    public function render_seo_metabox(\WP_Post $post): void {
+        // Add nonce for security
+        wp_nonce_field('thinkrank_metabox_nonce', 'thinkrank_metabox_nonce');
+
+        // Get existing metadata
+        $existing_metadata = $this->get_post_metadata($post->ID);
+
+        // Get post content for AI analysis
+        $content_preview = $this->get_content_preview($post);
+
+        // Render React metabox container with hidden form fields for data
+?>
+        <div id="thinkrank-metabox-container" class="thinkrank-metabox">
+
+            <!-- Hidden form fields for React to read initial data -->
+            <input type="hidden" id="thinkrank_seo_title" name="thinkrank_seo_title" value="<?php echo esc_attr($existing_metadata['title'] ?? ''); ?>" />
+            <input type="hidden" id="thinkrank_meta_description" name="thinkrank_meta_description" value="<?php echo esc_attr($existing_metadata['description'] ?? ''); ?>" />
+            <?php // Render-time mirrors of the two fields a background writer (Auto AI, bulk, import) can fill after load. The React app never touches these, so on save they still hold the value shown when the form loaded — letting persist_metadata() tell a stale blank apart from a deliberate clear. ?>
+            <input type="hidden" id="thinkrank_seo_title__orig" name="thinkrank_seo_title__orig" value="<?php echo esc_attr($existing_metadata['title'] ?? ''); ?>" />
+            <input type="hidden" id="thinkrank_meta_description__orig" name="thinkrank_meta_description__orig" value="<?php echo esc_attr($existing_metadata['description'] ?? ''); ?>" />
+            <input type="hidden" id="thinkrank_focus_keyword" name="thinkrank_focus_keyword" value="<?php echo esc_attr($existing_metadata['focus_keyword'] ?? ''); ?>" />
+            <input type="hidden" id="thinkrank_focus_keywords" name="thinkrank_focus_keywords" value="<?php echo esc_attr(wp_json_encode($existing_metadata['focus_keywords'] ?? [])); ?>" />
+            <input type="hidden" id="thinkrank_seo_score" name="thinkrank_seo_score" value="<?php echo esc_attr($existing_metadata['seo_score'] ?? '0'); ?>" />
+            <input type="hidden" id="thinkrank_generated_at" name="thinkrank_generated_at" value="<?php echo esc_attr($existing_metadata['generated_at'] ?? ''); ?>" />
+            <input type="hidden" id="thinkrank_pillar_content" name="thinkrank_pillar_content" value="<?php echo esc_attr($existing_metadata['pillar_content'] ?? ''); ?>" />
+            <input type="hidden" id="thinkrank_exclude_from_search" name="thinkrank_exclude_from_search" value="<?php echo esc_attr((string) ($existing_metadata['exclude_from_search'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_exclude_from_archives" name="thinkrank_exclude_from_archives" value="<?php echo esc_attr((string) ($existing_metadata['exclude_from_archives'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_canonical_url" name="thinkrank_canonical_url" value="<?php echo esc_url($existing_metadata['canonical_url'] ?? ''); ?>" />
+            <?php
+            // The redirect lives in Pro's rules table, not post meta, so nothing
+            // else hands it to the React app. Without these the field loads
+            // empty, and its own hidden input then posts that empty value on the
+            // next save, which Object_Redirect reads as "remove the redirect".
+            // Rendered only when a provider can store it, matching MetaboxApp.
+            if (Object_Redirect::is_supported()) :
+                ?>
+            <input type="hidden" id="thinkrank_redirect_url" name="thinkrank_redirect_url" value="<?php echo esc_attr((string) ($existing_metadata['redirect_url'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_redirect_type" name="thinkrank_redirect_type" value="<?php echo esc_attr((string) ($existing_metadata['redirect_type'] ?? Object_Redirect::DEFAULT_TYPE)); ?>" />
+            <?php endif; ?>
+            <input type="hidden" id="thinkrank_robots_meta_enabled" name="thinkrank_robots_meta_enabled" value="<?php echo esc_attr((string) ($existing_metadata['robots_meta_enabled'] ?? '0')); ?>" />
+            <input type="hidden" id="thinkrank_robots_meta" name="thinkrank_robots_meta" value="<?php echo esc_attr((string) ($existing_metadata['robots_meta'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_advanced_robots_meta" name="thinkrank_advanced_robots_meta" value="<?php echo esc_attr((string) ($existing_metadata['advanced_robots_meta'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_og_title" name="thinkrank_og_title" value="<?php echo esc_attr((string) ($existing_metadata['og_title'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_og_description" name="thinkrank_og_description" value="<?php echo esc_attr((string) ($existing_metadata['og_description'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_og_image" name="thinkrank_og_image" value="<?php echo esc_url((string) ($existing_metadata['og_image'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_twitter_title" name="thinkrank_twitter_title" value="<?php echo esc_attr((string) ($existing_metadata['twitter_title'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_twitter_description" name="thinkrank_twitter_description" value="<?php echo esc_attr((string) ($existing_metadata['twitter_description'] ?? '')); ?>" />
+            <input type="hidden" id="thinkrank_twitter_image" name="thinkrank_twitter_image" value="<?php echo esc_url((string) ($existing_metadata['twitter_image'] ?? '')); ?>" />
+            <textarea id="thinkrank_content_preview" style="display: none;"><?php echo esc_textarea($content_preview); ?></textarea>
+        </div>
+<?php
+
+    }
+
+    /**
+     * Save meta box data
+     *
+     * @param int $post_id Post ID
+     * @param \WP_Post $post Post object
+     * @return void
+     */
+    public function save_meta_boxes(int $post_id, \WP_Post $post): void {
+        // Verify nonce
+        if (!isset($_POST['thinkrank_metabox_nonce'])) {
+            return;
+        }
+
+        $nonce = sanitize_text_field(wp_unslash($_POST['thinkrank_metabox_nonce']));
+        if (!wp_verify_nonce($nonce, 'thinkrank_metabox_nonce')) {
+            return;
+        }
+
+        // Check permissions
+        if (!current_user_can('edit_post', $post_id)) {
+            return;
+        }
+
+        // Skip autosave
+        if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) {
+            return;
+        }
+
+        // The classic/block editor submits the metabox fields as part of the
+        // #post form, so they arrive (slashed) in $_POST. Hand them straight to
+        // the shared persistence routine.
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above
+        $this->persist_metadata($post_id, wp_unslash($_POST));
+
+        // The redirect is the one field here that can be refused outright. The
+        // response to this request is a redirect back to the editor, so the
+        // reason has to survive one page load to be seen at all.
+        $redirect_error = $this->get_last_redirect_error();
+        if (null !== $redirect_error) {
+            $this->store_redirect_error($redirect_error);
+        }
+    }
+
+    /**
+     * Persist metabox fields for a post from a form-field-name => value map,
+     * reusing the shared metabox persistence (sanitization, JSON encoding,
+     * focus-keyword normalization, empty-value deletion).
+     *
+     * Intended for non-form callers such as the MCP abilities layer. The
+     * caller is responsible for authorization; keys use the same
+     * `thinkrank_*` field names accepted by the metabox form (e.g.
+     * `thinkrank_seo_title`, `thinkrank_meta_description`, `thinkrank_robots_meta`).
+     *
+     * @param int   $post_id Post to update.
+     * @param array $fields  Field name => value map.
+     * @return void
+     */
+    public function save_seo_fields(int $post_id, array $fields): void {
+        $this->persist_metadata($post_id, $fields);
+    }
+
+    /**
+     * Persist all metabox fields for a post from a $_POST-shaped (already
+     * unslashed) source array.
+     *
+     * Shared by `save_meta_boxes()` (classic/block editor form submit) and
+     * `ajax_save_metabox()` (editors like Elementor that don't submit the #post
+     * form). Nonce/permission checks are the caller's responsibility. Each field
+     * is independently sanitized; missing keys are left untouched.
+     *
+     * @param int   $post_id Post to update.
+     * @param array $src     Field name => raw value map (unslashed).
+     * @return void
+     */
+    private function persist_metadata(int $post_id, array $src): void {
+        // Title & meta description are handled separately below: they can be
+        // written out-of-band (Auto AI on publish, imports)
+        // after an editor was opened, so a plain save from that now-stale editor
+        // would clobber the generated value with a blank. Focus keywords are
+        // likewise handled separately (array meta) via Focus_Keywords below.
+        //
+        // Both fields may hold variable tags, so they are sanitized as templates:
+        // sanitize_text_field()/sanitize_textarea_field() strip %date% and
+        // %category% as percent-encoding and store "te%" / "tegory%" (#521).
+        $this->persist_seo_text_field($post_id, $src, 'thinkrank_seo_title', '_thinkrank_seo_title', [Pattern_Resolver::class, 'sanitize_template']);
+        $this->persist_seo_text_field($post_id, $src, 'thinkrank_meta_description', '_thinkrank_meta_description', [Pattern_Resolver::class, 'sanitize_template_textarea']);
+
+        $fields = [
+            'thinkrank_seo_score' => 'absint',
+            'thinkrank_generated_at' => 'sanitize_text_field',
+            'thinkrank_pillar_content' => 'sanitize_text_field',
+            'thinkrank_exclude_from_search' => 'sanitize_text_field',
+            'thinkrank_exclude_from_archives' => 'sanitize_text_field',
+        ];
+
+        // Focus keywords: prefer the JSON array field; fall back to the legacy
+        // single string. Focus_Keywords::save() normalizes (dedupe, drop empty,
+        // cap at MAX) and keeps the legacy single-value meta in sync.
+        if (isset($src['thinkrank_focus_keywords'])) {
+            $raw_keywords = $src['thinkrank_focus_keywords'];
+            $decoded = is_string($raw_keywords) ? json_decode($raw_keywords, true) : $raw_keywords;
+            Focus_Keywords::save($post_id, is_array($decoded) ? $decoded : []);
+        } elseif (isset($src['thinkrank_focus_keyword'])) {
+            Focus_Keywords::save($post_id, $src['thinkrank_focus_keyword']);
+        }
+
+        // Update the post slug (post_name) when the metabox permalink field
+        // was edited. This touches the WP post itself, not post meta.
+        //
+        // The baseline is what the field was RENDERED with. Without it the
+        // guard here was a bare isset(), and the hidden input is always
+        // posted — so a user who edited WordPress's own permalink field in
+        // the Classic Editor had their new slug written by core and then
+        // overwritten by this page-load snapshot (#441).
+        if (isset($src['thinkrank_post_slug'])) {
+            $this->maybe_update_slug(
+                $post_id,
+                (string) $src['thinkrank_post_slug'],
+                isset($src['thinkrank_post_slug_baseline'])
+                    ? (string) $src['thinkrank_post_slug_baseline']
+                    : null
+            );
+        }
+
+        // Save canonical URL separately with URL sanitization
+        if (isset($src['thinkrank_canonical_url'])) {
+            $canonical_url = esc_url_raw((string) $src['thinkrank_canonical_url']);
+            if (empty($canonical_url)) {
+                delete_post_meta($post_id, '_thinkrank_canonical_url');
+            } else {
+                update_post_meta($post_id, '_thinkrank_canonical_url', $canonical_url);
+            }
+        }
+
+        $this->last_redirect_error = $this->save_object_redirect('post', $post_id, $src);
+
+        foreach ($fields as $field => $sanitize_callback) {
+            if (isset($src[$field])) {
+                $value = call_user_func($sanitize_callback, $src[$field]);
+                update_post_meta($post_id, "_{$field}", $value);
+            }
+        }
+
+        $this->save_robots_meta($post_id, $src);
+        $this->save_visibility_meta($post_id, $src);
+        $this->save_social_meta($post_id, $src);
+
+        // Update last modified timestamp
+        update_post_meta($post_id, '_thinkrank_last_updated', current_time('mysql'));
+    }
+
+    /**
+     * Persist one SEO text field with an out-of-band-write guard.
+     *
+     * Auto AI (on publish) and imports write the SEO title / meta description
+     * directly to post meta. When that happens after an editor
+     * was opened, the editor's hidden input is a stale blank; a normal save
+     * would overwrite the freshly generated value with that blank. This guard
+     * skips the write only when the submitted value is empty AND it was also
+     * empty when the form was rendered (the `<field>__orig` mirror), yet the
+     * stored value is now non-empty — i.e. a background writer won the race.
+     *
+     * A deliberate clear still applies: if the field held a value at render and
+     * is submitted empty, `$orig` is non-empty so the guard does not trigger.
+     * Callers that don't send the `__orig` mirror (e.g. the MCP/Elementor
+     * paths) keep the plain write behavior.
+     *
+     * @param int      $post_id  Post being saved.
+     * @param array    $src      Unslashed field map.
+     * @param string   $field    POST field name (e.g. thinkrank_seo_title).
+     * @param string   $meta_key Target post meta key.
+     * @param callable $sanitize Sanitizer applied to the submitted value.
+     * @return void
+     */
+    private function persist_seo_text_field(int $post_id, array $src, string $field, string $meta_key, callable $sanitize): void {
+        if (!isset($src[$field])) {
+            return; // Field absent from this submit → leave the stored value untouched.
+        }
+
+        $submitted = (string) call_user_func($sanitize, (string) $src[$field]);
+
+        if ('' === $submitted && isset($src[$field . '__orig'])) {
+            $orig   = (string) $src[$field . '__orig'];
+            $stored = (string) get_post_meta($post_id, $meta_key, true);
+            // Blank now, blank at render, but populated in storage → a background
+            // write landed after this editor loaded; don't clobber it.
+            if ('' === $orig && '' !== $stored) {
+                return;
+            }
+        }
+
+        update_post_meta($post_id, $meta_key, $submitted);
+    }
+
+    /**
+     * Update the post slug (post_name) from the metabox permalink field.
+     *
+     * Runs inside the save_post cycle, so wp_update_post() would recurse — a
+     * static guard prevents re-entry. WordPress applies wp_unique_post_slug(),
+     * so a colliding slug is de-duplicated automatically. Empty input is left
+     * alone (WP keeps/auto-generates the slug); auto-drafts and revisions are
+     * skipped so we don't fight the editor's own slug generation.
+     *
+     * @param int    $post_id  Post to update.
+     * @param string $raw_slug Desired slug from the metabox.
+     * @return void
+     */
+    private function maybe_update_slug(int $post_id, string $raw_slug, ?string $baseline = null): void {
+        static $updating = false;
+        if ($updating) {
+            return;
+        }
+
+        $post = get_post($post_id);
+        if (!$post || wp_is_post_revision($post_id)) {
+            return;
+        }
+
+        if (in_array($post->post_status, ['auto-draft', 'trash'], true)) {
+            return;
+        }
+
+        $desired = sanitize_title($raw_slug);
+        if ($desired === '') {
+            return;
+        }
+
+        // Unchanged from what the form was rendered with, so the user did not
+        // choose this value — they left it alone. Writing it back would undo
+        // whatever core already saved from WordPress's own permalink field a
+        // moment ago, on the same save_post priority (#441).
+        //
+        // Compared against the BASELINE rather than the current post_name on
+        // purpose: by the time this runs core has already updated post_name,
+        // so that comparison cannot tell a deliberate edit from a stale one.
+        if ($baseline !== null && $desired === sanitize_title($baseline)) {
+            return;
+        }
+
+        if ($desired === $post->post_name) {
+            return;
+        }
+
+        $updating = true;
+        wp_update_post([
+            'ID'        => $post_id,
+            'post_name' => $desired,
+        ]);
+        $updating = false;
+    }
+
+    /**
+     * Persist per-post Open Graph and Twitter Card overrides.
+     *
+     * Empty values delete the meta entry so the frontend falls back to the
+     * SEO title / meta description / featured image chain.
+     */
+    private function save_social_meta(int $post_id, array $src): void {
+        $text_fields = [
+            'thinkrank_og_title'            => '_thinkrank_og_title',
+            'thinkrank_og_description'      => '_thinkrank_og_description',
+            'thinkrank_twitter_title'       => '_thinkrank_twitter_title',
+            'thinkrank_twitter_description' => '_thinkrank_twitter_description',
+        ];
+        foreach ($text_fields as $field => $meta_key) {
+            if (!isset($src[$field])) {
+                continue;
+            }
+            // Template fields: the frontend resolves their variable tags, so the
+            // %tokens% have to survive the save (#521).
+            $value = Pattern_Resolver::sanitize_template_textarea((string) $src[$field]);
+            if ($value === '') {
+                delete_post_meta($post_id, $meta_key);
+            } else {
+                update_post_meta($post_id, $meta_key, $value);
+            }
+        }
+
+        $url_fields = [
+            'thinkrank_og_image'      => '_thinkrank_og_image',
+            'thinkrank_twitter_image' => '_thinkrank_twitter_image',
+        ];
+        foreach ($url_fields as $field => $meta_key) {
+            if (!isset($src[$field])) {
+                continue;
+            }
+            $value = esc_url_raw((string) $src[$field]);
+            if ($value === '') {
+                delete_post_meta($post_id, $meta_key);
+            } else {
+                update_post_meta($post_id, $meta_key, $value);
+            }
+        }
+    }
+
+    /**
+     * Save per-post robots meta and advanced robots meta from the metabox.
+     *
+     * Stores the robots payloads as JSON-encoded strings, sanitized via
+     * sanitize_json_meta_field. The toggle plus the two JSON blobs are the
+     * single source of truth for per-post robots overrides.
+     */
+    private function save_robots_meta(int $post_id, array $src): void {
+        if (!isset($src['thinkrank_robots_meta_enabled'])) {
+            return;
+        }
+
+        $enabled = (int) (bool) $src['thinkrank_robots_meta_enabled'];
+        update_post_meta($post_id, '_thinkrank_robots_meta_enabled', $enabled);
+
+        if (isset($src['thinkrank_robots_meta'])) {
+            update_post_meta($post_id, '_thinkrank_robots_meta', $this->sanitize_json_meta_field((string) $src['thinkrank_robots_meta']));
+        }
+
+        if (isset($src['thinkrank_advanced_robots_meta'])) {
+            update_post_meta($post_id, '_thinkrank_advanced_robots_meta', $this->sanitize_json_meta_field((string) $src['thinkrank_advanced_robots_meta']));
+        }
+    }
+
+
+    /**
+     * Save the per-post listing-visibility switches.
+     *
+     * Stored as 1 or deleted rather than 1/0: the excluded set is read with a
+     * `meta_value = '1'` query, so a row holding 0 would be dead weight on every
+     * post anyone ever unticked. Deleting keeps the postmeta table proportional
+     * to the number of posts actually hidden.
+     *
+     * @since 2.7.0
+     *
+     * @param int   $post_id Post being saved.
+     * @param array $src     Submitted fields.
+     * @return void
+     */
+    private function save_visibility_meta(int $post_id, array $src): void {
+        $fields = [
+            'thinkrank_exclude_from_search'   => \ThinkRank\SEO\Content_Visibility::SEARCH_META,
+            'thinkrank_exclude_from_archives' => \ThinkRank\SEO\Content_Visibility::ARCHIVE_META,
+        ];
+
+        foreach ($fields as $field => $meta_key) {
+            if (!isset($src[$field])) {
+                continue;
+            }
+
+            if ((bool) $src[$field]) {
+                update_post_meta($post_id, $meta_key, 1);
+            } else {
+                delete_post_meta($post_id, $meta_key);
+            }
+        }
+
+        \ThinkRank\SEO\Content_Visibility::flush();
+    }
+
+    /**
+     * Enqueue meta box scripts
+     *
+     * @param string $hook Current admin page hook
+     * @return void
+     */
+    public function enqueue_metabox_scripts(string $hook): void {
+        // Only load on post edit screens (including block editor)
+        if (!in_array($hook, ['post.php', 'post-new.php'], true)) {
+            return;
+        }
+
+        // Get current post type - handle both classic and block editor contexts
+        $current_post_type = $this->get_current_post_type();
+        if (!$current_post_type || !in_array($current_post_type, $this->get_supported_post_types(), true)) {
+            return;
+        }
+
+        // Get post object for additional data
+        global $post;
+
+        // Ensure wp.media is available for the social-image media picker.
+        wp_enqueue_media();
+
+        // No chunk dependencies needed - all bundled into main metabox.js
+        // Enqueue React metabox script with direct dependencies
+        $asset_file = THINKRANK_PLUGIN_DIR . 'assets/metabox.asset.php';
+        $asset = file_exists($asset_file) ? include $asset_file : [
+            'dependencies' => ['react', 'wp-element', 'wp-i18n', 'wp-api-fetch', 'wp-components'],
+            'version' => THINKRANK_VERSION
+        ];
+
+        // Use dependencies directly from the asset file. The pinned "Configure
+        // SEO" launcher needs wp-plugins (already listed by the build) and
+        // resolves PinnedItems from wp.editor / wp.interface at runtime, so we do
+        // NOT add wp-interface here: it is not a registered script handle on
+        // WP 7.x, and an unmet dependency would drop the whole metabox script.
+        $dependencies = $asset['dependencies'];
+
+        wp_enqueue_script(
+            'thinkrank-metabox',
+            THINKRANK_PLUGIN_URL . 'assets/metabox.js',
+            $dependencies,
+            $asset['version'],
+            true
+        );
+
+        // Localize script data (shared builder; reused by the Elementor editor
+        // integration, which has no #post form / hidden inputs of its own).
+        wp_localize_script('thinkrank-metabox', 'thinkrankMetabox', $this->get_localized_data($post->ID));
+
+        // Add defer attribute for non-blocking script loading
+        wp_script_add_data('thinkrank-metabox', 'defer', true);
+
+        // Enqueue metabox styles
+        wp_enqueue_style(
+            'thinkrank-metabox',
+            THINKRANK_PLUGIN_URL . 'assets/metabox.css',
+            ['wp-components'],
+            THINKRANK_VERSION
+        );
+
+        // Classic Editor sidebar widget: lightweight styles + a vanilla-JS
+        // handler so the "Optimize Here" button works without depending on the
+        // React bundle. The box itself is only registered in the Classic Editor.
+        $sidebar_css = <<<'CSS'
+.thinkrank-classic-sidebar-box-title{margin:0 0 12px;font-size:13px;line-height:1.5;color:#1e1e1e;}
+.thinkrank-classic-sidebar-box-cta{width:100%;text-align:center;justify-content:center;}
+CSS;
+        wp_add_inline_style('thinkrank-metabox', $sidebar_css);
+
+        $sidebar_js = <<<'JS'
+(function(){
+    document.addEventListener('click', function(e){
+        var btn = e.target.closest && e.target.closest('.thinkrank-classic-sidebar-box-cta');
+        if(!btn){return;}
+        e.preventDefault();
+        // Open the ThinkRank SEO drawer mounted by the React metabox app.
+        window.dispatchEvent(new CustomEvent('thinkrank:toggle-seo-drawer'));
+    });
+})();
+JS;
+        wp_add_inline_script('thinkrank-metabox', $sidebar_js);
+    }
+
+    /**
+     * Build the data object localized into the metabox script (`thinkrankMetabox`).
+     *
+     * Extracted so the Elementor editor integration can reuse the exact same
+     * configuration. Callers that run outside the #post form (Elementor) also
+     * read `existingMetadata`/`contentPreview`, which they add on top of this.
+     *
+     * @param int $post_id Post being edited.
+     * @return array Localized config consumed by the React metabox.
+     */
+    public function get_localized_data(int $post_id): array {
+        $post = get_post($post_id);
+        $post_type = $post ? $post->post_type : 'post';
+
+        // Resolve the correct REST API base for the current post type.
+        // Falls back to the post type slug for any type without a rest_base.
+        $post_type_obj  = get_post_type_object($post_type);
+        $post_rest_base = ($post_type_obj && !empty($post_type_obj->rest_base))
+            ? $post_type_obj->rest_base
+            : $post_type;
+
+        return [
+            'ajaxUrl' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('thinkrank_metabox_ajax'),
+            'postId' => $post_id,
+            'postType' => $post_type,
+            'postRestBase' => $post_rest_base,
+            'postPermalink' => get_permalink($post_id),
+            'postSlug' => $post ? $post->post_name : '',
+            'restUrl' => rest_url('thinkrank/v1/'),
+            'restNonce' => wp_create_nonce('wp_rest'),
+            'homeUrl' => home_url(),
+            'siteName' => get_bloginfo('name'),
+            'faviconUrl' => $this->get_site_favicon_url(),
+            'featuredImageUrl' => $this->get_post_featured_image_url($post_id),
+            'strings' => [
+                'generating' => __('Generating...', 'thinkrank'),
+                'analyzing' => __('Analyzing...', 'thinkrank'),
+                'error' => __('Error occurred', 'thinkrank'),
+                'success' => __('Success!', 'thinkrank'),
+                'generated' => __('Metadata generated successfully', 'thinkrank'),
+                'contentTooShort' => __('Please add some content before generating SEO metadata.', 'thinkrank'),
+                'apiError' => __('Failed to connect to AI service. Please check your API settings.', 'thinkrank'),
+            ],
+            'seoScore' => $this->get_persisted_seo_score($post_id),
+            'postModified' => $post ? get_the_modified_date('c', $post) : '',
+            'linkSuggestionsEnabled' => $this->is_link_suggestions_enabled($post_type),
+            'postStatus' => get_post_status($post_id),
+            'isPro' => Plan_Config::is_pro(),
+            // Whether a provider (Pro's Redirections feature) can actually store
+            // a redirect. False renders the field as an upsell rather than an
+            // input that accepts text nothing will ever act on.
+            'redirectSupported' => Object_Redirect::is_supported(),
+            'redirectTypes' => Object_Redirect::TYPES,
+            /**
+             * Filter the editor SEO panel's post-load refresh behaviour.
+             *
+             * The panel re-checks `/metadata/{id}` after load so values written
+             * by a background writer (Auto AI on publish, imports) appear
+             * without a reload. It only polls while the server
+             * reports a write in flight, but the poll lives in JavaScript, so
+             * the switch has to be localized into the bundle rather than being
+             * a PHP-side filter alone (#329).
+             *
+             * Set `enabled` to false to switch the refresh off entirely.
+             *
+             * @since 1.30.0
+             *
+             * @param array $config  enabled (bool), intervalMs (int), maxTicks (int).
+             * @param int   $post_id Post being edited.
+             */
+            'seoRefresh' => apply_filters(
+                'thinkrank_metabox_seo_refresh',
+                [
+                    'enabled' => true,
+                    'intervalMs' => 4000,
+                    'maxTicks' => 10,
+                ],
+                $post_id
+            ),
+            // Whether the selected AI provider is configured — gates the
+            // "Generate with AI" button in the metabox. An OpenAI-compatible
+            // endpoint counts once it has a base URL and a model id, with or
+            // without a key (#721).
+            'aiConfigured' => $this->settings->has_ai_provider_configured(),
+            // Resolved Global/Bulk SEO variable-tag patterns for this post, shown
+            // as placeholder previews when a field is empty (the frontend applies
+            // these same patterns on output). Typing a value overrides them.
+            'patternPreviews' => Pattern_Resolver::previews($post_id),
+            // Token => value map (keys without %), for live client-side preview of
+            // a custom pattern typed into a metabox field.
+            'patternVariables' => Pattern_Resolver::variables($post_id),
+            // The uncapped copy the Content Analysis panel measures. Localized
+            // here so all six editors get it, rather than each builder adding
+            // its own (#778). `contentPreview` stays as the AI budget.
+            'contentFull' => $post instanceof \WP_Post ? $this->get_analysis_content($post) : '',
+        ];
+    }
+
+    /**
+     * Latest persisted SEO score for a post.
+     *
+     * Read from the scores table — the same source the posts list column and the
+     * Analysis panel use — so the editor badge agrees with them on load rather
+     * than showing 0 until the Analysis panel mounts and fetches the score.
+     *
+     * The `thinkrank_seo_score` form field is unusable for this: it is only
+     * written by the AI "Analyze Content" flow and is reset to 0 on every save.
+     *
+     * @param int $post_id Post ID
+     * @return int|null Score, or null when the post has never been analyzed.
+     */
+    private function get_persisted_seo_score(int $post_id): ?int {
+        $existing = $this->seo_calculator->get_existing_score_data($post_id);
+        $score    = $existing['overall_score'] ?? null;
+
+        return $score !== null ? (int) $score : null;
+    }
+
+    /**
+     * Check if link suggestions are enabled for a post type
+     * 
+     * @param string $post_type Post type to check
+     * @return bool True if enabled, false otherwise
+     */
+    private function is_link_suggestions_enabled(string $post_type): bool {
+        $settings = get_option('thinkrank_global_seo_settings', []);
+
+        if (isset($settings[$post_type]['link_suggestions'])) {
+            return (bool) $settings[$post_type]['link_suggestions'];
+        }
+
+        return true;
+    }
+
+    /**
+     * Get current post type in admin context
+     *
+     * Handles both classic editor and block editor contexts
+     *
+     * @return string|null Current post type or null if not found
+     */
+    private function get_current_post_type(): ?string {
+        global $post, $typenow, $current_screen;
+
+        // Try to get post type from various sources
+        if ($post && !empty($post->post_type)) {
+            return $post->post_type;
+        }
+
+        if (!empty($typenow)) {
+            return $typenow;
+        }
+
+        if ($current_screen && !empty($current_screen->post_type)) {
+            return $current_screen->post_type;
+        }
+
+        // Fallback: check URL parameters for block editor
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Reading URL parameters for context determination, not processing form data
+        if (isset($_GET['post_type'])) {
+            // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Reading URL parameters for context determination, not processing form data
+            return sanitize_text_field(wp_unslash($_GET['post_type']));
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Reading URL parameters for context determination, not processing form data
+        if (isset($_GET['post'])) {
+            // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Reading URL parameters for context determination, not processing form data
+            $post_id = absint($_GET['post']);
+            $post_type = get_post_type($post_id);
+            if ($post_type) {
+                return $post_type;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Get supported post types
+     *
+     * @return array Supported post types
+     */
+    public function get_supported_post_types(): array {
+        $default_types = ['post', 'page'];
+
+        // Add WooCommerce product if available
+        if (class_exists('WooCommerce')) {
+            $default_types[] = 'product';
+        }
+
+        // Add other common e-commerce post types
+        $ecommerce_types = ['product', 'shop_order', 'shop_coupon'];
+        foreach ($ecommerce_types as $type) {
+            if (post_type_exists($type) && !in_array($type, $default_types, true)) {
+                $default_types[] = $type;
+            }
+        }
+
+        // Add custom post types that are public and have UI
+        $custom_post_types = get_post_types([
+            'public' => true,
+            'show_ui' => true,
+            '_builtin' => false,
+        ]);
+
+        // WordPress internals that should never carry an SEO metabox. Fixed,
+        // so it is built once rather than per post type.
+        $wp_internal_types = [
+            'attachment',
+            'revision',
+            'nav_menu_item',
+            'custom_css',
+            'customize_changeset',
+            'oembed_cache',
+            'user_request',
+            'wp_block',
+            'wp_template',
+            'wp_template_part',
+            'wp_global_styles',
+            'wp_navigation',
+            'acf-field',
+            'acf-field-group',
+        ];
+
+        // Builder template CPTs (Bricks, Elementor, Divi, Beaver Builder) are
+        // layout fragments, not pages with their own SEO. Global SEO already
+        // refuses them; this list is shared with that policy so the two cannot
+        // drift apart again (#621).
+        if (!class_exists('\ThinkRank\SEO\Global_SEO_Post_Types')) {
+            require_once THINKRANK_PLUGIN_DIR . 'includes/seo/class-global-seo-post-types.php';
+        }
+
+        foreach ($custom_post_types as $post_type) {
+            // Resolved per post type, not hoisted: the shared list runs through
+            // a public filter that receives the post-type object, so an
+            // integrator can answer differently for different post types.
+            $excluded_types = array_merge(
+                $wp_internal_types,
+                \ThinkRank\SEO\Global_SEO_Post_Types::excluded_post_types(get_post_type_object($post_type))
+            );
+
+            if (!in_array($post_type, $excluded_types, true) && !in_array($post_type, $default_types, true)) {
+                $default_types[] = $post_type;
+            }
+        }
+
+        return apply_filters('thinkrank_supported_post_types', $default_types);
+    }
+
+    /**
+     * Transient holding the last redirect error for the current user.
+     */
+    private const REDIRECT_ERROR_TRANSIENT = 'thinkrank_redirect_error_';
+
+    /**
+     * Why the redirect field was refused on the most recent persist, if it was.
+     *
+     * @var \WP_Error|null
+     */
+    private ?\WP_Error $last_redirect_error = null;
+
+    /**
+     * Persist the edit-screen redirect field.
+     *
+     * Absent keys are left alone, so a caller that never rendered the field
+     * (the AJAX save from an editor that submits a subset, an import) cannot
+     * clear a redirect by omission.
+     *
+     * The destination is not post meta — Pro's rules table holds it — so unlike
+     * every other field here this save can fail for reasons the editor needs to
+     * hear about: no Pro, plain permalinks, a destination that is the page's own
+     * URL. Failing silently would be the worst of both, since the field would
+     * redisplay empty on the next load with no explanation, so the reason is
+     * stashed for the notice rendered on the next screen.
+     *
+     * @param string $object_type 'post' or 'term'.
+     * @param int    $object_id   Object ID.
+     * @param array  $src         Field name => raw value map.
+     * @return void
+     */
+    private function save_object_redirect(string $object_type, int $object_id, array $src): ?\WP_Error {
+        if (!array_key_exists('thinkrank_redirect_url', $src)) {
+            return null;
+        }
+
+        $url = (string) $src['thinkrank_redirect_url'];
+
+        // With no provider there is nothing to store and nothing to clear.
+        // Staying quiet when the field was submitted empty keeps every ordinary
+        // save on a free site from raising an error about a field the editor
+        // never touched.
+        if (!Object_Redirect::is_supported()) {
+            if ('' !== trim($url)) {
+                return new \WP_Error(
+                    'thinkrank_redirect_unsupported',
+                    __('Redirects require ThinkRank Pro with the Redirections feature active.', 'thinkrank')
+                );
+            }
+            return null;
+        }
+
+        $type = array_key_exists('thinkrank_redirect_type', $src)
+            ? $src['thinkrank_redirect_type']
+            : Object_Redirect::DEFAULT_TYPE;
+
+        $result = Object_Redirect::save($object_type, $object_id, $url, $type);
+
+        return is_wp_error($result) ? $result : null;
+    }
+
+    /**
+     * Why the last persist_metadata() call could not store the redirect.
+     *
+     * Every other metabox field either saves or is sanitized into something
+     * that does; this one can be refused, and each caller reports that
+     * differently — a notice for the form post, a JSON field for the AJAX save,
+     * an error message for the MCP ability.
+     *
+     * @return \WP_Error|null
+     */
+    public function get_last_redirect_error(): ?\WP_Error {
+        return $this->last_redirect_error;
+    }
+
+    /**
+     * Remember why a redirect could not be saved, for the next admin screen.
+     *
+     * @param \WP_Error $error Failure.
+     * @return void
+     */
+    private function store_redirect_error(\WP_Error $error): void {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            return;
+        }
+
+        set_transient(self::REDIRECT_ERROR_TRANSIENT . $user_id, $error->get_error_message(), MINUTE_IN_SECONDS);
+    }
+
+    /**
+     * Show, once, why the last redirect save failed.
+     *
+     * @return void
+     */
+    public function render_redirect_notice(): void {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            return;
+        }
+
+        $key     = self::REDIRECT_ERROR_TRANSIENT . $user_id;
+        $message = get_transient($key);
+
+        if (!is_string($message) || '' === $message) {
+            return;
+        }
+
+        delete_transient($key);
+
+        printf(
+            '<div class="notice notice-error is-dismissible"><p>%s</p></div>',
+            esc_html(
+                sprintf(
+                    /* translators: %s: reason the redirect was not saved. */
+                    __('ThinkRank could not save the redirect: %s', 'thinkrank'),
+                    $message
+                )
+            )
+        );
+    }
+
+    /**
+     * Get existing post metadata
+     *
+     * @param int $post_id Post ID
+     * @return array Existing metadata
+     */
+    public function get_post_metadata(int $post_id): array {
+        // One lookup: get() goes through a filter Pro answers from the database.
+        $redirect = Object_Redirect::get('post', $post_id);
+
+        return [
+            'title' => get_post_meta($post_id, '_thinkrank_seo_title', true),
+            'description' => get_post_meta($post_id, '_thinkrank_meta_description', true),
+            'focus_keyword' => Focus_Keywords::get_primary($post_id),
+            'focus_keywords' => Focus_Keywords::get($post_id),
+            'seo_score' => get_post_meta($post_id, '_thinkrank_seo_score', true),
+            'generated_at' => get_post_meta($post_id, '_thinkrank_generated_at', true),
+            'pillar_content' => get_post_meta($post_id, '_thinkrank_pillar_content', true),
+            'exclude_from_search' => get_post_meta($post_id, \ThinkRank\SEO\Content_Visibility::SEARCH_META, true),
+            'exclude_from_archives' => get_post_meta($post_id, \ThinkRank\SEO\Content_Visibility::ARCHIVE_META, true),
+            'canonical_url' => get_post_meta($post_id, '_thinkrank_canonical_url', true),
+            // Not post meta: the rule in Pro's redirections table is the value.
+            // See ThinkRank\SEO\Object_Redirect.
+            'redirect_url' => $redirect['url'],
+            'redirect_type' => $redirect['type'],
+            'robots_meta_enabled' => get_post_meta($post_id, '_thinkrank_robots_meta_enabled', true),
+            'robots_meta' => get_post_meta($post_id, '_thinkrank_robots_meta', true),
+            'advanced_robots_meta' => get_post_meta($post_id, '_thinkrank_advanced_robots_meta', true),
+            'og_title' => get_post_meta($post_id, '_thinkrank_og_title', true),
+            'og_description' => get_post_meta($post_id, '_thinkrank_og_description', true),
+            'og_image' => get_post_meta($post_id, '_thinkrank_og_image', true),
+            'twitter_title' => get_post_meta($post_id, '_thinkrank_twitter_title', true),
+            'twitter_description' => get_post_meta($post_id, '_thinkrank_twitter_description', true),
+            'twitter_image' => get_post_meta($post_id, '_thinkrank_twitter_image', true),
+        ];
+    }
+
+    /**
+     * Get site favicon URL
+     *
+     * Prefers WordPress' native Site Icon (zero HTTP). Only when no Site Icon is
+     * configured does it probe common favicon locations — and that probe is
+     * cached (including a "no favicon" sentinel) so the editor never fires
+     * blocking loopback HEAD requests on every load.
+     *
+     * @since 1.16.2 Prefer get_site_icon_url() and cache the fallback probe.
+     * @return string Favicon URL, or '' when none can be resolved.
+     */
+    private function get_site_favicon_url(): string {
+        // Try the native Site Icon first (WordPress 4.3+) — no HTTP required.
+        $site_icon_url = get_site_icon_url();
+        if ($site_icon_url) {
+            return $site_icon_url;
+        }
+
+        // No Site Icon configured: fall back to probing common favicon paths.
+        // Cache the resolved value (empty string included) so the blocking
+        // loopback probe runs at most once per ~12h per site host instead of on
+        // every editor load.
+        $cache_key = 'thinkrank_favicon_url_' . md5((string) wp_parse_url(home_url(), PHP_URL_HOST));
+        $cached    = get_transient($cache_key);
+        if (false !== $cached) {
+            return (string) $cached;
+        }
+
+        $favicon_url = '';
+
+        $favicon_paths = [
+            '/favicon.ico',
+            '/favicon.png',
+            '/apple-touch-icon.png',
+        ];
+
+        foreach ($favicon_paths as $path) {
+            $candidate = home_url($path);
+            $response  = wp_remote_head($candidate, ['timeout' => 3]);
+            if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+                $favicon_url = $candidate;
+                break;
+            }
+        }
+
+        set_transient($cache_key, $favicon_url, 12 * HOUR_IN_SECONDS);
+
+        return $favicon_url;
+    }
+
+    /**
+     * Get post featured image URL
+     *
+     * @param int $post_id Post ID
+     * @return string|null Featured image URL or null if not available
+     */
+    private function get_post_featured_image_url(int $post_id): ?string {
+        $thumbnail_id = get_post_thumbnail_id($post_id);
+        if ($thumbnail_id) {
+            // Use the full-size image — social share images need a large source
+            // (the preview scales it down), not a small thumbnail.
+            $image_url = wp_get_attachment_image_url($thumbnail_id, 'full');
+            return $image_url ?: null;
+        }
+        return null;
+    }
+
+    /**
+     * Characters of page text an AI caller is given.
+     *
+     * A prompt budget, not a description of the page — one caller forwards this
+     * straight into an AI payload, so it stays capped.
+     *
+     * @since 2.10.0
+     * @var int
+     */
+    private const AI_PREVIEW_LENGTH = 4000;
+
+    /**
+     * Safety ceiling for the analysis copy.
+     *
+     * High enough that no real article reaches it, low enough that a runaway
+     * builder tree cannot put a megabyte of text through wp_localize_script
+     * into every editor page load.
+     *
+     * @since 2.10.0
+     * @var int
+     */
+    private const ANALYSIS_MAX_LENGTH = 200000;
+
+    /**
+     * Resolved body text per post, for this request.
+     *
+     * Every builder integration localizes get_localized_data() (which carries
+     * the analysis copy) and then adds get_content_preview() on top, and the
+     * classic screen renders the preview into the form as well as localizing
+     * the analysis copy. Each of those resolved the post through
+     * Builder_Content from scratch, so a builder page walked its whole tree
+     * twice on every editor load. Both now derive from one resolution.
+     *
+     * Keyed on the post's ID and modified time, so a post saved and re-read
+     * within the same request is resolved again.
+     *
+     * @since 2.10.0
+     * @var array<string,string>
+     */
+    private array $resolved_bodies = [];
+
+    /**
+     * The post's body text, resolved through whatever built it.
+     *
+     * Body only. The title and excerpt used to be prepended here, which is
+     * right for an AI prompt but wrong for a measurement: the Analysis panel
+     * counted them as body copy, so Word Count and Keyword Density in a
+     * builder included the title and excerpt, while the same panel in the
+     * block editor (which reads the editor's content) did not. They are added
+     * back for the AI preview only.
+     *
+     * @since 2.10.0
+     *
+     * @param \WP_Post $post Post object.
+     * @return string Plain text, whitespace collapsed, uncapped.
+     */
+    private function resolve_post_body(\WP_Post $post): string {
+        $key = $post->ID . '|' . (string) ($post->post_modified_gmt ?? '');
+
+        if (isset($this->resolved_bodies[$key])) {
+            return $this->resolved_bodies[$key];
+        }
+
+        // Resolve through Builder_Content: a page builder keeps its words
+        // outside post_content (Oxygen empties it entirely), and the editor
+        // cannot reach postmeta, so without this the preview handed to the
+        // browser is just the title and the live panel reports "No content".
+        if (!class_exists('\\ThinkRank\\SEO\\Builder_Content')) {
+            require_once THINKRANK_PLUGIN_DIR . 'includes/seo/class-builder-content.php';
+        }
+
+        $this->resolved_bodies[$key] = self::collapse_text(\ThinkRank\SEO\Builder_Content::resolve($post));
+
+        return $this->resolved_bodies[$key];
+    }
+
+    /**
+     * Strip tags and collapse whitespace.
+     *
+     * @since 2.10.0
+     *
+     * @param string $content Markup or text.
+     * @return string
+     */
+    private static function collapse_text(string $content): string {
+        $content = wp_strip_all_tags($content);
+
+        return trim((string) preg_replace('/\s+/', ' ', $content));
+    }
+
+    /**
+     * The post's text for the editor's Content Analysis panel.
+     *
+     * Uncapped, because this is a measurement rather than a budget. In a page
+     * builder there is no `core/editor` store, no TinyMCE instance and no
+     * `#content` textarea, so the localized string is the ONLY thing the panel
+     * can count — and it was being handed the 4,000-character AI preview. Word
+     * Count, Keyword Density, Readability and Content Quality therefore
+     * described the first 4,000 characters and nothing after, freezing at
+     * roughly 600-700 words however long the page grew (#778).
+     *
+     * Still bounded, at a ceiling no real article reaches: this rides along on
+     * every editor page load.
+     *
+     * The body only, like the editor content it stands in for; the title and
+     * excerpt belong to the AI preview (see resolve_post_body()).
+     *
+     * @since 2.10.0
+     *
+     * @param \WP_Post $post Post object.
+     * @return string
+     */
+    public function get_analysis_content(\WP_Post $post): string {
+        return \ThinkRank\Core\Seo_Text::trim_to_length(
+            $this->resolve_post_body($post),
+            self::ANALYSIS_MAX_LENGTH
+        );
+    }
+
+    /**
+     * Get content preview for AI analysis
+     * 
+     * @param \WP_Post $post Post object
+     * @return string Content preview
+     */
+    public function get_content_preview(\WP_Post $post): string {
+        // The title and excerpt lead the preview: they are context an AI
+        // caller wants first, and they are not part of the measured body.
+        $lead = $post->post_title . "\n\n";
+
+        if (!empty($post->post_excerpt)) {
+            $lead .= $post->post_excerpt . "\n\n";
+        }
+
+        $preview = trim(self::collapse_text($lead) . ' ' . $this->resolve_post_body($post));
+
+        // substr() counts BYTES: on Thai or CJK this handed the model a third
+        // of the intended content and cut the last character in half (#687).
+        return \ThinkRank\Core\Seo_Text::trim_to_length($preview, self::AI_PREVIEW_LENGTH);
+    }
+
+    /**
+     * AJAX handler for generating post metadata
+     * 
+     * @return void
+     */
+    public function ajax_generate_post_metadata(): void {
+        // Verify nonce
+        $nonce = sanitize_text_field(wp_unslash($_POST['nonce'] ?? ''));
+        if (!wp_verify_nonce($nonce, 'thinkrank_metabox_ajax')) {
+            wp_die('Security check failed');
+        }
+
+        // Check permissions
+        $post_id = absint($_POST['post_id'] ?? 0);
+        if (!current_user_can('edit_post', $post_id)) {
+            wp_die('Insufficient permissions');
+        }
+
+        try {
+            $options = [
+                'target_keyword' => sanitize_text_field(wp_unslash($_POST['target_keyword'] ?? '')),
+                'content_type' => sanitize_text_field(wp_unslash($_POST['content_type'] ?? 'blog_post')),
+                'tone' => sanitize_text_field(wp_unslash($_POST['tone'] ?? 'professional')),
+            ];
+
+            $metadata = $this->metadata_generator->generate_for_post($post_id, $options);
+
+            wp_send_json_success([
+                'metadata' => $metadata,
+                'message' => __('SEO metadata generated successfully!', 'thinkrank'),
+            ]);
+        } catch (\Exception $e) {
+            wp_send_json_error([
+                'message' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * AJAX: persist the full set of metabox fields for a post.
+     *
+     * Used by editors that don't submit the #post form (Elementor). Expects the
+     * same field names the classic/block metabox submits, sent as POST params.
+     * $_POST is slashed by WordPress, matching what `persist_metadata()` expects.
+     *
+     * @return void
+     */
+    public function ajax_save_metabox(): void {
+        $nonce = sanitize_text_field(wp_unslash($_POST['nonce'] ?? ''));
+        if (!wp_verify_nonce($nonce, 'thinkrank_metabox_ajax')) {
+            wp_send_json_error(['message' => __('Security check failed', 'thinkrank')], 403);
+        }
+
+        $post_id = absint($_POST['post_id'] ?? 0);
+        if (!$post_id || !current_user_can('edit_post', $post_id)) {
+            wp_send_json_error(['message' => __('Insufficient permissions', 'thinkrank')], 403);
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- nonce verified above; each field sanitized inside persist_metadata()
+        $this->persist_metadata($post_id, wp_unslash($_POST));
+
+        // Everything else saved; only the redirect can have been refused. Report
+        // it in this response rather than as a notice on some later screen —
+        // this caller never reloads the page.
+        $redirect_error = $this->get_last_redirect_error();
+        if (null !== $redirect_error) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s: reason the redirect was not saved. */
+                    __('Saved, except the redirect: %s', 'thinkrank'),
+                    $redirect_error->get_error_message()
+                ),
+            ], 400);
+        }
+
+        wp_send_json_success([
+            'message' => __('SEO settings saved successfully!', 'thinkrank'),
+        ]);
+    }
+}

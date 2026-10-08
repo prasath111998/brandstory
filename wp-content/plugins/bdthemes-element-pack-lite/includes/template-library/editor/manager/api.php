@@ -1,0 +1,189 @@
+<?php
+
+namespace ElementPack\Includes\TemplateLibrary\Editor\Manager;
+use ElementPack\Includes\TemplateLibrary\ElementPack_Template_Library_Base;
+use Elementor\Core\Common\Modules\Ajax\Module as Ajax;
+use Elementor\TemplateLibrary\Source_Base;
+
+defined('ABSPATH') || exit;
+class ElementPackTemplateLibraryEditorApi extends ElementPack_Template_Library_Base
+{
+    protected $source = null;
+
+    public function __construct()
+    {
+        parent::__construct();
+        add_action('wp_ajax_bdt_element_pack_template_library_get_layouts', [$this, 'get_layouts']);
+        add_action('wp_ajax_bdt_element_pack_template_library_making_syncing', [$this, 'sync_now']);
+        add_action('wp_ajax_bdt_element_pack_template_import_progress', [$this, 'get_import_progress']);
+        add_action( 'elementor/ajax/register_actions', [ $this, 'register_ajax_actions_data' ] );
+    }
+
+    /**
+     * Report how far an in-flight import has got.
+     *
+     * Polled by the editor while the blocking get_bdt_elementpack_template_data
+     * request is still open, so it must stay cheap: one transient read.
+     */
+    public function get_import_progress() {
+        check_ajax_referer( 'ep-template-library-progress', 'nonce' );
+
+        // Mirrors the capability the import itself requires.
+        if ( ! current_user_can( 'edit_posts' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Access Denied', 'bdthemes-element-pack-lite' ) ], 403 );
+        }
+
+        $import_id = isset( $_REQUEST['import_id'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['import_id'] ) ) : '';
+        $state     = Import_Progress::read( $import_id );
+
+        if ( ! is_array( $state ) ) {
+            // The import request hasn't written its first update yet.
+            wp_send_json_success( [ 'stage' => 'pending', 'percent' => 0 ] );
+        }
+
+        wp_send_json_success( $state );
+    }
+
+    public function register_ajax_actions_data( Ajax $ajax ) {
+
+        $ajax->register_ajax_action( 'get_bdt_elementpack_template_data', function( $data ) {
+            if ( ! current_user_can( 'edit_posts' ) ) {
+                throw new \Exception( 'Access Denied' );
+            }
+
+            if ( ! empty( $data['editor_post_id'] ) ) {
+                $editor_post_id = absint( $data['editor_post_id'] );
+
+                if ( ! get_post( $editor_post_id ) ) {
+                    throw new \Exception( esc_html__( 'Post not found', 'bdthemes-element-pack-lite' ) );
+                }
+
+                \Elementor\Plugin::instance()->db->switch_to_post( $editor_post_id );
+            }
+
+            if ( empty( $data['template_id'] ) ) {
+                throw new \Exception( esc_html__( 'Template id missing', 'bdthemes-element-pack-lite' ) );
+            }
+
+            return $this->get_template_data( $data );
+        } );
+    }
+
+    public function get_template_data( array $args ) {
+        $source = $this->get_source();
+        $result = $this->findDemo($args['template_id']);
+
+        if(!is_array($result) || !isset($result['json_url'])){
+            throw new \Exception( esc_html__( 'Template id missing', 'bdthemes-element-pack-lite' ) );
+        }
+
+        if($result['is_pro'] == 1 && !$this->packLicenseActivated){
+            throw new \Exception( esc_html__( 'required_activated_license', 'bdthemes-element-pack-lite' ) );
+        }
+
+        $args['demo_json'] = $result['json_url'];
+        $data = $source->get_data( $args );
+        return $data;
+    }
+
+    public function get_source() {
+        if ( is_null( $this->source ) ) {
+            $this->source = new Library_Source();
+        }
+
+        return $this->source;
+    }
+
+    public function getCategoriesItems() {
+
+        $this->checkDemoData();
+        $demoDataType = absint( $this->demoType );
+        // Table Info
+        global $wpdb;
+        $table_prefix = $wpdb->prefix;
+        $postTable      = $this->table_post;
+        $postCatTable   = $this->table_cat_post;
+        $catTable       = $this->table_cat;
+
+        // Table names are internal ($wpdb->prefix based) and cannot be bound as
+        // placeholders; $demoDataType is cast through absint() above.
+        // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter
+        $demoData = $this->wpdb->get_results("SELECT COUNT(*) as ttotal, {$catTable}.* FROM {$postTable}
+ LEFT JOIN {$postCatTable} ON {$postTable}.demo_id = {$postCatTable}.demo_id
+ LEFT JOIN {$catTable} ON {$catTable}.term_id = {$postCatTable}.term_id
+ WHERE {$postTable}.type={$demoDataType} GROUP BY {$catTable}.term_id", ARRAY_A);
+        // phpcs:enable
+
+        $navItems = array();
+        $totalDemo = 0;
+        foreach ( $demoData as $data ) {
+            $total = intval($data['ttotal']);
+            $totalDemo = $totalDemo + $total;
+            $navItems[] = array( 'term_slug' => $data['slug'], 'term_name' => $data['name'],'term_id' => $data['term_id'],'count'=> $total);
+        }
+        $this->demo_total = $totalDemo;
+        $firstItem = array( 'term_slug' => '', 'term_name' => 'All Templates','term_id' => 0,'count'=> $totalDemo);
+
+        return array_merge([$firstItem], $navItems);
+    }
+
+    public function get_layouts()
+    {
+
+        check_ajax_referer( 'ep-template-library', 'nonce' );
+
+        if ( ! current_user_can( 'edit_posts' ) ) {
+            wp_send_json_error( array( 'message' => esc_html__( 'Access Denied', 'bdthemes-element-pack-lite' ) ), 403 );
+        }
+
+        isset($_REQUEST['tab']) || exit();
+
+        $tab = empty($_REQUEST['tab']) ? 'bdt_elementpack_page' : sanitize_key( wp_unslash( $_REQUEST['tab'] ) );
+
+        if($tab == 'bdt_elementpack_block'){
+            $this->demoType = 2;
+        }elseif($tab == 'bdt_elementpack_header'){
+            $this->demoType = 3;
+        }elseif($tab == 'bdt_elementpack_footer'){
+            $this->demoType = 4;
+        }else{
+            $this->demoType = 1;
+        }
+
+        $this->termSlug = 'demo_term_all';
+        if(isset($_REQUEST['term_slug']) && !empty($_REQUEST['term_slug'])){
+            $this->termSlug = sanitize_text_field(wp_unslash($_REQUEST['term_slug']));
+        }
+
+        $this->perPage = 500000;
+
+        wp_send_json([
+            'data' => [
+                'categories' => $this->getCategoriesItems(),
+                'templates'  => $this->getElementorLibraryData(),
+            ],
+        ], 200);
+
+    }
+
+    public function sync_now(){
+        check_ajax_referer( 'ep-template-library', 'nonce' );
+
+        if ( ! current_user_can( 'edit_posts' ) ) {
+            wp_send_json_error( array( 'message' => esc_html__( 'Access Denied', 'bdthemes-element-pack-lite' ) ), 403 );
+        }
+
+        $this->createTemplateTables();
+
+        echo wp_json_encode(
+            array(
+                'success' => true,
+                'data'    => array(),
+            )
+        );
+
+        wp_die();
+    }
+}
+
+new ElementPackTemplateLibraryEditorApi();

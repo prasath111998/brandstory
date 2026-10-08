@@ -1,0 +1,288 @@
+<?php
+
+namespace ElementPack\Modules\AnimatedLink\Widgets;
+
+use ElementPack\Base\Module_Base;
+use Elementor\Controls_Manager;
+use Elementor\Group_Control_Typography;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // Exit if accessed directly
+}
+
+class AnimatedLink extends Module_Base {
+
+	protected $_has_template_content = false;
+
+	public function get_name() {
+		return 'bdt-animated-link';
+	}
+
+	public function get_title() {
+		return BDTEP . esc_html__( 'Animated Link', 'bdthemes-element-pack-lite' );
+	}
+
+	public function get_icon() {
+		return 'bdt-wi-animated-link';
+	}
+
+	public function get_categories() {
+		return [ 'element-pack' ];
+	}
+
+	public function get_keywords() {
+		return [ 'animated', 'link', 'headline', 'split', 'gsap', 'vivid' ];
+	}
+
+	public function get_style_depends() {
+		return [ $this->ep_is_edit_mode() ? 'ep-styles' : 'ep-animated-link' ];
+	}
+
+	public function get_custom_help_url() {
+		return 'https://youtu.be/qs0gEVh0x7w';
+	}
+
+	public function has_widget_inner_wrapper(): bool {
+        return ! \Elementor\Plugin::$instance->experiments->is_feature_active( 'e_optimized_markup' );
+    }
+	protected function is_dynamic_content(): bool {
+		return false;
+	}
+
+	protected function register_controls() {
+
+		$this->start_controls_section(
+			'section_content_animated_link',
+			[
+				'label' => esc_html__('Animated Link', 'bdthemes-element-pack-lite'),
+			]
+		);
+
+		$this->add_control(
+			'link_style',
+			[
+				'label'   => esc_html__('Style', 'bdthemes-element-pack-lite'),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'metis',
+				'options' => [
+					'carpo'   => esc_html__('Carpo', 'bdthemes-element-pack-lite'),
+					'carme'   => esc_html__('Carme', 'bdthemes-element-pack-lite'),
+					'dia'     => esc_html__('Dia', 'bdthemes-element-pack-lite'),
+					'eirene'  => esc_html__('Eirene', 'bdthemes-element-pack-lite'),
+					'elara'   => esc_html__('Elara', 'bdthemes-element-pack-lite'),
+					'ersa'    => esc_html__('Ersa', 'bdthemes-element-pack-lite'),
+					'helike'  => esc_html__('Helike', 'bdthemes-element-pack-lite'),
+					'herse'   => esc_html__('Herse', 'bdthemes-element-pack-lite'),
+					'io'      => esc_html__('Io', 'bdthemes-element-pack-lite'),
+					'iocaste' => esc_html__('Iocaste', 'bdthemes-element-pack-lite'),
+					'kale'    => esc_html__('Kale', 'bdthemes-element-pack-lite'),
+					'leda'    => esc_html__('Leda', 'bdthemes-element-pack-lite'),
+					'metis'   => esc_html__('Metis', 'bdthemes-element-pack-lite'),
+					'mneme'   => esc_html__('Mneme', 'bdthemes-element-pack-lite'),
+					'thebe'   => esc_html__('Thebe', 'bdthemes-element-pack-lite'),
+				]
+			]
+		);
+
+		$this->add_control(
+			'link_text',
+			[
+				'label'       => esc_html__('Text', 'bdthemes-element-pack-lite'),
+				'type'        => Controls_Manager::TEXT,
+				'dynamic'     => ['active' => true],
+				'default'     => esc_html__('Animated Link', 'bdthemes-element-pack-lite'),
+				'label_block' => true,
+			]
+		);
+
+		$this->add_control(
+			'link_url',
+			[
+				'label'         => esc_html__('Link', 'bdthemes-element-pack-lite'),
+				'type'          => Controls_Manager::URL,
+				'default'       => ['url' => ''],
+				'show_external' => false,
+				'dynamic'       => ['active' => true],
+			]
+		);
+
+		$this->add_responsive_control(
+			'link_alignment',
+			[
+				'label'   => esc_html__('Alignment', 'bdthemes-element-pack-lite'),
+				'type'    => Controls_Manager::CHOOSE,
+				'options' => [
+					'left' => [
+						'title' => esc_html__('Left', 'bdthemes-element-pack-lite'),
+						'icon'  => 'eicon-text-align-left',
+					],
+					'center' => [
+						'title' => esc_html__('Center', 'bdthemes-element-pack-lite'),
+						'icon'  => 'eicon-text-align-center',
+					],
+					'right' => [
+						'title' => esc_html__('Right', 'bdthemes-element-pack-lite'),
+						'icon'  => 'eicon-text-align-right',
+					]
+				],
+				'selectors' => [
+					'{{WRAPPER}}.elementor-widget-bdt-animated-link' => 'text-align: {{VALUE}}'
+				]
+			]
+		);
+
+		$this->end_controls_section();
+
+		//Style
+		$this->start_controls_section(
+			'section_style_link',
+			[
+				'label'     => esc_html__('Animated Link', 'bdthemes-element-pack-lite'),
+				'tab'       => Controls_Manager::TAB_STYLE,
+			]
+		);
+
+		$this->add_control(
+			'link_text_color',
+			[
+				'label'     => esc_html__('Color', 'bdthemes-element-pack-lite'),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-animated-link' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'link_hover_text_color',
+			[
+				'label'     => esc_html__('Hover Color', 'bdthemes-element-pack-lite'),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-animated-link:hover' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'link_style_color',
+			[
+				'label'     => esc_html__('Style Color', 'bdthemes-element-pack-lite'),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-animated-link:before, {{WRAPPER}} .bdt-ep-animated-link:after' => 'background: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'link_padding',
+			[
+				'label'      => esc_html__('Padding', 'bdthemes-element-pack-lite'),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => ['px', 'em', '%'],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-ep-animated-link' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Typography::get_type(),
+			[
+				'name'     => 'link_typography',
+				'selector' => '{{WRAPPER}} .bdt-ep-animated-link',
+			]
+		);
+
+		$this->end_controls_section();
+	}
+
+	protected function render() {
+		$settings = $this->get_settings_for_display();
+
+		if ( empty( $settings['link_text'] ) ) {
+			return;
+		}
+		
+		$link_text = $settings['link_text'];
+		$style = $settings['link_style'];
+
+		$this->add_render_attribute( 'link-wrap', 'class', [ 'bdt-ep-animated-link', 'bdt-ep-animated-link--' . esc_attr( $style ) ] );
+
+		if ( 'leda' === $style ) {
+			$this->add_render_attribute( 'link-wrap', 'data-text', $link_text );
+		}
+
+		if ( ! empty( $settings['link_url']['url'] ) ) {
+			$this->add_link_attributes( 'link-wrap', $settings['link_url'] );
+		}
+
+		?>
+		<?php if ( in_array( $style, [ 'leda', 'elara', 'ersa', 'eirene', 'helike' ], true ) ) : ?>
+			<a <?php $this->print_render_attribute_string( 'link-wrap' ); ?>>
+				<span><?php echo esc_html( $link_text ); ?></span>
+			</a>
+		<?php elseif ( 'iocaste' === $style ) : ?>
+			<a <?php $this->print_render_attribute_string( 'link-wrap' ); ?>>
+				<span><?php echo esc_html( $link_text ); ?></span>
+				<svg class="bdt-link__graphic bdt-link__graphic--slide" width="300%" height="100%" viewBox="0 0 1200 60" preserveAspectRatio="none">
+					<path d="M0,56.5c0,0,298.666,0,399.333,0C448.336,56.5,513.994,46,597,46c77.327,0,135,10.5,200.999,10.5c95.996,0,402.001,0,402.001,0"></path>
+				</svg>
+			</a>
+		<?php elseif ( 'herse' === $style ) : ?>
+			<a <?php $this->print_render_attribute_string( 'link-wrap' ); ?>>
+				<span><?php echo esc_html( $link_text ); ?></span>
+				<svg class="bdt-link__graphic bdt-link__graphic--stroke bdt-link__graphic--arc" width="100%" height="18" viewBox="0 0 59 18">
+					<path d="M.945.149C12.3 16.142 43.573 22.572 58.785 10.842" pathLength="1" />
+				</svg>
+			</a>
+		<?php elseif ( 'carme' === $style ) : ?>
+			<a <?php $this->print_render_attribute_string( 'link-wrap' ); ?>>
+				<span><?php echo esc_html( $link_text ); ?></span>
+				<svg class="bdt-link__graphic bdt-link__graphic--stroke bdt-link__graphic--scribble" width="100%" height="9" viewBox="0 0 101 9">
+					<path d="M.426 1.973C4.144 1.567 17.77-.514 21.443 1.48 24.296 3.026 24.844 4.627 27.5 7c3.075 2.748 6.642-4.141 10.066-4.688 7.517-1.2 13.237 5.425 17.59 2.745C58.5 3 60.464-1.786 66 2c1.996 1.365 3.174 3.737 5.286 4.41 5.423 1.727 25.34-7.981 29.14-1.294" pathLength="1" />
+				</svg>
+			</a>
+		<?php else : ?>
+			<a <?php $this->print_render_attribute_string( 'link-wrap' ); ?>>
+				<?php echo esc_html( $link_text ); ?>
+			</a>
+		<?php endif; ?>
+		<?php
+	}
+
+	protected function content_template() {
+		?>
+		<#
+		var style   = settings.link_style || 'metis';
+		var text    = settings.link_text;
+		var href    = ( settings.link_url && settings.link_url.url ) ? settings.link_url.url : '#';
+
+		var linkClass = 'bdt-ep-animated-link bdt-ep-animated-link--' + style;
+
+		var spanStyles = [ 'leda', 'elara', 'ersa', 'eirene', 'helike', 'iocaste', 'herse', 'carme' ];
+		#>
+		<# if ( _.contains( spanStyles, style ) ) { #>
+			<a class="{{ linkClass }}" href="{{ href }}">
+				<span>{{ text }}</span>
+				<# if ( 'iocaste' === style ) { #>
+					<svg class="bdt-link__graphic bdt-link__graphic--slide" width="300%" height="100%" viewBox="0 0 1200 60" preserveAspectRatio="none">
+						<path d="M0,56.5c0,0,298.666,0,399.333,0C448.336,56.5,513.994,46,597,46c77.327,0,135,10.5,200.999,10.5c95.996,0,402.001,0,402.001,0"></path>
+					</svg>
+				<# } else if ( 'herse' === style ) { #>
+					<svg class="bdt-link__graphic bdt-link__graphic--stroke bdt-link__graphic--arc" width="100%" height="18" viewBox="0 0 59 18">
+						<path d="M.945.149C12.3 16.142 43.573 22.572 58.785 10.842" pathLength="1" />
+					</svg>
+				<# } else if ( 'carme' === style ) { #>
+					<svg class="bdt-link__graphic bdt-link__graphic--stroke bdt-link__graphic--scribble" width="100%" height="9" viewBox="0 0 101 9">
+						<path d="M.426 1.973C4.144 1.567 17.77-.514 21.443 1.48 24.296 3.026 24.844 4.627 27.5 7c3.075 2.748 6.642-4.141 10.066-4.688 7.517-1.2 13.237 5.425 17.59 2.745C58.5 3 60.464-1.786 66 2c1.996 1.365 3.174 3.737 5.286 4.41 5.423 1.727 25.34-7.981 29.14-1.294" pathLength="1" />
+					</svg>
+				<# } #>
+			</a>
+		<# } else { #>
+			<a class="{{ linkClass }}" href="{{ href }}">{{ text }}</a>
+		<# } #>
+		<?php
+	}
+}

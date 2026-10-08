@@ -1,0 +1,175 @@
+<?php
+namespace ElementPack;
+
+if (!defined('ABSPATH')) {
+	exit;
+} // Exit if accessed directly
+
+
+require_once BDTEP_ADMIN_PATH . 'class-settings-api.php';
+require_once BDTEP_ADMIN_PATH . 'admin-feeds.php';
+// element pack admin settings here
+require_once BDTEP_ADMIN_PATH . 'admin-settings.php';
+
+/**
+ * Admin class
+ */
+
+class Admin {
+
+	public function __construct() {
+
+		// Embed the Script on our Plugin's Option Page Only
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only screen check, no state is changed.
+		$current_page = isset($_GET['page']) ? sanitize_text_field(wp_unslash($_GET['page'])) : '';
+
+		if ('element_pack_options' == $current_page) {
+			add_action('admin_init', [$this, 'admin_script']);
+		}
+
+		add_action('admin_init', [$this, 'admin_biggopti_script']);
+
+		add_action('admin_enqueue_scripts', [$this, 'enqueue_styles']);
+		
+        add_filter('plugin_row_meta', [$this, 'plugin_row_meta'], 10, 2);
+        add_filter( 'plugin_action_links_' . BDTEP_PBNAME, [ $this, 'plugin_action_links' ] );
+
+		add_action('upgrader_process_complete', [$this, 'bdthemes_element_pack_plugin_on_upgrade_process_complete'], 10, 2);
+		register_deactivation_hook(BDTEP__FILE__, [$this, 'bdthemes_element_pack_plugin_on_deactivate']);
+	}
+
+	/**
+	 * Enqueue styles
+	 * @access public
+	 */
+
+	public function enqueue_styles() {
+
+		$direction_suffix = is_rtl() ? '.rtl' : '';
+
+		wp_enqueue_style('bdt-uikit', BDTEP_ASSETS_URL . 'css/bdt-uikit' . $direction_suffix . '.css', [], '3.21.7');
+		wp_enqueue_style('ep-editor', BDTEP_ASSETS_URL . 'css/ep-editor.css', [], BDTEP_VER);
+		wp_enqueue_style('ep-admin', BDTEP_ADMIN_URL . 'assets/css/ep-admin.css', [], BDTEP_VER);
+
+		wp_enqueue_script('bdt-uikit', BDTEP_ASSETS_URL . 'js/bdt-uikit.min.js', ['jquery'], '3.21.7', false);
+	}
+
+	/**
+	 * Row meta
+	 * @access public
+	 * @return array
+	 */
+
+	public function plugin_row_meta($plugin_meta, $plugin_file) {
+		if (BDTEP_PBNAME === $plugin_file) {
+
+            $row_meta = [
+				'docs'  => '<a href="https://elementpack.pro/contact/" aria-label="' . esc_attr(__('Go for Get Support', 'bdthemes-element-pack-lite')) . '" target="_blank">' . __('Get Support', 'bdthemes-element-pack-lite') . '</a>',
+				'video' => '<a href="https://www.youtube.com/playlist?list=PLP0S85GEw7DOJf_cbgUIL20qqwqb5x8KA" aria-label="' . esc_attr(__('View Element Pack Video Tutorials', 'bdthemes-element-pack-lite')) . '" target="_blank">' . __('Video Tutorials', 'bdthemes-element-pack-lite') . '</a>',
+
+			];
+
+			$plugin_meta = array_merge($plugin_meta, $row_meta);
+		}
+
+		return $plugin_meta;
+	}
+
+	/**
+	 * Plugin action links
+	 * @access public
+	 * @return array
+	 */
+
+    public function plugin_action_links( $plugin_meta ) {
+
+        $row_meta = [
+            'settings' => '<a href="'.admin_url( 'admin.php?page=element_pack_options' ) .'" aria-label="' . esc_attr(__('Go to settings', 'bdthemes-element-pack-lite')) . '" >' . __('Settings', 'bdthemes-element-pack-lite') . '</b></a>',
+        ];
+
+        $plugin_meta = array_merge($plugin_meta, $row_meta);
+
+        return $plugin_meta;
+    }
+
+	/**
+	 * Action meta
+	 * @access public
+	 * @return array
+	 */
+
+
+	public function plugin_action_meta($links) {
+
+		$links = array_merge([sprintf('<a href="%s">%s</a>', element_pack_dashboard_link('#element_pack_welcome'), esc_html__('Settings', 'bdthemes-element-pack-lite'))], $links);
+
+		return $links;
+	}
+
+	/**
+	 * Register admin script
+	 * @access public
+	 */
+
+	public function admin_script() {
+		$suffix = defined('SCRIPT_DEBUG') && SCRIPT_DEBUG ? '' : '.min';
+		if ( is_admin() ) { // for Admin Dashboard Only
+			wp_enqueue_script('chart', BDTEP_ASSETS_URL . 'vendor/js/chart.min.js', ['jquery'], '4.5.1', true);
+			wp_enqueue_script('ep-admin', BDTEP_ADMIN_URL  . 'assets/js/ep-admin.min.js', ['jquery'], BDTEP_VER, true);
+			wp_enqueue_script('jquery');
+			wp_enqueue_script('jquery-form');
+		}
+	}
+
+	public function admin_biggopti_script() {
+		wp_enqueue_style( 'ep-biggopti', BDTEP_ADMIN_URL . 'assets/css/ep-biggopti.css', [], BDTEP_VER, 'all' );
+		wp_enqueue_script( 'ep-biggopti', BDTEP_ADMIN_URL . 'assets/js/ep-biggopti.min.js', [ 'jquery' ], BDTEP_VER, true );
+
+		wp_enqueue_style( 'bdt-product-feed', BDTEP_ADMIN_URL . 'assets/css/ep-product-feed.css', [], BDTEP_VER, 'all' );
+
+		$script_config = [
+			'ajaxurl' => admin_url( 'admin-ajax.php' ),
+			'nonce'   => wp_create_nonce( 'element-pack' ),
+		];
+		wp_localize_script( 'ep-biggopti', 'ElementPackBiggoptiConfig', $script_config );
+	}
+
+	/**
+	 * Drop Tables on deactivated plugin
+	 * @access public
+	 */
+
+	public function bdthemes_element_pack_plugin_on_deactivate() {
+
+		global $wpdb;
+
+		$table_cat      = $wpdb->prefix . 'ep_template_library_cat';
+		$table_post     = $wpdb->prefix . 'ep_template_library_post';
+		$table_cat_post = $wpdb->prefix . 'ep_template_library_cat_post';
+
+		// Table names cannot be passed through $wpdb->prepare(); these are built
+		// from $wpdb->prefix plus hardcoded literals, so no user input is involved.
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, PluginCheck.Security.DirectDB.UnescapedDBParameter
+		$wpdb->query('DROP TABLE IF EXISTS ' . $table_cat_post);
+		$wpdb->query('DROP TABLE IF EXISTS ' . $table_cat);
+		$wpdb->query('DROP TABLE IF EXISTS ' . $table_post);
+		// phpcs:enable
+	}
+
+	/**
+	 * Upgrade Process Complete
+	 * @access public
+	 */
+
+	public function bdthemes_element_pack_plugin_on_upgrade_process_complete($upgrader_object, $options) {
+		if (isset($options['action']) && $options['action'] == 'update' && $options['type'] == 'plugin') {
+			if (isset($options['plugins']) && is_array($options['plugins'])) {
+				foreach ($options['plugins'] as $each_plugin) {
+					if ($each_plugin == BDTEP_PBNAME) {
+						@$this->bdthemes_element_pack_plugin_on_deactivate();
+					}
+				}
+			}
+		}
+	}
+}

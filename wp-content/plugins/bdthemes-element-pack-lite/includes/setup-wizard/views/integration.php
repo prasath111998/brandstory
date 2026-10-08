@@ -1,0 +1,526 @@
+<?php
+/**
+ * Integration Step
+ */
+
+namespace ElementPack\SetupWizard;
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// phpcs:disable WordPress.NamingConventions.PrefixAllGlobals -- Setup wizard view template with local presentation variables.
+
+// Include the required classes
+require_once __DIR__ . '/../class-plugin-integration-helper.php';
+require_once __DIR__ . '/../class-remote-data-handler.php';
+
+// Helper function for time formatting
+if (!function_exists('element_pack_format_last_updated')) {
+    function element_pack_format_last_updated($date_string) {
+        if (empty($date_string)) {
+            return __('Unknown', 'bdthemes-element-pack-lite');
+        }
+        
+        $date = strtotime($date_string);
+        if (!$date) {
+            return __('Unknown', 'bdthemes-element-pack-lite');
+        }
+        
+        $diff = current_time('timestamp') - $date;
+        
+        if ($diff < 60) {
+            return __('Just now', 'bdthemes-element-pack-lite');
+        } elseif ($diff < 3600) {
+            $minutes = floor($diff / 60);
+            /* translators: %d: Number of minutes */
+            return sprintf(_n('%d minute ago', '%d minutes ago', $minutes, 'bdthemes-element-pack-lite'), $minutes);
+        } elseif ($diff < 86400) {
+            $hours = floor($diff / 3600);
+            /* translators: %d: Number of hours */
+            return sprintf(_n('%d hour ago', '%d hours ago', $hours, 'bdthemes-element-pack-lite'), $hours);
+        } elseif ($diff < 2592000) { // 30 days
+            $days = floor($diff / 86400);
+            /* translators: %d: Number of days */
+            return sprintf(_n('%d day ago', '%d days ago', $days, 'bdthemes-element-pack-lite'), $days);
+        } elseif ($diff < 31536000) { // 1 year
+            $months = floor($diff / 2592000);
+            /* translators: %d: Number of months */
+            return sprintf(_n('%d month ago', '%d months ago', $months, 'bdthemes-element-pack-lite'), $months);
+        } else {
+            $years = floor($diff / 31536000);
+            /* translators: %d: Number of years */
+            return sprintf(_n('%d year ago', '%d years ago', $years, 'bdthemes-element-pack-lite'), $years);
+        }
+    }
+}
+
+// Helper function for fallback URLs
+if (!function_exists('element_pack_get_plugin_fallback_urls')) {
+    function element_pack_get_plugin_fallback_urls($plugin_slug) {
+        // Icon URLs are derived from the slug by the shared helper rather than
+        // hardcoded here, so this view ships no asset URLs of its own.
+        return \ElementPack\SetupWizard\Plugin_Integration_Helper::plugin_icon_fallbacks($plugin_slug);
+    }
+}
+
+// Define plugin slugs
+$plugin_slugs = array(
+    'bdthemes-element-pack-lite',
+    'bdthemes-prime-slider-lite/bdthemes-prime-slider.php',
+    'ultimate-post-kit',
+    'ultimate-store-kit',
+    'zoloblocks',
+    'pixel-gallery',
+    'live-copy-paste',
+    'spin-wheel',
+    'ai-image',
+    'dark-reader',
+    'ar-viewer',
+    'smart-admin-assistant',
+    'website-accessibility',
+);
+
+// Get enhanced plugin data using the remote data handler
+$ep_plugins = Remote_Data_Handler::get_remote_plugins();
+
+// Check if we have cached data
+$has_cached_data = !empty($ep_plugins);
+
+// If no cached data, don't fetch immediately - let JavaScript handle it
+if (!$has_cached_data) {
+    $ep_plugins = []; // Empty array for initial load
+}
+?>
+
+<div class="bdt-wizard-step bdt-setup-wizard-integration" data-step="integration">
+    <h2><?php esc_html_e('Add More Firepower', 'bdthemes-element-pack-lite'); ?></h2>
+    <p><?php esc_html_e('You can onboard additional powerful plugins to extend your web design capabilities.', 'bdthemes-element-pack-lite'); ?></p>
+
+    <div class="progress-bar-container">
+        <div id="plugin-install-progress" class="progress-bar"></div>
+    </div>
+
+    <form method="POST" id="ep-install-plugins">
+        <!-- Loading state - shown during plugin installation -->
+        <div class="ep-loading-state" id="ep-install-loading" style="display: none; text-align: center; padding: 40px;">
+            <div class="ep-loading-dots">
+                <div class="ep-loading-dot"></div>
+                <div class="ep-loading-dot"></div>
+                <div class="ep-loading-dot"></div>
+            </div>
+            <p style="margin-top: 20px;" id="ep-loading-message"><?php esc_html_e('Installing plugins...', 'bdthemes-element-pack-lite'); ?></p>
+        </div>
+
+        <!-- Initial loading state - shown while fetching plugin data -->
+        <?php if (!$has_cached_data): ?>
+        <div class="ep-loading-state" id="ep-initial-loading" style="text-align: center; padding: 40px;">
+            <div class="ep-loading-dots">
+                <div class="ep-loading-dot"></div>
+                <div class="ep-loading-dot"></div>
+                <div class="ep-loading-dot"></div>
+            </div>
+            <p style="margin-top: 20px;"><?php esc_html_e('Loading plugin data...', 'bdthemes-element-pack-lite'); ?></p>
+        </div>
+        <?php endif; ?>
+
+        <div class="bdt-plugin-list" id="ep-integration-plugin-list">
+            <?php if ($has_cached_data): ?>
+                <?php
+                $predefined = \ElementPack\SetupWizard\Plugin_Integration_Helper::get_predefined_plugins();
+                $recommended_by_slug = [];
+                foreach ($predefined as $key => $config) {
+                    $dir = (strpos($key, '/') !== false) ? dirname($key) : $key;
+                    $recommended_by_slug[ $dir ] = !empty($config['recommended']);
+                }
+                foreach ($ep_plugins as $slug_key => $plugin) :
+                    // Skip own plugin (Element Pack) when printing only; data still includes it for other plugins
+                    if ($slug_key === 'bdthemes-element-pack-lite') continue;
+                    // Use enhanced status if available, otherwise fall back to old method
+                    $plugin_status = $plugin['status'] ?? 'unknown';
+                    if ($plugin_status === 'unknown') {
+                        // Fallback to old method for compatibility
+                        $is_active = is_plugin_active($plugin['slug']);
+                    } else {
+                        // Use enhanced status
+                        $is_active = ($plugin_status === 'active');
+                    }
+                    $plugin_recommended = !empty($recommended_by_slug[ $slug_key ]);
+                    $is_recommended = $plugin_recommended && !$is_active;
+                ?>
+                    <label class="plugin-item" data-slug="<?php echo esc_attr($plugin['slug']); ?>">
+                        <span class="bdt-flex bdt-flex-middle bdt-flex-between bdt-margin-small-bottom">
+                            <span class="bdt-plugin-logo">
+                                <?php 
+                                // The plugins API returns HTML-encoded text; decode it
+                                // so escaping on output does not double-encode.
+                                $plugin_name = html_entity_decode($plugin['name'] ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                                $plugin_slug = $plugin['slug'] ?? '';
+
+                                // Bundled logo first, remote icon only as a fallback.
+                                $local_logo = \ElementPack\SetupWizard\Plugin_Integration_Helper::plugin_logo_url($slug_key);
+                                $logo_url   = $local_logo ?: ($plugin['logo'] ?? '');
+                                
+                                if (!empty($logo_url) && filter_var($logo_url, FILTER_VALIDATE_URL)) {
+                                    // Bundled Element Pack logo, or the WordPress.org icon.
+                                    echo '<img src="' . esc_url($logo_url) . '" alt="' . esc_attr($plugin_name) . '" onerror="this.style.display=\'none\'; this.nextElementSibling.style.display=\'flex\';">';
+                                    echo '<div class="default-plugin-icon" style="display:none;">📦</div>';
+                                } else {
+                                    // No bundled logo for this slug and no icon from the
+                                    // WordPress.org plugins API yet — show the placeholder.
+                                    echo '<div class="default-plugin-icon">📦</div>';
+                                }
+                                ?>
+                            </span>
+                            
+                            <div class="bdt-plugin-badge-switch-wrap">
+
+                            <?php if ($is_recommended) : ?>
+                                <span class="recommended-badge"><?php esc_html_e('Recommended', 'bdthemes-element-pack-lite'); ?></span>
+                            <?php endif; ?>
+                            
+                            <?php if ($is_active) : ?>
+                                <span class="active-badge"><?php esc_html_e('ACTIVE', 'bdthemes-element-pack-lite'); ?></span>
+                            <?php endif; ?>
+                             <?php
+                             if (!$is_active) : ?>
+                                 <label class="switch">
+                                     <input type="checkbox" class="plugin-slider-checkbox" <?php echo esc_attr( $plugin_recommended ? 'checked' : '' ); ?>
+                                            name="plugins[]<?php echo isset($plugin['slug']) ? esc_attr($plugin['slug']) : ''; ?>">
+                                     <span class="slider round"></span>
+                                 </label>
+                             <?php
+                             endif;
+                             ?>
+                            </div>
+                        </span>
+                        <div class="bdt-flex bdt-flex-middle">
+                                <span class="bdt-plugin-name">
+                                    <?php echo esc_html($plugin_name); ?>
+                                </span>
+                            </div>
+                            
+                        <span class="active-installs">
+                            <?php esc_html_e('Active Installs: ', 'bdthemes-element-pack-lite'); 
+                            if (isset($plugin['active_installs_count']) && $plugin['active_installs_count'] > 0) {
+                                echo ' <span class="installs-count">' . number_format($plugin['active_installs_count']) . '+' . '</span>';
+                            } else {
+                                echo '<span class="installs-count">Fewer than 10</span>';
+                            }
+                            ?>
+                        </span>
+
+                        <?php if (isset($plugin['downloaded_formatted']) && !empty($plugin['downloaded_formatted'])): ?>
+                        <span class="downloads"><?php esc_html_e('Downloads: ', 'bdthemes-element-pack-lite'); echo wp_kses_post($plugin['downloaded_formatted']); ?></span>
+                        <?php endif; ?>
+                        
+                        <div class="rating-section">
+                            <div class="wporg-ratings" title="<?php echo esc_attr($plugin['rating'] ?? '0'); ?> out of 5 stars" style="color:var(--wp--preset--color--pomegrade-1, #e26f56);">
+                                <?php 
+                                $rating = floatval($plugin['rating'] ?? 0);
+                                $full_stars = floor($rating);
+                                $has_half_star = ($rating - $full_stars) >= 0.5;
+                                $empty_stars = 5 - $full_stars - ($has_half_star ? 1 : 0);
+                                
+                                // Full stars
+                                for ($i = 0; $i < $full_stars; $i++) {
+                                    echo '<span class="dashicons dashicons-star-filled"></span>';
+                                }
+                                
+                                // Half star
+                                if ($has_half_star) {
+                                    echo '<span class="dashicons dashicons-star-half"></span>';
+                                }
+                                
+                                // Empty stars
+                                for ($i = 0; $i < $empty_stars; $i++) {
+                                    echo '<span class="dashicons dashicons-star-empty"></span>';
+                                }
+                                ?>
+                            </div>
+                            <span class="rating-text">
+                                <?php echo esc_html($plugin['rating'] ?? '0'); ?> out of 5 stars.
+                                <?php if (isset($plugin['num_ratings']) && $plugin['num_ratings'] > 0): ?>
+                                    <span class="rating-count">(<?php echo number_format($plugin['num_ratings']); ?> ratings)</span>
+                                <?php endif; ?>
+                            </span>
+                        </div>
+                        
+                        <?php 
+                        // Use the enhanced last_updated_formatted if available, otherwise fall back to formatting
+                        if (isset($plugin['last_updated_formatted']) && !empty($plugin['last_updated_formatted'])): ?>
+                        <span class="last-updated"><?php esc_html_e('Last Updated: ', 'bdthemes-element-pack-lite'); echo esc_html($plugin['last_updated_formatted']); ?></span>
+                        <?php elseif (isset($plugin['last_updated']) && !empty($plugin['last_updated'])): ?>
+                        <span class="last-updated"><?php esc_html_e('Last Updated: ', 'bdthemes-element-pack-lite'); echo esc_html(element_pack_format_last_updated($plugin['last_updated'])); ?></span>
+                        <?php endif; ?>
+
+                    </label>
+                <?php
+                endforeach; ?>
+            <?php endif; ?>
+        </div>
+        
+        <div class="wizard-navigation bdt-margin-top">
+            <button class="bdt-button bdt-button-primary d-none" type="submit" id="ep-install-plugins-btn">
+                <?php esc_html_e('Install and Continue', 'bdthemes-element-pack-lite'); ?>
+            </button>
+            <div class="bdt-close-button bdt-margin-left bdt-wizard-next" data-step="finish"><?php esc_html_e('Skip', 'bdthemes-element-pack-lite'); ?></div>
+        </div>
+    </form>
+
+    <div class="bdt-wizard-navigation">
+        <button class="bdt-button bdt-button-secondary bdt-wizard-prev" data-step="features">
+            <span><i class="dashicons dashicons-arrow-left-alt"></i></span>
+            <?php esc_html_e('Previous Step', 'bdthemes-element-pack-lite'); ?>
+        </button>
+    </div>
+</div>
+
+<style>
+.ep-loading-dots {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin: 20px 0;
+}
+
+.ep-loading-dot {
+    width: 12px;
+    height: 12px;
+    background-color: #49ddb4;
+    border-radius: 50%;
+    animation: ep-wave 1.4s ease-in-out infinite both;
+}
+
+.ep-loading-dot:nth-child(1) {
+    animation-delay: -0.32s;
+}
+
+.ep-loading-dot:nth-child(2) {
+    animation-delay: -0.16s;
+}
+
+.ep-loading-dot:nth-child(3) {
+    animation-delay: 0s;
+}
+
+@keyframes ep-wave {
+    0%, 80%, 100% {
+        transform: scale(0.8);
+        opacity: 0.5;
+    }
+    40% {
+        transform: scale(1.2);
+        opacity: 1;
+    }
+}
+</style>
+
+<?php // phpcs:ignore PluginCheck.CodeAnalysis.Offloading.OffloadedContent -- Setup wizard loads plugin icons from the WordPress.org plugin directory. ?>
+<script>
+jQuery(document).ready(function($) {
+    const epI18n = <?php echo wp_json_encode( [
+        'unable_to_load'      => __( 'Unable to load plugin data.', 'bdthemes-element-pack-lite' ),
+        'network_error'       => __( 'Network error occurred while loading plugin data.', 'bdthemes-element-pack-lite' ),
+        'no_plugins_found'    => __( 'No plugins found.', 'bdthemes-element-pack-lite' ),
+        'recommended'         => __( 'Recommended', 'bdthemes-element-pack-lite' ),
+        'active'              => __( 'ACTIVE', 'bdthemes-element-pack-lite' ),
+        'active_installs'     => __( 'Active Installs:', 'bdthemes-element-pack-lite' ),
+        'downloads'           => __( 'Downloads:', 'bdthemes-element-pack-lite' ),
+        'last_updated'        => __( 'Last Updated:', 'bdthemes-element-pack-lite' ),
+        'out_of_5_stars'      => __( 'out of 5 stars', 'bdthemes-element-pack-lite' ),
+        'ratings'             => __( 'ratings', 'bdthemes-element-pack-lite' ),
+        'fewer_than_10'       => __( 'Fewer than 10', 'bdthemes-element-pack-lite' ),
+        'retry'               => __( 'Retry', 'bdthemes-element-pack-lite' ),
+    ] ); ?>;
+    let integrationDataLoaded = false;
+
+    // Plugin data comes from a remote catalog; escape it before it is
+    // concatenated into markup.
+    function epEsc(value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+    }
+    
+    // Function to load integration data
+    function loadIntegrationData() {
+        if (integrationDataLoaded) return;
+        
+        const $pluginList = $('#ep-integration-plugin-list');
+        const $initialLoading = $('#ep-initial-loading');
+        
+        // Don't add another loading state if initial loading is visible
+        // Just keep the existing one
+        
+        // Make AJAX request to get plugin data
+        $.ajax({
+            url: ajaxurl,
+            type: 'POST',
+            data: {
+                action: 'ep_get_plugins',
+                nonce: '<?php echo esc_js( wp_create_nonce('ep_get_plugins_nonce') ); ?>'
+            },
+            success: function(response) {
+                if (response.success && response.data.plugins) {
+                    // Hide the initial loading div
+                    $initialLoading.hide();
+                    renderPluginList(response.data.plugins);
+                    integrationDataLoaded = true;
+                } else {
+                    showError(epI18n.unable_to_load);
+                }
+            },
+            error: function() {
+                showError(epI18n.network_error);
+            }
+        });
+    }
+    
+    // Function to render plugin list
+    function renderPluginList(plugins) {
+        const $pluginList = $('#ep-integration-plugin-list');
+        let html = '';
+        
+        if (plugins.length === 0) {
+            html = '<div class="ep-no-plugins" style="text-align: center; padding: 40px;"><p>' + epI18n.no_plugins_found + '</p></div>';
+        } else {
+            plugins.forEach(function(plugin) {
+                // Skip own plugin (Element Pack) when printing only; data still includes it for other plugins
+                if (plugin.slug === 'bdthemes-element-pack-lite') return;
+                const isActive = plugin.status === 'active';
+                const isRecommended = plugin.recommended && !isActive;
+                
+                html += `
+                    <label class="plugin-item" data-slug="${epEsc(plugin.slug)}">
+                        <span class="bdt-flex bdt-flex-middle bdt-flex-between bdt-margin-small-bottom">
+                            <span class="bdt-plugin-logo">
+                                ${generatePluginLogo(plugin)}
+                            </span>
+                            <div class="bdt-plugin-badge-switch-wrap">
+                                ${isRecommended ? '<span class="recommended-badge">' + epI18n.recommended + '</span>' : ''}
+                                ${isActive ? '<span class="active-badge">' + epI18n.active + '</span>' : ''}
+                                ${!isActive ? `
+                                    <label class="switch">
+                                        <input type="checkbox" class="plugin-slider-checkbox" ${plugin.recommended ? 'checked' : ''} name="plugins[]${epEsc(plugin.slug)}">
+                                        <span class="slider round"></span>
+                                    </label>
+                                ` : ''}
+                            </div>
+                        </span>
+                        <div class="bdt-flex bdt-flex-middle">
+                            <span class="bdt-plugin-name">${epEsc(plugin.name)}</span>
+                        </div>
+                        <span class="active-installs">
+                            ${epI18n.active_installs}
+                            <span class="installs-count">${plugin.active_installs_count > 0 ? plugin.active_installs_count.toLocaleString() + '+' : epI18n.fewer_than_10}</span>
+                        </span>
+                        ${plugin.downloaded_formatted ? `<span class="downloads">${epI18n.downloads} ${epEsc(plugin.downloaded_formatted)}</span>` : ''}
+                        <div class="rating-section">
+                            <div class="wporg-ratings" title="${epEsc(plugin.rating)} ${epI18n.out_of_5_stars}" style="color:var(--wp--preset--color--pomegrade-1, #e26f56);">
+                                ${generateStarRating(plugin.rating)}
+                            </div>
+                            <span class="rating-text">
+                                ${plugin.rating} ${epI18n.out_of_5_stars}.
+                                ${plugin.num_ratings > 0 ? `<span class="rating-count">(${plugin.num_ratings.toLocaleString()} ${epI18n.ratings})</span>` : ''}
+                            </span>
+                        </div>
+                        ${plugin.last_updated_formatted ? `<span class="last-updated">${epI18n.last_updated} ${epEsc(plugin.last_updated_formatted)}</span>` : ''}
+                    </label>
+                `;
+            });
+        }
+        
+        $pluginList.html(html);
+    }
+    
+    // Helper function to generate plugin logo
+    function generatePluginLogo(plugin) {
+        if (plugin.logo && plugin.logo.match(/^https?:\/\//)) {
+            return `<img src="${epEsc(plugin.logo)}" alt="${epEsc(plugin.name)}" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                    <div class="default-plugin-icon" style="display:none;">📦</div>`;
+        } else {
+            const slug = plugin.slug.includes('/') ? plugin.slug.split('/')[0] : plugin.slug;
+            return `<div class="default-plugin-icon" aria-label="${epEsc(plugin.name)}">📦</div>`;
+        }
+    }
+    
+    // Helper function to generate star rating
+    function generateStarRating(rating) {
+        const fullStars = Math.floor(rating);
+        const hasHalfStar = (rating - fullStars) >= 0.5;
+        const emptyStars = 5 - fullStars - (hasHalfStar ? 1 : 0);
+        
+        let html = '';
+        for (let i = 0; i < fullStars; i++) {
+            html += '<span class="dashicons dashicons-star-filled"></span>';
+        }
+        if (hasHalfStar) {
+            html += '<span class="dashicons dashicons-star-half"></span>';
+        }
+        for (let i = 0; i < emptyStars; i++) {
+            html += '<span class="dashicons dashicons-star-empty"></span>';
+        }
+        return html;
+    }
+    
+    // Function to show error
+    function showError(message) {
+        const $pluginList = $('#ep-integration-plugin-list');
+        const $initialLoading = $('#ep-initial-loading');
+        
+        // Hide initial loading
+        $initialLoading.hide();
+        
+        // Show error in plugin list
+        $pluginList.html(`
+            <div class="ep-error-state" style="text-align: center; padding: 40px;">
+                <p style="color: #d63638;">${message}</p>
+                <button type="button" class="bdt-button bdt-button-secondary" onclick="location.reload()">${epI18n.retry}</button>
+            </div>
+        `);
+    }
+    
+    // Detect when integration tab becomes active
+    function observeIntegrationTab() {
+        // Check if integration step is currently visible
+        const $integrationStep = $('.bdt-setup-wizard-integration');
+        
+        if ($integrationStep.length) {
+            // Create a MutationObserver to detect when the integration step becomes visible
+            const observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(mutation) {
+                    if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+                        const $target = $(mutation.target);
+                        if ($target.hasClass('bdt-setup-wizard-integration') && $target.is(':visible')) {
+                            loadIntegrationData();
+                            observer.disconnect(); // Stop observing after first load
+                        }
+                    }
+                });
+            });
+            
+            // Start observing
+            observer.observe($integrationStep[0], {
+                attributes: true,
+                attributeFilter: ['class']
+            });
+            
+            // Also check immediately if it's already visible
+            if ($integrationStep.is(':visible') && !integrationDataLoaded) {
+                loadIntegrationData();
+            }
+        }
+    }
+    
+    // Initialize tab observation
+    observeIntegrationTab();
+    
+    // Fallback: Also try to detect tab clicks (for different wizard implementations)
+    $(document).on('click', '[data-step="integration"], .bdt-wizard-step[data-step="integration"]', function() {
+        if (!integrationDataLoaded) {
+            setTimeout(loadIntegrationData, 100);
+        }
+    });
+});
+</script>

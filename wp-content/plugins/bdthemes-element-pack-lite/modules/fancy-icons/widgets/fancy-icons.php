@@ -1,0 +1,693 @@
+<?php
+
+namespace ElementPack\Modules\FancyIcons\Widgets;
+
+use ElementPack\Base\Module_Base;
+use Elementor\Controls_Manager;
+use Elementor\Group_Control_Image_Size;
+use Elementor\Group_Control_Border;
+use Elementor\Group_Control_Text_Stroke;
+use Elementor\Icons_Manager;
+use Elementor\Group_Control_Typography;
+use Elementor\Repeater;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class Fancy_Icons extends Module_Base {
+
+    public function get_name() {
+        return 'bdt-fancy-icons';
+    }
+
+    public function get_title() {
+        return BDTEP . esc_html__('Fancy Icons', 'bdthemes-element-pack-lite');
+    }
+
+    public function get_icon() {
+        return 'bdt-wi-fancy-icons';
+    }
+
+    public function get_categories() {
+        return ['element-pack'];
+    }
+
+    public function get_keywords() {
+        return ['social', 'share', 'fancy', 'advanced', 'brand', 'icons'];
+    }
+
+    public function is_reload_preview_required() {
+        return false;
+    }
+
+    public function get_style_depends() {
+        return $this->ep_is_edit_mode() ? [ 'ep-styles' ] : [ 'ep-fancy-icons' ];
+    }
+
+    public function get_custom_help_url() {
+        return 'https://youtu.be/Y4NoiuW2yBM';
+    }
+
+	public function has_widget_inner_wrapper(): bool {
+        return ! \Elementor\Plugin::$instance->experiments->is_feature_active( 'e_optimized_markup' );
+    }
+	protected function is_dynamic_content(): bool {
+		return false;
+	}
+
+    protected function register_controls() {
+
+        $this->start_controls_section(
+            'section_layout_fancy_icons',
+            [
+                'label' => esc_html__('Fancy Icons', 'bdthemes-element-pack-lite'),
+                'tab'   => Controls_Manager::TAB_CONTENT,
+            ]
+        );
+
+        $repeater = new Repeater();
+
+        $repeater->add_control(
+            'social_type',
+            [
+                'label'        => esc_html__('Social Type', 'bdthemes-element-pack-lite'),
+                'type'         => Controls_Manager::CHOOSE,
+                'toggle'       => false,
+                'default'      => 'icon',
+                'prefix_class' => 'bdt-social-type-',
+                'options'      => [
+                    'icon' => [
+                        'title' => esc_html__('Icon', 'bdthemes-element-pack-lite'),
+                        'icon'  => 'fas fa-star'
+                    ],
+                    'text' => [
+                        'title' => esc_html__('Text', 'bdthemes-element-pack-lite'),
+                        'icon'  => 'fas fa-text-width',
+                    ],
+                ],
+                'render_type'  => 'template'
+            ]
+        );
+
+        $repeater->add_control(
+            'social_icon',
+            [
+                'label'     => esc_html__('Icon', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::ICONS,
+                'fa4compatibility' => 'icon',
+                'condition' => [
+                    'social_type' => 'icon',
+                ],
+                'default' => [
+                    'value' => 'fab fa-facebook-f',
+                    'library' => 'fa-brands',
+                ],
+                'skin' => 'inline',
+                'label_block' => false
+            ]
+        );
+
+        $repeater->add_control(
+            'social_name',
+            [
+                'label'       => esc_html__('Custom Label', 'bdthemes-element-pack-lite'),
+                'type'        => Controls_Manager::TEXT,
+                'dynamic'     => ['active' => true],
+                'default'     => esc_html__('Facebook', 'bdthemes-element-pack-lite'),
+                'label_block' => true,
+                'condition'   => [
+                    'social_type' => 'text',
+                ],
+                'render_type' => 'template'
+            ]
+        );
+
+        $repeater->add_control(
+            'social_link',
+            [
+                'label'         => esc_html__('Custom Link', 'bdthemes-element-pack-lite'),
+                'type'          => Controls_Manager::URL,
+                'default'       => ['url' => '#'],
+                'show_external' => false,
+                'dynamic'       => ['active' => true],
+                'condition'     => [
+                    'social_type!' => ''
+                ]
+            ]
+        );
+
+        $repeater->add_control(
+            'icon_color',
+            [
+                'label'     => esc_html__('Color', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} {{CURRENT_ITEM}}.bdt-fancy-icons-item a'          => 'color: {{VALUE}};',
+                    '{{WRAPPER}} {{CURRENT_ITEM}}.bdt-fancy-icons-item a.icon svg'          => 'fill: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $repeater->add_control(
+            'icon_hover_color',
+            [
+                'label'     => esc_html__('Hover Color', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} {{CURRENT_ITEM}}.bdt-fancy-icons-item:hover a'          => 'color: {{VALUE}};',
+                    '{{WRAPPER}} {{CURRENT_ITEM}}.bdt-fancy-icons-item:hover a.icon svg'          => 'fill: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $repeater->add_control(
+            'icon_background_color',
+            [
+                'label'     => esc_html__('Background', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} {{CURRENT_ITEM}}.bdt-fancy-icons-item' => 'background: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'share_items',
+            [
+                'label'       => esc_html__('Social Items', 'bdthemes-element-pack-lite'),
+                'type'        => Controls_Manager::REPEATER,
+                'fields' => $repeater->get_controls(),
+                'default'     => [
+                    [
+                        'social_name' => esc_html__('Facebook', 'bdthemes-element-pack-lite'),
+                        'social_icon' => ['value' => 'fab fa-facebook-f', 'library' => 'fa-brands'],
+                    ],
+                    [
+                        'social_name' => esc_html__('X', 'bdthemes-element-pack-lite'),
+                        'social_icon' => ['value' => 'fab fa-x-twitter', 'library' => 'fa-brands'],
+                    ],
+                    [
+                        'social_name' => esc_html__('Linkedin', 'bdthemes-element-pack-lite'),
+                        'social_icon' => ['value' => 'fab fa-linkedin-in', 'library' => 'fa-brands'],
+                    ],
+                    [
+                        'social_name' => esc_html__('Instagram', 'bdthemes-element-pack-lite'),
+                        'social_icon' => ['value' => 'fab fa-instagram', 'library' => 'fa-brands'],
+                    ],
+                ],
+                'title_field' => '{{{ social_name }}}',
+            ]
+        );
+
+        $this->add_responsive_control(
+            'columns',
+            [
+                'label'          => esc_html__('Columns', 'bdthemes-element-pack-lite'),
+                'type'           => Controls_Manager::SELECT,
+                'default'        => '2',
+                'tablet_default' => '2',
+                'mobile_default' => '1',
+                'options'        => [
+                    '1' => '1',
+                    '2' => '2',
+                    '3' => '3',
+                    '4' => '4',
+                    '5' => '5',
+                    '6' => '6',
+                ],
+                'separator'      => 'before'
+            ]
+        );
+
+        $this->add_control(
+            'background_type',
+            [
+                'label'   => esc_html__('Background Type', 'bdthemes-element-pack-lite'),
+                'type'    => Controls_Manager::CHOOSE,
+                'default' => 'image',
+                'options' => [
+                    'image'   => [
+                        'title' => esc_html__('Image', 'bdthemes-element-pack-lite'),
+                        'icon'  => 'fas fa-image',
+                    ],
+                    'video'   => [
+                        'title' => esc_html__('Video', 'bdthemes-element-pack-lite'),
+                        'icon'  => 'fas fa-play-circle',
+                    ],
+                    'youtube' => [
+                        'title' => esc_html__('Youtube', 'bdthemes-element-pack-lite'),
+                        'icon'  => 'fab fa-youtube',
+                    ],
+                ],
+            ]
+        );
+
+
+        $this->add_control(
+            'background_image',
+            [
+                'label'     => esc_html__('Background Image', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::MEDIA,
+                'dynamic'   => ['active' => true],
+                'default'   => [
+                    'url' => BDTEP_ASSETS_URL . 'images/gallery/item-5.svg',
+                ],
+                'condition' => [
+                    'background_type' => 'image'
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'background_attachment',
+            [
+                'label'     => esc_html__('Background Attachment', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::SELECT,
+                'default'   => 'inherit',
+                'options'   => [
+                    'inherit' => esc_html__('Default', 'bdthemes-element-pack-lite'),
+                    'scroll'  => esc_html__('Scroll', 'bdthemes-element-pack-lite'),
+                    'fixed'   => esc_html__('Fixed', 'bdthemes-element-pack-lite'),
+                ],
+                'condition' => [
+                    'background_type' => 'image'
+                ],
+            ]
+        );
+
+        $this->add_group_control(
+            Group_Control_Image_Size::get_type(),
+            [
+                'name'         => 'thumbnail_size',
+                'label'        => esc_html__('Image Size', 'bdthemes-element-pack-lite'),
+                'exclude'      => ['custom'], // phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_exclude -- Elementor control option, not WP_Query.
+                'default'      => 'full',
+                'prefix_class' => 'bdt-fancy-icons--thumbnail-size-',
+                'condition'    => [
+                    'background_type' => 'image'
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'video_link',
+            [
+                'label'     => esc_html__('Video Link', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::TEXT,
+                'condition' => [
+                    'background_type' => 'video'
+                ],
+                'default'   => '//test-videos.co.uk/vids/bigbuckbunny/mp4/av1/1080/Big_Buck_Bunny_1080_10s_1MB.mp4',
+                'dynamic'   => ['active' => true],
+            ]
+        );
+
+        $this->add_control(
+            'youtube_link',
+            [
+                'label'     => esc_html__('Youtube Link', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::TEXT,
+                'condition' => [
+                    'background_type' => 'youtube'
+                ],
+                'default'   => 'https://youtu.be/YE7VzlLtp-4',
+                'dynamic'   => ['active' => true],
+            ]
+        );
+
+        $this->end_controls_section();
+
+        //Style
+        $this->start_controls_section(
+            'section_style_fancy_icons',
+            [
+                'label' => esc_html__('Fancy Icons', 'bdthemes-element-pack-lite'),
+                'tab'   => Controls_Manager::TAB_STYLE,
+            ]
+        );
+        $this->add_control(
+			'blend_type',
+			[
+				'label'     => esc_html__('Blend Type', 'bdthemes-element-pack-lite'),
+				'type'      => Controls_Manager::SELECT,
+				'default'   => 'multiply',
+				'options'   => element_pack_blend_options(),
+				'selectors' => [
+					'{{WRAPPER}} .bdt-fancy-icons-item' => 'mix-blend-mode: {{VALUE}};'
+				],
+			]
+		);
+
+        $this->add_control(
+            'item_background_color',
+            [
+                'label'     => esc_html__('Background', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item' => 'background: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'item_hover_background_color',
+            [
+                'label'     => esc_html__('Hover Background', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item:hover' => 'background: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_group_control(
+            Group_Control_Border::get_type(),
+            [
+                'name'     => 'fancy_ixons_item_border',
+                'selector' => '{{WRAPPER}} .bdt-fancy-icons',
+            ]
+        );
+
+        $this->add_responsive_control(
+            'fancy_ixons_item_radius',
+            [
+                'label'      => esc_html__('Radius', 'bdthemes-element-pack-lite'),
+                'type'       => Controls_Manager::DIMENSIONS,
+                'size_units' => ['px', '%'],
+                'selectors'  => [
+                    '{{WRAPPER}} .bdt-fancy-icons' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+                ],
+            ]
+        );
+
+        $this->add_responsive_control(
+            'item_icon_text_rotate',
+            [
+                'label'     => esc_html__('Hover Rotate', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::SLIDER,
+                'range'     => [
+                    'px' => [
+                        'min'  => -360,
+                        'max'  => 360,
+                        'step' => 5,
+                    ],
+                ],
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item:hover a' => 'transform: rotate({{SIZE}}deg);',
+                ],
+            ]
+        );
+
+        $this->add_responsive_control(
+            'item_padding',
+            [
+                'label'      => esc_html__('Padding', 'bdthemes-element-pack-lite'),
+                'type'       => Controls_Manager::DIMENSIONS,
+                'size_units' => ['px', 'em', '%'],
+                'selectors'  => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'share_items_icon',
+            [
+                'label'     => esc_html__('Icon', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::HEADING,
+                'separator' => 'before',
+            ]
+        );
+
+        $this->add_control(
+            'item_icon_color',
+            [
+                'label'     => esc_html__('Color', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item a.icon'     => 'color: {{VALUE}};',
+                    '{{WRAPPER}} .bdt-fancy-icons-item a.icon svg'     => 'fill: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'item_icon_hover_color',
+            [
+                'label'     => esc_html__('Hover Color', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item:hover a.icon' => 'color: {{VALUE}};',
+                    '{{WRAPPER}} .bdt-fancy-icons-item:hover a.icon svg' => 'fill: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_responsive_control(
+            'icon_size',
+            [
+                'label'      => esc_html__('Size', 'bdthemes-element-pack-lite'),
+                'type'       => Controls_Manager::SLIDER,
+                'size_units' => ['vw'],
+                'range'      => [
+                    'vw' => [
+                        'min' => 1,
+                        'max' => 50,
+                    ],
+                ],
+                'default'    => [
+                    'unit' => 'vw',
+                ],
+                'selectors'  => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item a.icon' => 'font-size: {{SIZE}}{{UNIT}};',
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'share_items_text',
+            [
+                'label'     => esc_html__('Text', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::HEADING,
+                'separator' => 'before',
+            ]
+        );
+
+        $this->add_group_control(
+            Group_Control_Text_Stroke::get_type(),
+            [
+                'name' => 'item_text_stroke',
+                'label' => esc_html__('Text Stroke', 'bdthemes-element-pack-lite') . BDTEP_NC,
+                'selector' => '{{WRAPPER}} .bdt-fancy-icons-item a.text',
+            ]
+        );
+
+        $this->add_control(
+            'item_text_color',
+            [
+                'label'     => esc_html__('Color', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item a.text' => 'color: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_control(
+            'item_text_hover_color',
+            [
+                'label'     => esc_html__('Hover Color', 'bdthemes-element-pack-lite'),
+                'type'      => Controls_Manager::COLOR,
+                'selectors' => [
+                    '{{WRAPPER}} .bdt-fancy-icons-item:hover a.text' => 'color: {{VALUE}}; -webkit-text-stroke-color: {{VALUE}};',
+                ],
+            ]
+        );
+
+        $this->add_group_control(
+            Group_Control_Typography::get_type(),
+            [
+                'name' => 'text_size',
+                'label' => esc_html__('Typography', 'bdthemes-element-pack-lite'),
+                'selector' => '{{WRAPPER}} .bdt-fancy-icons-item a.text',
+            ]
+        );
+
+        $this->end_controls_section();
+    }
+
+
+    /**
+     * Renders the video background (HTML5 video).
+     *
+     * @param array $settings Widget settings; uses 'video_link'.
+     */
+    protected function render_item_video( $settings ) {
+        $video_src = isset( $settings['video_link'] ) ? $settings['video_link'] : '';
+        if ( $video_src === '' ) {
+            return;
+        }
+        ?>
+        <video autoplay loop muted playsinline>
+            <source src="<?php echo esc_url( $video_src ); ?>" type="video/mp4">
+        </video>
+        <?php
+    }
+
+    /**
+     * Renders the YouTube iframe background.
+     *
+     * @param array $settings Widget settings; uses 'youtube_link'.
+     */
+    protected function render_item_youtube( $settings ) {
+        $youtube_link = isset( $settings['youtube_link'] ) ? $settings['youtube_link'] : '';
+        if ( $youtube_link === '' ) {
+            return;
+        }
+        $id = ( preg_match( '%(?:youtube(?:-nocookie)?\.com/(?:[^/]+/.+/|(?:v|e(?:mbed)?)/|.*[?&]v=)|youtu\.be/)([^"&?/ ]{11})%i', $youtube_link, $match ) ) ? $match[1] : false;
+        if ( $id === false ) {
+            return;
+        }
+        $url = 'https://www.youtube.com/embed/' . esc_attr( $id ) . '?autoplay=1&mute=1&controls=0&showinfo=0&rel=0&loop=1&modestbranding=1&wmode=transparent&playsinline=1&playlist=' . esc_attr( $id );
+        ?>
+        <iframe src="<?php echo esc_url( $url ); ?>" allowfullscreen></iframe>
+        <?php
+    }
+
+    public function render() {
+        $settings = $this->get_settings_for_display();
+
+        $desktop_cols = isset( $settings['columns'] ) ? $settings['columns'] : '2';
+        $tablet_cols  = isset( $settings['columns_tablet'] ) ? $settings['columns_tablet'] : '2';
+        $mobile_cols  = isset( $settings['columns_mobile'] ) ? $settings['columns_mobile'] : '1';
+
+        $this->add_render_attribute( 'advanced-icons', 'class', 'bdt-fancy-icons' );
+
+        $background_type = isset( $settings['background_type'] ) ? $settings['background_type'] : 'image';
+        if ( $background_type === 'image' && ! empty( $settings['background_image']['url'] ) ) {
+            $thumb_url = Group_Control_Image_Size::get_attachment_image_src(
+                $settings['background_image']['id'],
+                'thumbnail_size',
+                $settings
+            );
+            if ( ! $thumb_url ) {
+                $thumb_url = $settings['background_image']['url'];
+            }
+            $attachment = isset( $settings['background_attachment'] ) ? $settings['background_attachment'] : 'inherit';
+            $this->add_render_attribute(
+                'advanced-icons',
+                'style',
+                'background-image: url(' . esc_url( $thumb_url ) . '); background-attachment: ' . esc_attr( $attachment ) . ';'
+            );
+        }
+        ?>
+        <div <?php $this->print_render_attribute_string( 'advanced-icons' ); ?>>
+            <div class="bdt-fancy-icons-background">
+                <?php
+                if ( $background_type === 'youtube' && ! empty( $settings['youtube_link'] ) ) {
+                    $this->render_item_youtube( $settings );
+                } elseif ( $background_type === 'video' && ! empty( $settings['video_link'] ) ) {
+                    $this->render_item_video( $settings );
+                }
+                ?>
+            </div>
+
+            <div class="bdt-grid bdt-grid-collapse bdt-child-width-1-<?php echo esc_attr( $mobile_cols ); ?> bdt-child-width-1-<?php echo esc_attr( $tablet_cols ); ?>@s bdt-child-width-1-<?php echo esc_attr( $desktop_cols ); ?>@l" data-bdt-grid>
+                <?php
+                $share_items = isset( $settings['share_items'] ) ? $settings['share_items'] : [];
+                foreach ( $share_items as $index => $item ) :
+                    $link_key = 'link_' . $index;
+                    $item_id  = isset( $item['_id'] ) ? $item['_id'] : $index;
+                    $social_type = isset( $item['social_type'] ) ? $item['social_type'] : 'icon';
+
+                    $this->add_render_attribute(
+                        'share-item',
+                        'class',
+                        'bdt-fancy-icons-item bdt-flex bdt-flex-middle bdt-flex-center elementor-repeater-item-' . esc_attr( $item_id ),
+                        true
+                    );
+                    $this->add_render_attribute( $link_key, 'class', [ esc_attr( $social_type ) ], true );
+
+                    $has_icon = ( $social_type === 'icon' && ! empty( $item['social_icon']['value'] ) );
+                    $has_text = ( $social_type === 'text' && ! empty( $item['social_name'] ) );
+
+                    if ( ! empty( $item['social_link']['url'] ) ) {
+                        $this->add_link_attributes( $link_key, $item['social_link'] );
+                    }
+                    ?>
+                    <div <?php $this->print_render_attribute_string( 'share-item' ); ?>>
+                        <a <?php $this->print_render_attribute_string( $link_key ); ?>>
+                            <?php if ( $has_icon || $has_text ) : ?>
+                                <span class="bdt-icon-wrapper">
+                                    <?php
+                                    if ( $has_icon ) {
+                                        Icons_Manager::render_icon( $item['social_icon'], [ 'aria-hidden' => 'true' ] );
+                                    } elseif ( $has_text ) {
+                                        echo wp_kses( $item['social_name'], element_pack_allow_tags( 'title' ) );
+                                    }
+                                    ?>
+                                </span>
+                            <?php endif; ?>
+                        </a>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php
+    }
+
+    protected function content_template() {
+        ?>
+        <#
+        var bgType = settings.background_type || 'image';
+        var bgStyle = '';
+        if ( bgType === 'image' && settings.background_image && settings.background_image.url ) {
+            bgStyle = 'background-image: url(' + settings.background_image.url + ');';
+            if ( settings.background_attachment ) {
+                bgStyle += 'background-attachment: ' + settings.background_attachment + ';';
+            }
+        }
+        var desktopCols = settings.columns || '2';
+        var tabletCols  = settings.columns_tablet || '2';
+        var mobileCols  = settings.columns_mobile || '1';
+        #>
+        <div class="bdt-fancy-icons" style="{{ bgStyle }}">
+            <div class="bdt-fancy-icons-background">
+                <# if ( bgType === 'video' && settings.video_link ) { #>
+                <video autoplay loop muted playsinline>
+                    <source src="{{ settings.video_link }}" type="video/mp4">
+                </video>
+                <# } else if ( bgType === 'youtube' && settings.youtube_link ) { #>
+                <iframe src="" allowfullscreen></iframe>
+                <# } #>
+            </div>
+            <div class="bdt-grid bdt-grid-collapse bdt-child-width-1-{{ mobileCols }} bdt-child-width-1-{{ tabletCols }}@s bdt-child-width-1-{{ desktopCols }}@l" data-bdt-grid>
+                <# _.each( settings.share_items, function( item ) {
+                    var socialType = item.social_type || 'icon';
+                    var hasIcon = ( socialType === 'icon' && item.social_icon && item.social_icon.value );
+                    var hasText = ( socialType === 'text' && item.social_name );
+                    var iconHTML = hasIcon ? elementor.helpers.renderIcon( view, item.social_icon, { 'aria-hidden': true }, 'i', 'object' ) : null;
+                    var linkUrl = item.social_link && item.social_link.url ? item.social_link.url : '#';
+                #>
+                <div class="bdt-fancy-icons-item bdt-flex bdt-flex-middle bdt-flex-center elementor-repeater-item-{{ item._id }}">
+                    <a class="{{ socialType }}" href="{{ linkUrl }}">
+                        <# if ( hasIcon || hasText ) { #>
+                        <span class="bdt-icon-wrapper">
+                            <# if ( hasIcon && iconHTML && iconHTML.rendered ) { #>
+                                {{{ iconHTML.value }}}
+                            <# } else if ( hasIcon ) { #>
+                                <i class="{{ item.social_icon.value }}" aria-hidden="true"></i>
+                            <# } else if ( hasText ) { #>
+                                {{{ item.social_name }}}
+                            <# } #>
+                        </span>
+                        <# } #>
+                    </a>
+                </div>
+                <# } ); #>
+            </div>
+        </div>
+        <?php
+    }
+}

@@ -1,0 +1,145 @@
+<?php
+
+namespace ElementPack\Includes\TemplateLibrary\Editor;
+
+if ( ! defined( 'ABSPATH' ) )
+	exit; // Exit if accessed directly
+class ElementPack_Template_Library_Editor_Init {
+
+	private $dir;
+
+	function __construct() {
+		$this->dir = dirname( __FILE__ ) . '/';
+
+		add_action( 'elementor/editor/after_enqueue_styles', array( $this, 'editor_styles' ) );
+		add_action( 'elementor/editor/before_enqueue_scripts', array( $this, 'enqueue_scripts' ), 9999 );
+
+		// print views and tab variables on footer.
+		add_action( 'elementor/editor/footer', array( $this, 'admin_inline_js' ) );
+		add_action( 'elementor/editor/footer', array( $this, 'print_views' ) );
+
+
+		// enqueue modal's preview css.
+		add_action( 'elementor/preview/enqueue_styles', array( $this, 'preview_styles' ) );
+	}
+
+	public function enqueue_scripts() {
+		// register script
+		wp_register_script(
+			'bdt-template-library-editor-scripts',
+			BDTEP_URL . 'includes/template-library/editor/assets/js/editor-template-library.min.js',
+			array( 'jquery', 'underscore', 'backbone-marionette' ),
+			BDTEP_VER,
+			true
+		);
+
+		//enqueue 
+		wp_enqueue_script( 'bdt-template-library-editor-scripts' );
+	}
+
+	public function editor_styles() {
+
+		wp_enqueue_style(
+			'bdt-template-library-editor-style',
+			BDTEP_URL . 'includes/template-library/editor/assets/css/editor-template-library.css',
+			array(),
+			BDTEP_VER
+		);
+	}
+
+	public function preview_styles() {
+
+		wp_enqueue_style(
+			'bdt-template-library-preview-style',
+			BDTEP_URL . 'includes/template-library/editor/assets/css/editor-template-preview.css',
+			array(),
+			BDTEP_VER
+		);
+	}
+
+	public function admin_inline_js() { ?>
+		<script type="text/javascript">
+			var ElementPackLibreryData = {
+				"nonce": "<?php echo esc_js( wp_create_nonce( 'ep-template-library' ) ); ?>",
+				"libraryButton": "Elements Button",
+				"modalRegions": {
+					"modalHeader": ".dialog-header",
+					"modalContent": ".dialog-message"
+				},
+				"license": {
+					"activated": true,
+					"link": "https://google.com"
+				},
+				"progress": {
+					"action": "bdt_element_pack_template_import_progress",
+					"nonce": "<?php echo esc_js( wp_create_nonce( 'ep-template-library-progress' ) ); ?>",
+					"interval": 700,
+					"labels": {
+						"pending": "<?php echo esc_js( __( 'Preparing…', 'bdthemes-element-pack-lite' ) ); ?>",
+						"fetching": "<?php echo esc_js( __( 'Fetching template…', 'bdthemes-element-pack-lite' ) ); ?>",
+						"preparing": "<?php echo esc_js( __( 'Preparing elements…', 'bdthemes-element-pack-lite' ) ); ?>",
+						"importing": "<?php echo esc_js( __( 'Importing content…', 'bdthemes-element-pack-lite' ) ); ?>",
+						"finalizing": "<?php echo esc_js( __( 'Finalizing…', 'bdthemes-element-pack-lite' ) ); ?>",
+						"complete": "<?php echo esc_js( __( 'Done', 'bdthemes-element-pack-lite' ) ); ?>",
+						"detail_elements": "<?php
+							/* translators: 1: number of elements imported so far, 2: total number of elements. */
+							echo esc_js( __( '%1$s of %2$s elements', 'bdthemes-element-pack-lite' ) );
+						?>",
+						"detail_images": "<?php
+							/* translators: %s: number of images downloaded so far. */
+							echo esc_js( __( '%s images', 'bdthemes-element-pack-lite' ) );
+						?>"
+					}
+				},
+				"tabs": {
+					"bdt_elementpack_page": {
+						"title": "Ready Pages",
+						"data": [],
+						"settings": {
+							"show_title": true,
+							"show_keywords": true
+						}
+					},
+					"bdt_elementpack_header": {
+						"title": "Headers",
+						"data": [],
+						"settings": {
+							"show_title": false,
+							"show_keywords": true
+						}
+					},
+					"bdt_elementpack_footer": {
+						"title": "Footers",
+						"data": [],
+						"settings": {
+							"show_title": false,
+							"show_keywords": true
+						}
+					},
+					"bdt_elementpack_block": {
+						"title": "Blocks",
+						"data": [],
+						"settings": {
+							"show_title": false,
+							"show_keywords": true
+						}
+					},
+				},
+				"defaultTab": "bdt_elementpack_page",
+				"new_demo_rang_date": "<?php echo esc_html( gmdate( 'Ymd', strtotime( '-31 days' ) ) ); ?>"
+			};
+		</script>
+		<?php
+	}
+	public function print_views() {
+		foreach ( glob( $this->dir . 'views/editor/*.php' ) as $file ) {
+			$name = basename( $file, '.php' );
+			ob_start();
+			include $file;
+			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Buffered output from trusted local view template (JS/HTML underscore template).
+			printf( '<script type="text/html" id="view-bdt-elementpack-%1$s">%2$s</script>', esc_html( $name ), ob_get_clean() );
+		}
+	}
+}
+
+new ElementPack_Template_Library_Editor_Init();

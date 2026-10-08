@@ -1,0 +1,4687 @@
+<?php
+/**
+ * Sitemap Generator Class
+ *
+ * XML sitemap generation and management for search engine optimization.
+ * Implements 2025 SEO best practices with real sitemap specifications,
+ * dynamic content inclusion, and performance optimization.
+ *
+ * @package ThinkRank
+ * @subpackage SEO
+ * @since 1.0.0
+ */
+
+declare(strict_types=1);
+
+namespace ThinkRank\SEO;
+
+use InvalidArgumentException;
+
+// Prevent direct access.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+// Filename derivation and web-root removal are shared with the deactivator and
+// with uninstall.php, which runs without an autoloader — so they live in a
+// plain function file both can require. See includes/cleanup-webroot.php.
+require_once __DIR__ . '/../cleanup-webroot.php';
+
+/**
+ * Sitemap Generator Class
+ *
+ * Generates and manages XML sitemaps for search engine optimization.
+ * Provides dynamic sitemap generation with content filtering, priority
+ * calculation, and change frequency optimization.
+ *
+ * @since 1.0.0
+ */
+class Sitemap_Generator extends Abstract_SEO_Manager {
+
+    /**
+     * Memoised WooCommerce page IDs kept out of the sitemap. Null until resolved.
+     *
+     * @since 2.0.1
+     * @var int[]|null
+     */
+    private ?array $woocommerce_excluded_page_ids = null;
+
+    /**
+     * Inclusion flag -> the child sitemap it controls.
+     *
+     * Shared by the child-list builder and by the "did the caller change what
+     * the sitemap includes?" check in maybe_promote_to_index().
+     *
+     * @since 1.31.0
+     * @var array<string, string>
+     */
+    private const INCLUSION_CHILD_TYPES = [
+        'include_posts'      => 'posts',
+        'include_pages'      => 'pages',
+        'include_categories' => 'categories',
+        'include_tags'       => 'tags',
+    ];
+
+    /**
+     * Child sitemap type -> the object that actually supplies its entries.
+     *
+     * A child normally carries its object's own slug, but the sitemap presets UI
+     * writes a display name for the WooCommerce taxonomy child
+     * ('product_categories', not 'product_cat'), so a saved child list can name a
+     * type no post type or taxonomy answers to. Resolving through here lets those
+     * children take the same generic path as every other custom taxonomy instead
+     * of needing a case of their own (#690).
+     *
+     * @since 2.7.0
+     * @var array<string, string>
+     */
+    private const CHILD_TYPE_ALIASES = [
+        'product_categories' => 'product_cat',
+    ];
+
+    /**
+     * Supported sitemap types
+     *
+     * @since 1.0.0
+     * @var array
+     */
+    /**
+     * How many post IDs to hydrate at a time while walking the sitemap set.
+     *
+     * @since 2.0.1
+     * @var int
+     */
+    private const ID_WALK_CHUNK = 500;
+
+    /**
+     * How long a content or settings change is debounced before the sitemap is
+     * rebuilt, in seconds. Coalesces bulk edits into a single regeneration.
+     *
+     * @since 2.2.1
+     * @var int
+     */
+    private const REGENERATION_DEBOUNCE = 30;
+
+    /**
+     * How far past its due time the scheduled rebuild may sit before a request
+     * takes it over, in seconds.
+     *
+     * WP-Cron is request-driven, so on a site running DISABLE_WP_CRON, blocking
+     * loopback requests, or seeing very little traffic the event never fires and
+     * the sitemap silently stops updating (#629). The grace keeps the fast path
+     * (cron) in charge under normal conditions.
+     *
+     * @since 2.2.1
+     * @var int
+     */
+    private const REGENERATION_TAKEOVER_GRACE = 120;
+
+    /**
+     * Longest backoff between takeover attempts after a failed rebuild, so a
+     * persistently failing generation cannot run on every admin request.
+     *
+     * @since 2.2.1
+     * @var int
+     */
+    private const REGENERATION_MAX_BACKOFF = 3600;
+
+    /**
+     * Option holding the rebuild that content/settings changes are still waiting
+     * on: `since`, `source` ('content'|'settings'), `attempts`, `next_attempt`.
+     * Absent means the served sitemap is up to date with what triggered it.
+     *
+     * @since 2.2.1
+     * @var string
+     */
+    public const REGENERATION_PENDING_OPTION = 'thinkrank_sitemap_regeneration_pending';
+
+    /**
+     * Option holding the last automatic-regeneration failure (`message`,
+     * `source`, `time`), so the failure is visible instead of swallowed.
+     *
+     * @since 2.2.1
+     * @var string
+     */
+    public const REGENERATION_ERROR_OPTION = 'thinkrank_sitemap_regeneration_error';
+
+    /**
+     * Delivery modes accepted by the `delivery_mode` setting.
+     *
+     * Mirrors LLMs_Txt_Manager::DELIVERY_MODES, which solved the same problem
+     * for llms.txt. `auto` is the only value a site should normally need.
+     *
+     * @since 2.9.0
+     * @var string[]
+     */
+    public const DELIVERY_MODES = ['auto', 'static', 'dynamic'];
+
+    /**
+     * Cache group for documents rendered on the dynamic path.
+     *
+     * @since 2.9.0
+     * @var string
+     */
+    private const DYNAMIC_CACHE_PREFIX = 'thinkrank_sitemap_doc_';
+
+    /**
+     * How long a dynamically rendered document is cached.
+     *
+     * Invalidated by content and settings changes through
+     * {@see self::flush_dynamic_cache()}, so this is only the backstop for a
+     * change nothing hooked.
+     *
+     * @since 2.9.0
+     * @var int
+     */
+    private const DYNAMIC_CACHE_TTL = 12 * HOUR_IN_SECONDS;
+
+    /**
+     * How long the render lock is held before it is assumed abandoned.
+     *
+     * Long enough for a large site's full build, short enough that a request
+     * killed mid-build does not lock the endpoint out for meaningfully long.
+     *
+     * @since 2.9.0
+     * @var int
+     */
+    private const RENDER_LOCK_TTL = 60;
+
+    /**
+     * Cached stand-in for "this site does not publish that name".
+     *
+     * published_document_names() lists what the configuration *could* produce,
+     * but a child whose type is excluded produces nothing. Without a negative
+     * entry those names miss the cache forever, so every request for one
+     * rebuilt the entire sitemap — the same cost the positive cache exists to
+     * avoid, on a public endpoint (#754 review).
+     *
+     * @since 2.9.0
+     * @var string
+     */
+    private const ABSENT_MARKER = "\0thinkrank-absent";
+
+    /**
+     * How many times, and how long, a losing request waits for the winner.
+     *
+     * Bounded at roughly a second in total: past that, building a second copy
+     * costs less than making a crawler wait.
+     *
+     * @since 2.9.0
+     * @var int
+     */
+    private const RENDER_LOCK_WAIT_ATTEMPTS = 4;
+
+    /**
+     * @since 2.9.0
+     * @var int
+     */
+    private const RENDER_LOCK_WAIT_MICROSECONDS = 250000;
+
+    /**
+     * Where generated documents go instead of disk, when set.
+     *
+     * Every sitemap document this class produces — segments, the index, the
+     * single flat file and local-sitemap.xml — is published through the one
+     * writer, {@see self::save_sitemap_to_file()}. Swapping that writer for a
+     * collector is therefore all it takes to render the same bytes without a
+     * filesystem, which is what dynamic delivery needs (#752). Doing it here
+     * rather than duplicating the build pipeline is deliberate: a second
+     * pipeline would drift from this one, and the index in particular is
+     * assembled from whatever the children actually produced.
+     *
+     * @since 2.9.0
+     * @var callable|null
+     */
+    private $document_sink = null;
+
+    /**
+     * Transient guarding against two generations running at once. Shared with
+     * Sitemap_Endpoint's manual generate route so an automatic rebuild and a
+     * manual one cannot write the same files concurrently.
+     *
+     * @since 2.2.1
+     * @var string
+     */
+    public const GENERATION_LOCK_TRANSIENT = 'thinkrank_sitemap_generation_lock';
+
+    /**
+     * How many term IDs to hydrate at a time while walking a taxonomy.
+     *
+     * @since 2.0.1
+     * @var int
+     */
+    private const TERM_WALK_CHUNK = 1000;
+
+    /**
+     * Exception code for an automatic rebuild stopped short of the memory limit.
+     *
+     * @since 2.10.1
+     * @var int
+     */
+    private const MEMORY_ABORT_CODE = 4290;
+
+    /**
+     * Whether the chunked walks should stop before the memory limit. Only on
+     * for automatic rebuilds, whose failure is recorded and retried.
+     *
+     * @since 2.10.1
+     * @var bool
+     */
+    private bool $memory_guard = false;
+
+    /**
+     * Largest memory cost of one walked chunk in this rebuild, in bytes.
+     *
+     * @since 2.10.1
+     * @var int
+     */
+    private int $walk_chunk_cost = 0;
+
+    private array $sitemap_types = [
+        'posts' => [
+            'name' => 'Posts',
+            'post_types' => ['post'],
+            'priority' => 0.8,
+            'changefreq' => 'weekly'
+        ],
+        'pages' => [
+            'name' => 'Pages',
+            'post_types' => ['page'],
+            'priority' => 0.9,
+            'changefreq' => 'monthly'
+        ],
+        'categories' => [
+            'name' => 'Categories',
+            'taxonomy' => 'category',
+            'priority' => 0.6,
+            'changefreq' => 'weekly'
+        ],
+        'tags' => [
+            'name' => 'Tags',
+            'taxonomy' => 'post_tag',
+            'priority' => 0.4,
+            'changefreq' => 'monthly'
+        ]
+    ];
+
+    /**
+     * The generator the content-change listeners share, built on the first
+     * change of a request.
+     *
+     * @since 2.10.1
+     * @var self|null
+     */
+    private static ?self $listener = null;
+
+    /**
+     * Constructor
+     *
+     * @since 1.0.0
+     * @since 2.10.1 Registers no hooks, whatever `$register_hooks` says. The
+     *              content-change listeners are registered once, at bootstrap,
+     *              by register_content_listeners().
+     *
+     * @param bool $register_hooks Unused since 2.10.1; kept so existing callers,
+     *                             Pro's included, keep working.
+     */
+    public function __construct(bool $register_hooks = true) {
+        parent::__construct('sitemap');
+    }
+
+    /**
+     * Filter the args of a sitemap post query.
+     *
+     * Exists so integrations can widen what the sitemap sees — the multilingual
+     * manager uses it to include every language, since these queries otherwise
+     * run in whichever language happened to be active at generation time.
+     *
+     * @since 1.23.0
+     *
+     * @param array $args get_posts() arguments.
+     * @return array Filtered arguments.
+     */
+    private function filter_query_args(array $args): array {
+        /**
+         * Filter the arguments of a sitemap post query.
+         *
+         * @since 1.23.0
+         *
+         * @param array $args get_posts() arguments.
+         */
+        return (array) apply_filters('thinkrank_sitemap_query_args', $args);
+    }
+
+    /**
+     * Filter the args of a sitemap term query.
+     *
+     * @since 1.23.0
+     *
+     * @param array $args get_terms() arguments.
+     * @return array Filtered arguments.
+     */
+    private function filter_term_query_args(array $args): array {
+        /**
+         * Filter the arguments of a sitemap term query.
+         *
+         * @since 1.23.0
+         *
+         * @param array $args get_terms() arguments.
+         */
+        return (array) apply_filters('thinkrank_sitemap_term_query_args', $args);
+    }
+
+    /**
+     * Register the content-change listeners that queue an automatic rebuild.
+     *
+     * Called once per request, at plugin bootstrap, next to the WP-Cron
+     * listeners that run the rebuild these queue (both in
+     * Plugin::register_sitemap_cron_listeners(), on plugins_loaded). The
+     * constructor used to register them, so they existed only in a request
+     * that happened to build a generator: the REST endpoint, the setup wizard,
+     * an MCP ability. Block-editor saves go through REST and were heard. A
+     * scheduled post published by WP-Cron, Quick Edit, the classic editor and
+     * WP-CLI were not, so the post stayed out of the sitemap with nothing
+     * pending to recover it (#824). Each instance also added its own set, so
+     * one REST save ran the handlers once per generator built.
+     *
+     * The generator is built on the first change and shared for the rest of
+     * the request, so a bulk edit does not construct one per post.
+     *
+     * @since 2.10.1
+     * @return void
+     */
+    public static function register_content_listeners(): void {
+        // Priority 20, to run after other plugins.
+        add_action('save_post', static function (int $post_id, \WP_Post $post): void {
+            self::listener()->handle_content_change($post_id, $post);
+        }, 20, 2);
+        add_action('delete_post', static function (int $post_id): void {
+            self::listener()->handle_content_deletion($post_id);
+        }, 20);
+        add_action('wp_trash_post', static function (int $post_id): void {
+            self::listener()->handle_content_deletion($post_id);
+        }, 20);
+        add_action('untrash_post', static function (int $post_id): void {
+            self::listener()->handle_content_change_by_id($post_id);
+        }, 20);
+
+        foreach (['created_term', 'edited_term', 'delete_term'] as $hook) {
+            add_action($hook, static function (int $term_id, int $tt_id, string $taxonomy): void {
+                self::listener()->handle_taxonomy_change($term_id, $tt_id, $taxonomy);
+            }, 20, 3);
+        }
+
+        // The sitemap leaves out what the robots tag noindexes and what
+        // ThinkRank redirects (#911), so a change to either decides what the
+        // published files should list. Neither is a post or term save, and
+        // without these the files kept the old answer until unrelated content
+        // changed.
+        foreach (self::ROBOTS_SETTINGS_OPTIONS as $option) {
+            add_action('update_option_' . $option, static function ($old_value, $value): void {
+                self::handle_robots_settings_change($old_value, $value);
+            }, 20, 2);
+            add_action('add_option_' . $option, static function ($name, $value): void {
+                self::handle_robots_settings_change([], $value);
+            }, 20, 2);
+        }
+
+        add_action('thinkrank_object_redirect_saved', static function (): void {
+            self::listener()->schedule_regeneration();
+        }, 20, 0);
+    }
+
+    /**
+     * Options holding robots directives the sitemap's item filter reads.
+     *
+     * @since 2.15.0
+     * @var string[]
+     */
+    private const ROBOTS_SETTINGS_OPTIONS = [
+        'thinkrank_global_seo_settings',
+        'thinkrank_global_robot_meta_settings',
+    ];
+
+    /**
+     * Queue a rebuild when a saved robots setting changes a noindex decision.
+     *
+     * Both options carry far more than robots directives (titles, schema,
+     * feature switches), so only a change to a noindex outcome rebuilds.
+     *
+     * @since 2.15.0
+     *
+     * @param mixed $old_value Previous option value.
+     * @param mixed $value     New option value.
+     * @return void
+     */
+    public static function handle_robots_settings_change($old_value, $value): void {
+        if (self::noindex_fingerprint($old_value) === self::noindex_fingerprint($value)) {
+            return;
+        }
+
+        // The matrix memoises the option for the request, and a rebuild that
+        // runs in this request must read the value just saved.
+        Content_Type_Settings::flush_cache();
+
+        self::listener()->schedule_regeneration();
+    }
+
+    /**
+     * The noindex decisions a robots option makes, keyed by what they apply to.
+     *
+     * Reads both shapes: the flat site-wide directives, and the per-entity
+     * rows, where a row's directives apply only while its robots switch is on.
+     * A row that is on but stores no `noindex` key changes nothing, matching
+     * the array_merge() the robots tag does.
+     *
+     * @since 2.15.0
+     *
+     * @param mixed $value Option value.
+     * @return array<string, bool|null>
+     */
+    private static function noindex_fingerprint($value): array {
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $decisions = [];
+
+        if (array_key_exists('noindex', $value) && !is_array($value['noindex'])) {
+            $decisions['*'] = !empty($value['noindex']);
+        }
+
+        foreach ($value as $key => $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $robots = $row['robots_meta'] ?? null;
+
+            $decisions[(string) $key] = !empty($row['robots_meta_enabled']) && is_array($robots) && array_key_exists('noindex', $robots)
+                ? !empty($robots['noindex'])
+                : null;
+        }
+
+        ksort($decisions);
+
+        return $decisions;
+    }
+
+    /**
+     * The generator the content-change listeners share.
+     *
+     * @since 2.10.1
+     * @return self
+     */
+    private static function listener(): self {
+        return self::$listener ??= new self(false);
+    }
+
+    /**
+     * Generate XML sitemap
+     *
+     * @since 1.0.0
+     *
+     * @param array $options Sitemap generation options
+     * @return string XML sitemap content
+     */
+    public function generate_sitemap(array $options = []): string {
+        $settings = $this->get_settings('site');
+
+        $xml = $this->xml_prolog($settings, 'sitemap');
+
+        // Add image namespace if images are enabled
+        if (!empty($settings['include_images'])) {
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">' . "\n";
+        } else {
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        }
+
+        // Add homepage. Use the static front page's real modified time when set,
+        // so lastmod reflects real changes rather than the generation time.
+        $xml .= $this->generate_url_entry(home_url('/'), $this->get_homepage_lastmod(), 1.0, 'daily');
+
+        // MEMORY-EFFICIENT: Generate posts using chunked processing.
+        // Note: the single "general" sitemap includes every URL (no per-file cap);
+        // per-file chunking applies to the segmented/index model where each type
+        // gets its own paginated file (see generate_multiple_sitemaps).
+        $enabled_post_types = $this->get_enabled_post_types($settings);
+        if (!empty($enabled_post_types)) {
+            $xml .= implode('', $this->collect_post_entries($enabled_post_types, $settings));
+        }
+
+        // OPTIMIZED: Get all enabled taxonomies and fetch in single query
+        $enabled_taxonomies = $this->get_enabled_taxonomies($settings);
+        if (!empty($enabled_taxonomies)) {
+            $all_taxonomy_data = $this->fetch_taxonomies_optimized($enabled_taxonomies, $settings);
+
+            // Process each taxonomy's data
+            foreach ($enabled_taxonomies as $taxonomy) {
+                if (!empty($all_taxonomy_data[$taxonomy])) {
+                    $xml .= $this->process_taxonomies_to_xml($all_taxonomy_data[$taxonomy], $taxonomy, $settings);
+                }
+            }
+        }
+
+        $xml .= '</urlset>';
+
+        return $xml;
+    }
+
+    /**
+     * Validate SEO settings (implements interface)
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Settings array to validate
+     * @return array Validation results
+     */
+    public function validate_settings(array $settings): array {
+        $validation = [
+            'valid' => true,
+            'errors' => [],
+            'warnings' => [],
+            'suggestions' => []
+        ];
+
+        try {
+            // Validate exclude_posts
+            if (!empty($settings['exclude_posts'])) {
+                $this->validate_exclude_posts($settings['exclude_posts']);
+            }
+
+            // Validate exclude_terms
+            if (!empty($settings['exclude_terms'])) {
+                $this->validate_exclude_terms($settings['exclude_terms']);
+            }
+
+            // Validate custom_url_pattern
+            if (!empty($settings['custom_url_pattern'])) {
+                $this->validate_custom_url_pattern($settings['custom_url_pattern']);
+            }
+
+            // Validate sitemap_urls
+            if (!empty($settings['sitemap_urls']) && is_array($settings['sitemap_urls'])) {
+                foreach ($settings['sitemap_urls'] as $sitemap) {
+                    if (!empty($sitemap['url'])) {
+                        $this->validate_sitemap_url($sitemap['url']);
+                    }
+                }
+            }
+
+            // Validate numeric settings
+            if (isset($settings['links_per_sitemap'])) {
+                $this->validate_links_per_sitemap($settings['links_per_sitemap']);
+            }
+
+        } catch (InvalidArgumentException $e) {
+            $validation['valid'] = false;
+            $validation['errors'][] = $e->getMessage();
+        }
+
+        return $validation;
+    }
+
+    /**
+     * Get output data for frontend rendering (implements interface)
+     *
+     * @since 1.0.0
+     *
+     * @param string   $context_type The context type
+     * @param int|null $context_id   Optional. Context ID
+     * @return array Output data ready for frontend rendering
+     */
+    public function get_output_data(string $context_type, ?int $context_id): array {
+        $settings = $this->get_settings($context_type, $context_id);
+
+        return [
+            'sitemap_url' => home_url('/sitemap.xml'),
+            'enabled' => $settings['enabled'] ?? true,
+            'last_generated' => $settings['last_generated'] ?? '',
+            'total_urls' => $this->count_sitemap_urls($settings)
+        ];
+    }
+
+    /**
+     * Sitemap keys outside the defaults.
+     *
+     * @since 2.0.1
+     *
+     * @return string[]
+     */
+    protected function additional_setting_keys(): array {
+        return ['selected_preset'];
+    }
+
+    /**
+     * Inclusion flags are per post type and per taxonomy.
+     *
+     * A site registering a `product` post type stores `include_product`; an
+     * enumerated list would go stale on the next registration, so the family
+     * is matched instead.
+     *
+     * @since 2.0.1
+     *
+     * @return string[]
+     */
+    protected function dynamic_setting_key_patterns(): array {
+        return ['/^include_[a-z0-9_]+$/', '/^exclude_[a-z0-9_]+$/'];
+    }
+
+    /**
+     * Get default settings for a context type (implements interface)
+     *
+     * @since 1.0.0
+     *
+     * @param string $context_type The context type to get defaults for
+     * @return array Default settings array
+     */
+    public function get_default_settings(string $context_type): array {
+        return [
+            // Core settings
+            'enabled' => true,
+
+            // Multiple Sitemap URLs
+            'sitemap_urls' => [
+                [
+                    'url' => '/sitemap.xml',
+                    'type' => 'general',
+                    'enabled' => true,
+                    'last_checked' => null,
+                    'status' => 'unknown'
+                ]
+            ],
+            'use_sitemap_index' => false,
+
+            // How the sitemap reaches crawlers. 'auto' keeps the historical
+            // behaviour wherever the web root is writable, and only falls back
+            // to serving the sitemap from PHP where writing a file is
+            // impossible — previously a hard failure with nothing served
+            // (#752).
+            'delivery_mode' => 'auto',
+
+            // General Settings
+            'links_per_sitemap' => 1000,
+            'include_images' => true,
+            'include_featured_images' => false,
+            'auto_generate' => true,
+            'ping_search_engines' => true,
+
+            // Content Inclusion (backward compatibility)
+            'include_posts' => true,
+            'include_pages' => true,
+            'include_categories' => true,
+            'include_tags' => false,
+
+            // Content Filtering
+            'exclude_posts' => '',
+            'exclude_terms' => '',
+            'exclude_password_protected' => true,
+            'exclude_private_posts' => true,
+
+            // Advanced Options
+            'enable_styling' => true,
+            'custom_url_pattern' => 'sitemap-{type}.xml',
+
+            // Stylesheet branding (#639). Both colours default to empty, not
+            // to the stock hexes: empty means the stylesheet's own value
+            // stands, so a site that never opens this screen renders exactly
+            // as it did before the setting existed.
+            'styling_logo' => false,
+            'styling_logo_url' => '',
+            'styling_color_main' => '',
+            'styling_color_accent' => '',
+
+            // Generation tracking
+            'last_generated' => ''
+        ];
+    }
+
+    /**
+     * Normalize the stylesheet branding values on the way into the store.
+     *
+     * The generic sanitizer only runs `sanitize_text_field()` over a string,
+     * which happily keeps "red" or "rebeccapurple" as a colour. Nothing
+     * downstream can use those — {@see Sitemap_Stylesheet::render()} skips any
+     * value it cannot read as a hex colour — so storing them would report a
+     * successful save of a setting that changes nothing, and `get-sitemap-
+     * settings` would hand an agent back a colour the sitemap does not use.
+     * Reducing here instead keeps the store and the rendering in agreement.
+     *
+     * @since 2.7.0
+     *
+     * @param array  $settings     Settings to sanitize.
+     * @param string $context_type Context the save is for.
+     * @return array
+     */
+    protected function sanitize_settings(array $settings, string $context_type = 'site'): array {
+        $sanitized = parent::sanitize_settings($settings, $context_type);
+
+        foreach (['styling_color_main', 'styling_color_accent'] as $key) {
+            if (array_key_exists($key, $sanitized)) {
+                $sanitized[$key] = Sitemap_Stylesheet::hex($sanitized[$key]);
+            }
+        }
+
+        if (array_key_exists('styling_logo_url', $sanitized)) {
+            $sanitized['styling_logo_url'] = esc_url_raw((string) $sanitized['styling_logo_url']);
+        }
+
+        // A mode this build cannot act on has to be stored as the fallback
+        // rather than kept verbatim, or get-sitemap-settings reports a delivery
+        // mode the site does not actually apply.
+        if (array_key_exists('delivery_mode', $sanitized)) {
+            $mode = sanitize_key((string) $sanitized['delivery_mode']);
+            $sanitized['delivery_mode'] = in_array($mode, self::DELIVERY_MODES, true) ? $mode : 'auto';
+        }
+
+        return $sanitized;
+    }
+
+    /**
+     * Get settings schema definition (implements interface)
+     *
+     * @since 1.0.0
+     *
+     * @param string $context_type The context type to get schema for
+     * @return array Settings schema definition
+     */
+    public function get_settings_schema(string $context_type): array {
+        return [
+            'enabled' => [
+                'type' => 'boolean',
+                'title' => 'Enable Sitemap',
+                'description' => 'Generate XML sitemap for search engines',
+                'default' => true
+            ],
+            'delivery_mode' => [
+                'type' => 'string',
+                'title' => 'Sitemap Delivery',
+                'description' => 'How the sitemap is served: auto picks static when the WordPress root is writable and dynamic when it is not, static writes files to the web root, dynamic serves the sitemap from WordPress with no files written',
+                'enum' => self::DELIVERY_MODES,
+                'default' => 'auto'
+            ],
+            'include_posts' => [
+                'type' => 'boolean',
+                'title' => 'Include Posts',
+                'description' => 'Include blog posts in sitemap',
+                'default' => true
+            ],
+            'include_pages' => [
+                'type' => 'boolean',
+                'title' => 'Include Pages',
+                'description' => 'Include static pages in sitemap',
+                'default' => true
+            ],
+            'include_categories' => [
+                'type' => 'boolean',
+                'title' => 'Include Categories',
+                'description' => 'Include category pages in sitemap',
+                'default' => true
+            ],
+            'include_tags' => [
+                'type' => 'boolean',
+                'title' => 'Include Tags',
+                'description' => 'Include tag pages in sitemap',
+                'default' => false
+            ],
+
+            'auto_generate' => [
+                'type' => 'boolean',
+                'title' => 'Auto Generate',
+                'description' => 'Automatically regenerate sitemap when content changes',
+                'default' => true
+            ],
+            'ping_search_engines' => [
+                'type' => 'boolean',
+                'title' => 'Ping Search Engines',
+                'description' => 'Notify Google and Bing when sitemap is updated',
+                'default' => true
+            ],
+            'last_generated' => [
+                'type' => 'string',
+                'title' => 'Last Generated',
+                'description' => 'Timestamp of last sitemap generation',
+                'default' => ''
+            ],
+            'styling_logo' => [
+                'type' => 'boolean',
+                'title' => 'Show Logo On Sitemap',
+                'description' => 'Show a logo above the sitemap heading',
+                'default' => false
+            ],
+            'styling_logo_url' => [
+                'type' => 'string',
+                'title' => 'Sitemap Logo',
+                'description' => 'Logo image URL. Empty falls back to the site icon',
+                'default' => ''
+            ],
+            'styling_color_main' => [
+                'type' => 'string',
+                'title' => 'Sitemap Main Color',
+                'description' => 'Hex color for the sitemap header, links and table head. Empty keeps the stock palette',
+                'default' => ''
+            ],
+            'styling_color_accent' => [
+                'type' => 'string',
+                'title' => 'Sitemap Accent Color',
+                'description' => 'Hex color for the header gradient and link hovers. Empty keeps the stock palette',
+                'default' => ''
+            ]
+        ];
+    }
+
+    /**
+     * Generate URL entry for sitemap
+     *
+     * @since 1.0.0
+     *
+     * @param string $url        URL
+     * @param string $lastmod    Last modification date
+     * @param float  $priority   Priority (0.0 to 1.0)
+     * @param string $changefreq Change frequency
+     * @param array  $images     Optional array of image data
+     * @return string XML URL entry
+     */
+    private function generate_url_entry(string $url, string $lastmod, float $priority, string $changefreq, array $images = []): string {
+        $xml = "  <url>\n";
+        // Every <loc> in every sitemap passes through here, which is why the
+        // scheme preference is applied at this one point rather than at each
+        // of the dozen collectors that build URLs (#638). An http sitemap on
+        // an https site hands search engines the wrong address for the whole
+        // site at once.
+        $xml .= "    <loc>" . esc_url(Url_Scheme::apply($url)) . "</loc>\n";
+        // Omit <lastmod> when unknown (empty) — a fabricated timestamp is worse
+        // than no timestamp, and an absent lastmod is valid per the spec.
+        if (!empty($lastmod)) {
+            $xml .= "    <lastmod>" . esc_html($lastmod) . "</lastmod>\n";
+        }
+        $xml .= "    <priority>" . number_format($priority, 1) . "</priority>\n";
+        $xml .= "    <changefreq>" . esc_html($changefreq) . "</changefreq>\n";
+
+        // Add image entries if provided
+        foreach ($images as $image) {
+            $xml .= "    <image:image>\n";
+            $xml .= "      <image:loc>" . esc_url(Url_Scheme::apply((string) $image['url'])) . "</image:loc>\n";
+
+            if (!empty($image['title'])) {
+                $xml .= "      <image:title>" . esc_html($image['title']) . "</image:title>\n";
+            }
+
+            if (!empty($image['alt'])) {
+                $xml .= "      <image:caption>" . esc_html($image['alt']) . "</image:caption>\n";
+            }
+
+            $xml .= "    </image:image>\n";
+        }
+
+        $xml .= "  </url>\n";
+
+        return $xml;
+    }
+
+    /**
+     * Collect every post <url> entry for the given post type(s) as an array of
+     * XML strings, using memory-efficient chunked fetching.
+     *
+     * Unlike the old capped generator, this returns ALL matching entries — the
+     * links-per-sitemap limit is applied later by paginating this array into
+     * separate files (see generate_multiple_sitemaps), matching how Rank Math
+     * splits large sitemaps instead of truncating them.
+     *
+     * @since 1.14.0
+     *
+     * @param array $post_types Array of post types to fetch
+     * @param array $settings   Sitemap settings
+     * @return array<string> Individual <url>…</url> entry strings
+     */
+    /**
+     * lastmod for the homepage <url> entry: the static front page's real
+     * modification time when one is set, otherwise the generation time.
+     *
+     * @return string ISO-8601 date.
+     */
+    private function get_homepage_lastmod(): string {
+        if (get_option('show_on_front') === 'page') {
+            $front_id = (int) get_option('page_on_front');
+            if ($front_id) {
+                $modified = get_post_field('post_modified_gmt', $front_id);
+                if (!empty($modified) && $modified !== '0000-00-00 00:00:00') {
+                    return gmdate('c', strtotime($modified));
+                }
+            }
+        }
+        return gmdate('c');
+    }
+
+    private function collect_post_entries(array $post_types, array $settings): array {
+        // Materialize the streaming source for callers that need the full set
+        // (e.g. the single un-paginated "general" sitemap). The paginated index
+        // path streams collect_post_entries_iter() directly to bound memory.
+        return iterator_to_array($this->collect_post_entries_iter($post_types, $settings), false);
+    }
+
+    /**
+     * Stream <url> entries for the given post types, yielding one at a time.
+     *
+     * Same chunked query, filtering, and ordering as before, but yields each
+     * entry instead of accumulating the whole set — so the paginated index
+     * generator never holds every URL of a large post type in memory at once.
+     *
+     * @param array $post_types Post types to include.
+     * @param array $settings   Sitemap settings.
+     * @return \Generator<string> <url> entry strings.
+     */
+    private function collect_post_entries_iter(array $post_types, array $settings): \Generator {
+        if (empty($post_types)) {
+            return;
+        }
+
+        // Parse and validate exclude_posts setting
+        $exclude_ids = [];
+        if (!empty($settings['exclude_posts'])) {
+            try {
+                $exclude_ids = $this->validate_exclude_posts($settings['exclude_posts']);
+            } catch (InvalidArgumentException $e) {
+                // Continue with empty array on validation failure - error details available in exception
+            }
+        }
+
+        // The static front page is emitted once as the explicit homepage entry,
+        // so exclude it here to avoid a duplicate <loc> (its permalink equals
+        // home_url('/')).
+        if (get_option('show_on_front') === 'page') {
+            $front_id = (int) get_option('page_on_front');
+            if ($front_id) {
+                $exclude_ids[] = $front_id;
+            }
+        }
+
+        // Resolve the ordered ID list in one indexed query, then hydrate in
+        // chunks via post__in. This avoids large OFFSET windows (which MySQL
+        // must scan-and-discard, making a full walk O(n^2)) while still loading
+        // only one chunk of full post objects into memory at a time. The
+        // original order is preserved (the id query and post__in hydration both
+        // use it).
+        $all_ids = get_posts($this->filter_query_args([
+            'post_type'   => $post_types,
+            'post_status' => 'publish',
+            'numberposts' => -1,
+            'exclude'     => $exclude_ids,
+            'orderby'     => 'post_type post_date',
+            'order'       => 'ASC DESC',
+            'fields'      => 'ids',
+        ]));
+
+        if (empty($all_ids)) {
+            return;
+        }
+
+        // Walk the ID list with a moving window rather than array_chunk().
+        // array_chunk() builds a second array holding every element again, so
+        // peak memory was twice the ID list — on a 100k-post site that is ~16MB
+        // where ~8MB is needed, and this walk is the one part of an otherwise
+        // well-bounded routine with no ceiling (#402).
+        $total = count($all_ids);
+
+        for ($offset = 0; $offset < $total; $offset += self::ID_WALK_CHUNK) {
+            $this->assert_memory_headroom();
+            $chunk_start = memory_get_usage(true);
+
+            $chunk = array_slice($all_ids, $offset, self::ID_WALK_CHUNK);
+
+            $posts = get_posts($this->filter_query_args([
+                'post_type'   => $post_types,
+                'post_status' => 'publish',
+                'numberposts' => count($chunk),
+                'post__in'    => $chunk,
+                'orderby'     => 'post__in', // preserve the resolved order
+            ]));
+
+            // get_featured_image() hydrates each featured image under the
+            // attachment's own ID, which the chunk's post IDs do not reach.
+            $attachment_ids = [];
+
+            foreach ($posts as $post) {
+                if ($this->should_include_in_sitemap($post, $settings)) {
+                    /**
+                     * Filter a sitemap entry's permalink.
+                     *
+                     * The multilingual manager uses this to generate each
+                     * translation's URL in its OWN language: the sitemap query
+                     * deliberately runs with suppress_filters, and the cron
+                     * rebuild runs with no language context at all, so a bare
+                     * get_permalink() resolved every translation to the
+                     * default-language URL — N entries sharing one <loc> (#409).
+                     *
+                     * @since 2.0.1
+                     * @param string   $url  Permalink as WordPress resolved it.
+                     * @param \WP_Post $post Post the entry describes.
+                     */
+                    $url = apply_filters('thinkrank_sitemap_post_permalink', get_permalink($post), $post);
+                    $lastmod = gmdate('c', strtotime($post->post_modified_gmt));
+                    $priority = $this->calculate_intelligent_priority($post, $post->post_type);
+                    $changefreq = $this->calculate_change_frequency($post, $post->post_type);
+                    $images = $this->extract_post_images($post, $settings);
+
+                    $thumbnail_id = (int) get_post_thumbnail_id($post);
+                    if ($thumbnail_id > 0) {
+                        $attachment_ids[] = $thumbnail_id;
+                    }
+
+                    yield $this->generate_url_entry($url, $lastmod, $priority, $changefreq, $images);
+                }
+            }
+
+            // Free the hydrated chunk before loading the next one — including
+            // the copies get_posts() left in the runtime object cache.
+            unset($posts);
+            $this->release_walk_memory(
+                $chunk_start,
+                $this->chunk_post_cache_groups($post_types),
+                array_merge($chunk, $attachment_ids)
+            );
+        }
+    }
+
+    /**
+     * Resolve and bound the configured links-per-sitemap limit.
+     *
+     * @since 1.14.0
+     *
+     * @param array $settings Sitemap settings
+     * @return int Links per sitemap file (1–50000)
+     */
+    private function get_links_per_sitemap(array $settings): int {
+        $limit = !empty($settings['links_per_sitemap']) ? intval($settings['links_per_sitemap']) : 1000;
+
+        return max(1, min(50000, $limit));
+    }
+
+    /**
+     * Stream <url> entries for a taxonomy's terms, yielding one at a time and
+     * fetching terms in bounded chunks (number/offset) — so the paginated index
+     * generator never holds every term of a large taxonomy in memory at once.
+     *
+     * @param string $taxonomy Taxonomy name.
+     * @param array  $settings Sitemap settings.
+     * @return \Generator<string> <url> entry strings.
+     */
+    private function collect_taxonomy_entries_iter(string $taxonomy, array $settings): \Generator {
+        $exclude_term_ids = [];
+        if (!empty($settings['exclude_terms'])) {
+            try {
+                $exclude_term_ids = $this->validate_exclude_terms($settings['exclude_terms']);
+            } catch (InvalidArgumentException $e) {
+                // Continue with an empty exclude list on validation failure.
+            }
+        }
+
+        // product_cat may legitimately have empty terms (products added later);
+        // every other taxonomy hides empties — matching fetch_taxonomies_optimized().
+        $hide_empty = $taxonomy !== 'product_cat';
+        $priority   = $taxonomy === 'category' ? 0.6 : 0.4;
+
+        // Resolve the ordered term IDs in one query, then hydrate in chunks via
+        // include. Avoids large OFFSET windows (O(n^2) over a full walk) while
+        // holding only one chunk of full term objects at a time.
+        $all_ids = get_terms($this->filter_term_query_args([
+            'taxonomy'   => $taxonomy,
+            'hide_empty' => $hide_empty,
+            'exclude'    => $exclude_term_ids,
+            'orderby'    => 'count',
+            'order'      => 'DESC',
+            'fields'     => 'ids',
+        ]));
+
+        if (is_wp_error($all_ids) || empty($all_ids)) {
+            return;
+        }
+
+        // Same moving window as the post walk above, for the same reason.
+        $total = count($all_ids);
+
+        for ($offset = 0; $offset < $total; $offset += self::TERM_WALK_CHUNK) {
+            $this->assert_memory_headroom();
+            $chunk_start = memory_get_usage(true);
+
+            $chunk = array_slice($all_ids, $offset, self::TERM_WALK_CHUNK);
+
+            $terms = get_terms($this->filter_term_query_args([
+                'taxonomy'   => $taxonomy,
+                'include'    => $chunk,
+                'orderby'    => 'include', // preserve the resolved order
+                'hide_empty' => false,     // already filtered by the id query
+            ]));
+
+            if (is_wp_error($terms) || empty($terms)) {
+                continue;
+            }
+
+            foreach ($terms as $term) {
+                // A term whose archive says noindex (its own override or its
+                // taxonomy's), or that redirects, must not be advertised: the
+                // sitemap would contradict the page's own signal (#911).
+                if (!Indexability::is_indexable_term($term)) {
+                    continue;
+                }
+
+                $url = get_term_link($term);
+                if (!is_wp_error($url)) {
+                    // Omit lastmod for terms — the generation time is not a real
+                    // modification time and would mislabel every term as just-changed.
+                    yield $this->generate_url_entry($url, '', $priority, 'weekly');
+                }
+            }
+
+            unset($terms);
+            $this->release_walk_memory($chunk_start, ['terms', 'term_meta'], $chunk);
+        }
+    }
+
+    /**
+     * The XML declaration, ownership marker and optional stylesheet every
+     * sitemap document opens with.
+     *
+     * The marker is written unconditionally, and that is the point: removal on
+     * deactivate and uninstall deletes a web-root sitemap only when the file
+     * says it is ours, and our filenames are the canonical ones another SEO
+     * plugin writes too (#515). Tying the proof to `enable_styling` — the one
+     * marker older versions left — would mean a site with styling off either
+     * kept a shadowing file behind (#510) or had a competitor's deleted.
+     *
+     * @since 2.1.1
+     *
+     * The stylesheet URL is served by {@see Sitemap_Stylesheet}, not read off
+     * disk by the web server, because a static file cannot carry the site's own
+     * logo and colours (#639). It is a fixed URL: the palette is applied per
+     * request, so changing a brand colour needs no regeneration and shows up on
+     * sitemaps published long before.
+     *
+     * @param array  $settings Sitemap settings (read for `enable_styling`).
+     * @param string $variant  Stylesheet variant, `sitemap` or `index`.
+     * @return string Prolog lines, newline-terminated.
+     */
+    private function xml_prolog(array $settings, string $variant): string {
+        $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+        $xml .= THINKRANK_SITEMAP_MARKER . "\n";
+
+        // The stylesheet is presentation only, so it stays opt-in.
+        if (!empty($settings['enable_styling'])) {
+            $xml .= '<?xml-stylesheet type="text/xsl" href="' . esc_url(Sitemap_Stylesheet::url($variant)) . '"?>' . "\n";
+        }
+
+        return $xml;
+    }
+
+    /**
+     * Wrap a set of <url> entry strings in a complete <urlset> document.
+     *
+     * @since 1.14.0
+     *
+     * @param array<string> $entries       Entry strings
+     * @param array         $settings      Sitemap settings
+     * @param bool          $with_image_ns Include the image sitemap namespace
+     * @return string Full sitemap XML
+     */
+    private function wrap_urlset(array $entries, array $settings, bool $with_image_ns): string {
+        $xml = $this->xml_prolog($settings, 'sitemap');
+
+        if ($with_image_ns && !empty($settings['include_images'])) {
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">' . "\n";
+        } else {
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        }
+
+        $xml .= implode('', $entries);
+        $xml .= '</urlset>';
+
+        return $xml;
+    }
+
+    /**
+     * Derive the filename/URL for a given pagination page.
+     *
+     * Page 1 keeps the base URL (e.g. /sitemap-posts.xml); pages 2+ insert the
+     * page number before the extension (e.g. /sitemap-posts-2.xml).
+     *
+     * @since 1.14.0
+     *
+     * @param string $url  Base sitemap URL
+     * @param int    $page 1-based page number
+     * @return string Paginated URL
+     */
+    private function paginate_url(string $url, int $page): string {
+        if ($page <= 1) {
+            return $url;
+        }
+
+        return (string) preg_replace('/\.xml$/i', '-' . $page . '.xml', $url);
+    }
+
+
+
+    /**
+     * Extract images from post for sitemap
+     *
+     * @since 1.0.0
+     *
+     * @param \WP_Post $post Post object
+     * @param array $settings Sitemap settings
+     * @return array Array of image data
+     */
+    private function extract_post_images(\WP_Post $post, array $settings): array {
+        $images = [];
+
+        // Skip if images are disabled
+        if (empty($settings['include_images'])) {
+            return $images;
+        }
+
+        // Get featured image if enabled
+        if (!empty($settings['include_featured_images'])) {
+            $featured_image = $this->get_featured_image($post->ID);
+            if ($featured_image) {
+                $images[] = $featured_image;
+            }
+        }
+
+        // Extract images from content
+        $content_images = $this->extract_content_images($post->post_content);
+        $images = array_merge($images, $content_images);
+
+        // Remove duplicates based on URL
+        $unique_images = [];
+        $seen_urls = [];
+        foreach ($images as $image) {
+            if (!in_array($image['url'], $seen_urls, true)) {
+                $unique_images[] = $image;
+                $seen_urls[] = $image['url'];
+            }
+        }
+
+        return $unique_images;
+    }
+
+    /**
+     * Get featured image data
+     *
+     * @since 1.0.0
+     *
+     * @param int $post_id Post ID
+     * @return array|null Featured image data or null
+     */
+    private function get_featured_image(int $post_id): ?array {
+        $thumbnail_id = get_post_thumbnail_id($post_id);
+        if (!$thumbnail_id) {
+            return null;
+        }
+
+        $image_url = wp_get_attachment_image_url($thumbnail_id, 'full');
+        if (!$image_url) {
+            return null;
+        }
+
+        $image_title = get_the_title($thumbnail_id);
+        $image_alt = get_post_meta($thumbnail_id, '_wp_attachment_image_alt', true);
+
+        return [
+            'url' => $image_url,
+            'title' => $image_title ?: '',
+            'alt' => $image_alt ?: ''
+        ];
+    }
+
+    /**
+     * Extract images from post content
+     *
+     * @since 1.0.0
+     *
+     * @param string $content Post content
+     * @return array Array of image data
+     */
+    private function extract_content_images(string $content): array {
+        $images = [];
+
+        // Find all img tags in content
+        preg_match_all('/<img[^>]+>/i', $content, $img_tags);
+
+        foreach ($img_tags[0] as $img_tag) {
+            // Extract src attribute
+            if (preg_match('/src=["\']([^"\']+)["\']/', $img_tag, $src_match)) {
+                $image_url = $src_match[1];
+
+                // Skip if not a valid URL or external image
+                if (!filter_var($image_url, FILTER_VALIDATE_URL)) {
+                    continue;
+                }
+
+                // Extract title and alt attributes
+                $title = '';
+                $alt = '';
+
+                if (preg_match('/title=["\']([^"\']*)["\']/', $img_tag, $title_match)) {
+                    $title = $title_match[1];
+                }
+
+                if (preg_match('/alt=["\']([^"\']*)["\']/', $img_tag, $alt_match)) {
+                    $alt = $alt_match[1];
+                }
+
+                $images[] = [
+                    'url' => $image_url,
+                    'title' => $title,
+                    'alt' => $alt
+                ];
+            }
+        }
+
+        return $images;
+    }
+
+    /**
+     * Get enabled taxonomies based on settings
+     *
+     * @since 1.0.0
+     * @param array $settings Sitemap settings
+     * @return array Array of enabled taxonomies
+     */
+    private function get_enabled_taxonomies(array $settings): array {
+        $taxonomies = [];
+
+        // Core taxonomies based on settings
+        if (!empty($settings['include_categories'])) {  // ✅ Evidence-based field name
+            $taxonomies[] = 'category';
+        }
+
+        if (!empty($settings['include_tags'])) {  // ✅ Evidence-based field name
+            $taxonomies[] = 'post_tag';
+        }
+
+        // Auto-detect public custom taxonomies
+        $custom_taxonomies = get_taxonomies([
+            'public' => true,
+            '_builtin' => false
+        ], 'names');
+
+        foreach ($custom_taxonomies as $taxonomy) {
+            if (!$this->should_include_taxonomy($taxonomy)) {
+                continue;
+            }
+
+            // Same as the post-type walk above: an explicit per-taxonomy flag
+            // now decides, and an unset flag keeps the previous "included"
+            // behaviour (#660).
+            if (\ThinkRank\SEO\Content_Type_Settings::is_included_in_sitemap('taxonomy', $taxonomy, $settings)) {
+                $taxonomies[] = $taxonomy;
+            }
+        }
+
+        return array_unique($taxonomies);
+    }
+
+
+
+    /**
+     * Fetch taxonomies using optimized combined query
+     *
+     * @since 1.0.0
+     *
+     * @param array $taxonomies Array of taxonomy names to fetch
+     * @param array $settings   Sitemap settings
+     * @return array Grouped terms by taxonomy
+     */
+    private function fetch_taxonomies_optimized(array $taxonomies, array $settings): array {
+        if (empty($taxonomies)) {
+            return [];
+        }
+
+        // Parse and validate exclude_terms setting
+        $exclude_term_ids = [];
+        if (!empty($settings['exclude_terms'])) {
+            try {
+                $exclude_term_ids = $this->validate_exclude_terms($settings['exclude_terms']);
+            } catch (InvalidArgumentException $e) {
+                // Continue with empty array on validation failure - error details available in exception
+            }
+        }
+
+        // Determine hide_empty setting based on taxonomies
+        $hide_empty = true;
+        foreach ($taxonomies as $taxonomy) {
+            // For product categories, don't hide empty categories since they might not have products yet
+            if ($taxonomy === 'product_cat') {
+                $hide_empty = false;
+                break;
+            }
+        }
+
+        // OPTIMIZED: Single query for multiple taxonomies
+        $all_terms = get_terms($this->filter_term_query_args([
+            'taxonomy' => $taxonomies,  // ✅ Multiple taxonomies in single query
+            'hide_empty' => $hide_empty,
+            'exclude' => $exclude_term_ids,
+            'orderby' => 'taxonomy count',
+            'order' => 'ASC DESC'  // Order by taxonomy ASC, then count DESC
+        ]));
+
+        if (is_wp_error($all_terms)) {
+            return [];
+        }
+
+        // Drop terms that are not indexable destinations. This path feeds the
+        // single general sitemap while collect_taxonomy_entries_iter() feeds
+        // the segmented ones, so both need the filter or the two disagree about
+        // the same term.
+        $all_terms = array_values(array_filter(
+            $all_terms,
+            static fn($term) => $term instanceof \WP_Term && Indexability::is_indexable_term($term)
+        ));
+
+        // Group terms by taxonomy
+        return $this->group_terms_by_taxonomy($all_terms);
+    }
+
+    /**
+     * Group terms by taxonomy
+     *
+     * @since 1.0.0
+     *
+     * @param array $terms Array of term objects
+     * @return array Grouped terms by taxonomy
+     */
+    private function group_terms_by_taxonomy(array $terms): array {
+        $grouped = [];
+
+        foreach ($terms as $term) {
+            $taxonomy = $term->taxonomy;  // ✅ Evidence-based property name
+
+            if (!isset($grouped[$taxonomy])) {
+                $grouped[$taxonomy] = [];
+            }
+
+            $grouped[$taxonomy][] = $term;
+        }
+
+        return $grouped;
+    }
+
+    /**
+     * Process taxonomy terms to XML entries
+     *
+     * @since 1.0.0
+     *
+     * @param array  $terms    Array of term objects
+     * @param string $taxonomy Taxonomy name
+     * @param array  $settings Sitemap settings
+     * @return string XML entries
+     */
+    private function process_taxonomies_to_xml(array $terms, string $taxonomy, array $settings): string {
+        $xml = '';
+
+        foreach ($terms as $term) {
+            $url = get_term_link($term);
+            if (!is_wp_error($url)) {
+                // Omit lastmod for terms (generation time is not a real
+                // modification time).
+                $lastmod = '';
+                $priority = $taxonomy === 'category' ? 0.6 : 0.4;
+                $changefreq = 'weekly';
+
+                $xml .= $this->generate_url_entry($url, $lastmod, $priority, $changefreq);
+            }
+        }
+
+        return $xml;
+    }
+
+    /**
+     * Calculate intelligent priority based on content factors
+     *
+     * @since 1.0.0
+     *
+     * @param \WP_Post $post      Post object
+     * @param string   $post_type Post type
+     * @return float Priority value between 0.1 and 1.0
+     */
+    private function calculate_intelligent_priority(\WP_Post $post, string $post_type): float {
+        $base_priority = $post_type === 'page' ? 0.9 : 0.8;
+
+        // Factors that can adjust priority
+        $adjustments = 0;
+
+        // Recent content gets higher priority
+        $days_old = (time() - strtotime($post->post_date)) / DAY_IN_SECONDS;
+        if ($days_old < 30) {
+            $adjustments += 0.1; // Recent content boost
+        } elseif ($days_old > 365) {
+            $adjustments -= 0.1; // Older content penalty
+        }
+
+        // Content length factor
+        $content_length = strlen(wp_strip_all_tags($post->post_content));
+        if ($content_length > 2000) {
+            $adjustments += 0.05; // Comprehensive content boost
+        } elseif ($content_length < 500) {
+            $adjustments -= 0.1; // Thin content penalty
+        }
+
+        // Special page types get higher priority
+        if ($post_type === 'page') {
+            $page_template = get_page_template_slug($post->ID);
+            if (in_array($page_template, ['page-home.php', 'front-page.php'], true) ||
+                (int) $post->ID === (int) get_option('page_on_front')) {
+                $base_priority = 1.0; // Homepage gets maximum priority
+            } elseif (in_array($page_template, ['page-contact.php', 'page-about.php'], true)) {
+                $adjustments += 0.05; // Important pages boost
+            }
+        }
+
+        // Ensure priority stays within valid range
+        $final_priority = max(0.1, min(1.0, $base_priority + $adjustments));
+
+        return round($final_priority, 1);
+    }
+
+    /**
+     * Calculate change frequency based on content type and age
+     *
+     * @since 1.0.0
+     *
+     * @param \WP_Post $post      Post object
+     * @param string   $post_type Post type
+     * @return string Change frequency
+     */
+    private function calculate_change_frequency(\WP_Post $post, string $post_type): string {
+        // Pages typically change less frequently
+        if ($post_type === 'page') {
+            $page_template = get_page_template_slug($post->ID);
+            if ((int) $post->ID === (int) get_option('page_on_front')) {
+                return 'daily'; // Homepage changes frequently
+            } elseif (in_array($page_template, ['page-contact.php', 'page-about.php'], true)) {
+                return 'monthly'; // Static pages change monthly
+            }
+            return 'yearly'; // Other pages change rarely
+        }
+
+        // Posts frequency based on age and type
+        $days_old = (time() - strtotime($post->post_date)) / DAY_IN_SECONDS;
+
+        if ($days_old < 7) {
+            return 'daily'; // Very recent posts
+        } elseif ($days_old < 30) {
+            return 'weekly'; // Recent posts
+        } elseif ($days_old < 365) {
+            return 'monthly'; // Older posts
+        }
+
+        return 'yearly'; // Very old posts
+    }
+
+    /**
+     * Determine if content should be included in sitemap
+     *
+     * @since 1.0.0
+     *
+     * @param \WP_Post $post Post object
+     * @param array $settings Sitemap settings
+     * @return bool Whether to include in sitemap
+     */
+    private function should_include_in_sitemap(\WP_Post $post, array $settings): bool {
+        // The WooCommerce cart, checkout and account pages are transactional,
+        // never indexable, and generate_default_robots_rules() already emits a
+        // Disallow for each of them. Listing them here submitted URLs our own
+        // robots.txt blocks, which Search Console reports as "Submitted URL
+        // blocked by robots.txt". Yoast and Rank Math exclude the same three.
+        if (in_array($post->ID, $this->woocommerce_excluded_page_ids(), true)) {
+            return false;
+        }
+
+        // Respect user setting for password protected content
+        if (!empty($post->post_password) && !empty($settings['exclude_password_protected'])) {
+            return false;
+        }
+
+        // Respect user setting for private posts
+        if ($post->post_status === 'private' && !empty($settings['exclude_private_posts'])) {
+            return false;
+        }
+
+        // Only published (and, per setting, private) content belongs in the
+        // sitemap. Content-quality heuristics (length, "demo"/"test"/"sample"
+        // in the title, "lorem ipsum" text) were intentionally removed: an XML
+        // sitemap should list every indexable published URL. Filtering by
+        // description length silently dropped legitimate WooCommerce products
+        // with short descriptions, and the substring title match excluded real
+        // pages such as "Demo" or "Product Samples". Indexability is governed
+        // by noindex directives below, not by heuristics.
+        if (!in_array($post->post_status, ['publish', 'private'], true)) {
+            return false;
+        }
+
+        // A URL whose page says noindex, or that ThinkRank redirects, is not a
+        // destination. Only the per-post noindex used to be read here, so a
+        // post type set to No-index still had every item listed, and redirected
+        // posts were submitted as "Page with redirect" (#911). The password
+        // check stays with the setting above: listing protected posts is a
+        // choice this sitemap has always offered.
+        if (Indexability::is_post_noindexed($post) || Indexability::is_post_redirected($post)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * WooCommerce pages that must never reach the sitemap.
+     *
+     * Resolved through wc_get_page_id() so a store that moved or renamed its
+     * cart/checkout/account pages is still matched. Returns an empty list when
+     * WooCommerce is not active. Memoised — should_include_in_sitemap() runs
+     * once per post.
+     *
+     * @since 2.0.1
+     *
+     * @return int[] Page IDs to exclude.
+     */
+    private function woocommerce_excluded_page_ids(): array {
+        if ($this->woocommerce_excluded_page_ids !== null) {
+            return $this->woocommerce_excluded_page_ids;
+        }
+
+        $ids = [];
+
+        if (function_exists('wc_get_page_id')) {
+            foreach (['cart', 'checkout', 'myaccount'] as $page) {
+                $id = (int) wc_get_page_id($page);
+                // wc_get_page_id() returns -1 when the page is not configured.
+                if ($id > 0) {
+                    $ids[] = $id;
+                }
+            }
+        }
+
+        $this->woocommerce_excluded_page_ids = $ids;
+
+        return $ids;
+    }
+
+    /**
+     * Count total URLs in sitemap
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Sitemap settings
+     * @return int Total URL count
+     */
+    public function count_sitemap_urls(array $settings): int {
+        $count = 1; // Homepage
+
+        if (!empty($settings['include_posts'])) {
+            $count += wp_count_posts('post')->publish;
+        }
+
+        if (!empty($settings['include_pages'])) {
+            $count += wp_count_posts('page')->publish;
+        }
+
+        if (!empty($settings['include_categories'])) {
+            $count += wp_count_terms(['taxonomy' => 'category', 'hide_empty' => true]);
+        }
+
+        if (!empty($settings['include_tags'])) {
+            $count += wp_count_terms(['taxonomy' => 'post_tag', 'hide_empty' => true]);
+        }
+
+        return $count;
+    }
+
+    /**
+     * Handle content changes for auto-generation
+     *
+     * @since 1.0.0
+     * @param int      $post_id Post ID
+     * @param \WP_Post $post    Post object
+     * @return void
+     */
+    public function handle_content_change(int $post_id, \WP_Post $post): void {
+        // Skip if auto-generation is disabled
+        if (!$this->should_auto_generate()) {
+            return;
+        }
+
+        // Skip autosaves and revisions
+        if (wp_is_post_autosave($post_id) || wp_is_post_revision($post_id)) {
+            return;
+        }
+
+        // Only process published content
+        if ($post->post_status !== 'publish') {
+            return;
+        }
+
+        // Check if this post type should trigger regeneration
+        if (!$this->should_include_post_type($post->post_type)) {
+            return;
+        }
+
+        // Schedule debounced regeneration
+        $this->schedule_debounced_regeneration();
+    }
+
+    /**
+     * Handle content deletion for auto-generation
+     *
+     * @since 1.0.0
+     * @param int $post_id Post ID
+     * @return void
+     */
+    public function handle_content_deletion(int $post_id): void {
+        // Skip if auto-generation is disabled
+        if (!$this->should_auto_generate()) {
+            return;
+        }
+
+        $post = get_post($post_id);
+        if (!$post) {
+            return;
+        }
+
+        // Check if this post type should trigger regeneration
+        if (!$this->should_include_post_type($post->post_type)) {
+            return;
+        }
+
+        // Schedule debounced regeneration
+        $this->schedule_debounced_regeneration();
+    }
+
+    /**
+     * Handle content change by ID (for untrash, etc.)
+     *
+     * @since 1.0.0
+     * @param int $post_id Post ID
+     * @return void
+     */
+    public function handle_content_change_by_id(int $post_id): void {
+        $post = get_post($post_id);
+        if ($post) {
+            $this->handle_content_change($post_id, $post);
+        }
+    }
+
+    /**
+     * Handle taxonomy changes for auto-generation
+     *
+     * @since 1.0.0
+     * @param int    $term_id  Term ID
+     * @param int    $tt_id    Term taxonomy ID
+     * @param string $taxonomy Taxonomy slug
+     * @return void
+     */
+    public function handle_taxonomy_change(int $term_id, int $tt_id, string $taxonomy): void {
+        // Skip if auto-generation is disabled
+        if (!$this->should_auto_generate()) {
+            return;
+        }
+
+        // Check if this taxonomy should trigger regeneration
+        if (!$this->should_include_taxonomy($taxonomy)) {
+            return;
+        }
+
+        // Schedule debounced regeneration
+        $this->schedule_debounced_regeneration();
+    }
+
+    /**
+     * Check if auto-generation is enabled
+     *
+     * @since 1.0.0
+     * @return bool True if auto-generation is enabled
+     */
+    private function should_auto_generate(): bool {
+        $settings = $this->get_settings('site');
+
+        // Check if sitemap is enabled
+        if (empty($settings['enabled'])) {
+            return false;
+        }
+
+        // Check if auto-generation is enabled
+        return !empty($settings['auto_generate']);
+    }
+
+    /**
+     * Get enabled post types based on settings
+     *
+     * @since 1.0.0
+     * @param array $settings Sitemap settings
+     * @return array Array of enabled post types
+     */
+    private function get_enabled_post_types(array $settings): array {
+        $post_types = [];
+
+        // Core post types based on settings
+        if (!empty($settings['include_posts'])) {
+            $post_types[] = 'post';
+        }
+
+        if (!empty($settings['include_pages'])) {
+            $post_types[] = 'page';
+        }
+
+        // Auto-detect public custom post types that should be included.
+        //
+        // A custom type's `include_<slug>` / `exclude_<slug>` flag is honoured
+        // here (#660). It was previously stored — additional_setting_keys()
+        // has always let those keys through — but never read, so a CPT was in
+        // the sitemap whatever the setting said. Unset still means included, so
+        // a site that never touched the flag is unaffected.
+        $custom_post_types = get_post_types([
+            'public' => true,
+            '_builtin' => false
+        ], 'names');
+
+        foreach ($custom_post_types as $post_type) {
+            if (!$this->should_include_post_type($post_type)) {
+                continue;
+            }
+
+            if (\ThinkRank\SEO\Content_Type_Settings::is_included_in_sitemap('post_type', $post_type, $settings)) {
+                $post_types[] = $post_type;
+            }
+        }
+
+        return array_unique($post_types);
+    }
+
+    /**
+     * Check if post type should trigger regeneration
+     *
+     * @since 1.0.0
+     * @param string $post_type Post type
+     * @return bool True if post type should trigger regeneration
+     */
+    private function should_include_post_type(string $post_type): bool {
+        // Match Rank Math: only publicly viewable post types belong in the
+        // sitemap (public && publicly_queryable). Additionally skip post types
+        // that opt out of front-end search (exclude_from_search => true) — e.g.
+        // Templately's internal `templately_library` store — which are template
+        // records, not standalone indexable URLs. BetterDocs `docs` and
+        // WooCommerce `product` register exclude_from_search => false, so they
+        // remain included.
+        // The predicate lives in Content_Type_Settings so the matrix can ask
+        // the same question before offering a switch for this post type.
+        return \ThinkRank\SEO\Content_Type_Settings::sitemap_accepts_post_type($post_type);
+    }
+
+    /**
+     * Check if taxonomy should trigger regeneration
+     *
+     * @since 1.0.0
+     * @param string $taxonomy Taxonomy slug
+     * @return bool True if taxonomy should trigger regeneration
+     */
+    private function should_include_taxonomy(string $taxonomy): bool {
+        // Public taxonomies only, and only the ones this generator can actually
+        // emit — the same predicate the content-type matrix asks before it
+        // offers a sitemap switch for one (presets still control which
+        // sitemaps are created).
+        return \ThinkRank\SEO\Content_Type_Settings::sitemap_accepts_taxonomy($taxonomy);
+    }
+
+    /**
+     * Schedule debounced sitemap regeneration
+     *
+     * @since 1.0.0
+     * @return void
+     */
+    private function schedule_debounced_regeneration(): void {
+        $this->mark_regeneration_pending('content');
+        $this->debounce_event('thinkrank_regenerate_sitemap');
+    }
+
+    /**
+     * Schedule (or keep) the debounced single event behind a regeneration hook.
+     *
+     * An event that is already due is left alone. WP-Cron only runs when a
+     * request arrives, so on a site with DISABLE_WP_CRON, a blocked loopback or
+     * little traffic an overdue event can sit in the queue for a long time —
+     * clearing and re-scheduling it on every save pushed the rebuild
+     * permanently 30 seconds into the future and the sitemap never updated
+     * (#629). Debouncing only against an event that has not come due yet keeps
+     * the bulk-edit coalescing without starving the rebuild.
+     *
+     * @since 2.2.1
+     * @param string $hook Regeneration hook to debounce.
+     * @return void
+     */
+    private function debounce_event(string $hook): void {
+        $next = wp_next_scheduled($hook);
+
+        if ($next !== false) {
+            if ($next <= time()) {
+                return;
+            }
+
+            wp_clear_scheduled_hook($hook);
+        }
+
+        wp_schedule_single_event(time() + self::REGENERATION_DEBOUNCE, $hook);
+    }
+
+    /**
+     * Record that a rebuild is outstanding, so an overdue one can be taken over
+     * by a later request and its staleness surfaced in the UI.
+     *
+     * `since` is the *oldest* outstanding change: it is what the takeover grace
+     * and the admin staleness warning are measured from, so successive edits
+     * must not push it forward. A settings change outranks a content change —
+     * it rebuilds regardless of the auto_generate toggle and handles a sitemap
+     * that has just been disabled — so once one is outstanding it stays the
+     * recorded source until the rebuild lands.
+     *
+     * @since 2.2.1
+     * @param string $source Either 'content' or 'settings'.
+     * @return void
+     */
+    private function mark_regeneration_pending(string $source): void {
+        // Whatever made the static files stale made the rendered ones stale
+        // too. Invalidating here rather than only on the rebuild keeps the two
+        // delivery modes reacting to exactly the same triggers, which is the
+        // only way a dynamic site stays as fresh as a static one (#752).
+        $this->flush_dynamic_cache();
+
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, []);
+        $pending = is_array($pending) ? $pending : [];
+
+        $since   = !empty($pending['since']) ? (int) $pending['since'] : time();
+        $current = isset($pending['source']) ? (string) $pending['source'] : '';
+        $source  = ($current === 'settings' || $source === 'settings') ? 'settings' : 'content';
+
+        // Merged so the bookkeeping a rebuild keeps on the marker (`started`,
+        // `memory_limit`) survives an edit made while it is outstanding.
+        update_option(
+            self::REGENERATION_PENDING_OPTION,
+            array_merge($pending, [
+                'since'        => $since,
+                'source'       => $source,
+                'attempts'     => !empty($pending['attempts']) ? (int) $pending['attempts'] : 0,
+                'next_attempt' => !empty($pending['next_attempt'])
+                    ? (int) $pending['next_attempt']
+                    : time() + self::REGENERATION_TAKEOVER_GRACE,
+                // Bumped on every change so a rebuild can tell whether the edit
+                // it started for is still the newest one outstanding.
+                'revision'     => (!empty($pending['revision']) ? (int) $pending['revision'] : 0) + 1,
+            ]),
+            true
+        );
+    }
+
+    /**
+     * The revision of the outstanding rebuild, for
+     * {@see mark_regeneration_complete()} to compare against once it is done.
+     *
+     * @since 2.2.1
+     * @return int Current revision, 0 when nothing is outstanding.
+     */
+    private function current_regeneration_revision(): int {
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, []);
+
+        return (is_array($pending) && !empty($pending['revision'])) ? (int) $pending['revision'] : 0;
+    }
+
+    /**
+     * Clear the outstanding-rebuild marker and any recorded failure.
+     *
+     * Public because a manual generation satisfies whatever the automatic path
+     * was still waiting to write.
+     *
+     * @since 2.2.1
+     * @return void
+     */
+    public function mark_regeneration_complete(?int $revision = null): void {
+        // The write succeeded, so whatever failure was on record is history.
+        if (get_option(self::REGENERATION_ERROR_OPTION, null) !== null) {
+            delete_option(self::REGENERATION_ERROR_OPTION);
+        }
+
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, null);
+
+        if ($pending === null) {
+            return;
+        }
+
+        // A change that landed while this rebuild was running is not covered by
+        // the files it just wrote, so it has to stay outstanding — otherwise, on
+        // a site where WP-Cron never fires, clearing the marker would strand it
+        // exactly the way #629 stranded everything.
+        if (
+            $revision !== null
+            && is_array($pending)
+            && (int) ($pending['revision'] ?? 0) !== $revision
+        ) {
+            // This attempt succeeded, so drop what it claimed: the newer change
+            // waits the grace a fresh edit gets, not a failure backoff it never
+            // earned. Not zero: that edit queued its own debounced event, and
+            // a marker due at once had the next admin request rebuild in its
+            // shutdown and the event rebuild again seconds later.
+            unset($pending['started'], $pending['memory_limit']);
+            $pending['attempts']     = 0;
+            $pending['next_attempt'] = time() + self::REGENERATION_TAKEOVER_GRACE;
+
+            update_option(self::REGENERATION_PENDING_OPTION, $pending, true);
+            return;
+        }
+
+        delete_option(self::REGENERATION_PENDING_OPTION);
+    }
+
+    /**
+     * Record the attempt that is about to run before it runs.
+     *
+     * A PHP fatal — the memory limit or max_execution_time — is not a
+     * Throwable, so no catch or finally around the generation runs when the
+     * process dies, and a failure recorded afterwards was never recorded at
+     * all: `attempts` stayed 0, the backoff never applied, and the next request
+     * started the same doomed rebuild again (a fatal every few minutes for as
+     * long as an admin was logged in). Claiming the attempt up front makes the
+     * backoff hold even when nothing after this line gets to run, and leaves a
+     * `started` stamp the next attempt can recognise as an interrupted one.
+     *
+     * @since 2.10.1
+     * @return void
+     */
+    private function claim_regeneration_attempt(): void {
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, null);
+
+        // Nothing outstanding (e.g. a manual generation already satisfied it):
+        // there is no marker to retry from, so nothing to claim.
+        if (!is_array($pending) || empty($pending['since'])) {
+            return;
+        }
+
+        if (!empty($pending['started'])) {
+            // The previous attempt claimed itself and never reported back.
+            update_option(
+                self::REGENERATION_ERROR_OPTION,
+                [
+                    'message'  => __('The previous automatic sitemap rebuild stopped before it finished, most likely because PHP ran out of memory or time. It is retried with a growing delay. If this keeps happening, raise the PHP memory_limit or max_execution_time, or run WP-Cron from a system cron.', 'thinkrank'),
+                    'source'   => isset($pending['source']) ? (string) $pending['source'] : 'content',
+                    'attempts' => !empty($pending['attempts']) ? (int) $pending['attempts'] : 1,
+                    'time'     => (int) $pending['started'],
+                ],
+                false
+            );
+        }
+
+        $attempts = (!empty($pending['attempts']) ? (int) $pending['attempts'] : 0) + 1;
+
+        $pending['attempts']     = $attempts;
+        $pending['next_attempt'] = time() + $this->regeneration_backoff($attempts);
+        $pending['started']      = time();
+
+        update_option(self::REGENERATION_PENDING_OPTION, $pending, true);
+    }
+
+    /**
+     * Delay before the next takeover after the given number of attempts.
+     *
+     * @since 2.10.1
+     * @param int $attempts Attempts made so far (1 or more).
+     * @return int Seconds.
+     */
+    private function regeneration_backoff(int $attempts): int {
+        return (int) min(
+            self::REGENERATION_TAKEOVER_GRACE * (2 ** min(max($attempts, 1), 10)),
+            self::REGENERATION_MAX_BACKOFF
+        );
+    }
+
+    /**
+     * Record a failed regeneration instead of discarding it.
+     *
+     * Keeps the pending marker in place so the rebuild is retried, but backs the
+     * next attempt off exponentially (capped) so a persistently failing
+     * generation cannot run on every admin request.
+     *
+     * @since 2.2.1
+     * @since 2.10.1 Accepts the memory limit a rebuild had to stop short of, and
+     *              does not count an attempt claim_regeneration_attempt()
+     *              already counted.
+     * @param string   $message      Failure detail.
+     * @param string   $source       Either 'content' or 'settings'.
+     * @param int|null $memory_limit Memory limit (bytes) the rebuild stopped
+     *                               short of, when that was the failure.
+     * @return void
+     */
+    private function record_regeneration_failure(string $message, string $source, ?int $memory_limit = null): void {
+        $pending  = get_option(self::REGENERATION_PENDING_OPTION, []);
+        $pending  = is_array($pending) ? $pending : [];
+        $attempts = !empty($pending['attempts']) ? (int) $pending['attempts'] : 0;
+
+        // An attempt that claimed itself up front has already been counted.
+        if (empty($pending['started'])) {
+            $attempts++;
+        }
+        $attempts = max($attempts, 1);
+
+        $backoff = $this->regeneration_backoff($attempts);
+
+        // Same precedence mark_regeneration_pending() enforces: a settings
+        // rebuild outranks a content one and must not be downgraded by a failed
+        // attempt. Overwriting it routed the retry back through the content
+        // path, where should_auto_generate() can be false and the completion
+        // marker then discards the settings rebuild entirely. Only the
+        // outstanding rebuild is upgraded — the recorded error keeps reporting
+        // whichever attempt actually failed.
+        $current         = isset($pending['source']) ? (string) $pending['source'] : '';
+        $pending_source  = ($current === 'settings' || $source === 'settings') ? 'settings' : 'content';
+
+        $marker = [
+            'since'        => !empty($pending['since']) ? (int) $pending['since'] : time(),
+            'source'       => $pending_source,
+            'attempts'     => $attempts,
+            'next_attempt' => time() + $backoff,
+            'revision'     => !empty($pending['revision']) ? (int) $pending['revision'] : 0,
+        ];
+
+        // Remembered so has_memory_for_retry() can keep requests with no more
+        // memory than this from repeating the same attempt.
+        if ($memory_limit !== null && $memory_limit > 0) {
+            $marker['memory_limit'] = $memory_limit;
+        }
+
+        update_option(self::REGENERATION_PENDING_OPTION, $marker, true);
+
+        update_option(
+            self::REGENERATION_ERROR_OPTION,
+            [
+                'message'  => $message,
+                'source'   => $source,
+                'attempts' => $attempts,
+                'time'     => time(),
+            ],
+            false
+        );
+
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+            error_log(sprintf('ThinkRank: sitemap %s regeneration failed — %s', $source, $message));
+        }
+    }
+
+    /**
+     * Is a rebuild outstanding and past the point where WP-Cron should have run
+     * it?
+     *
+     * Deliberately cheap — one autoloaded option read — because it is consulted
+     * on every admin request to decide whether the takeover is needed.
+     *
+     * @since 2.2.1
+     * @return bool True when a request should rebuild the sitemap itself.
+     */
+    public static function has_overdue_regeneration(): bool {
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, []);
+
+        if (!is_array($pending) || empty($pending['since'])) {
+            return false;
+        }
+
+        $due = !empty($pending['next_attempt'])
+            ? (int) $pending['next_attempt']
+            : (int) $pending['since'] + self::REGENERATION_TAKEOVER_GRACE;
+
+        return time() >= $due;
+    }
+
+    /**
+     * Rebuild the sitemap in-request when WP-Cron has not delivered.
+     *
+     * Hooked on `shutdown` for admin, REST and CLI requests only (see
+     * Plugin::register_sitemap_cron_listeners()), so the work happens after the
+     * response has been sent and never adds latency to a visitor page view.
+     *
+     * @since 2.2.1
+     * @return void
+     */
+    public function run_overdue_regeneration(): void {
+        if (!self::has_overdue_regeneration()) {
+            return;
+        }
+
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, []);
+        $pending = is_array($pending) ? $pending : [];
+        $source  = isset($pending['source']) ? (string) $pending['source'] : 'content';
+
+        // Cron is running and its own event for this rebuild is still queued
+        // and due: it is about to do exactly this work. Only then — an event
+        // that has already been consumed (e.g. it fired while another process
+        // held the generation lock) is never re-queued, and returning here
+        // unconditionally left the rebuild to requests that could not finish it.
+        if (wp_doing_cron()) {
+            $hook = $source === 'settings' ? 'thinkrank_regenerate_sitemap_settings' : 'thinkrank_regenerate_sitemap';
+            $next = wp_next_scheduled($hook);
+
+            if ($next !== false && $next <= time()) {
+                return;
+            }
+        }
+
+        // The last attempt had to stop short of this process's memory limit.
+        // Retrying at the same (or a lower) limit only repeats that, so leave
+        // the rebuild to a process with more room — WP-CLI, a system cron, or a
+        // host with a higher limit — instead of burning it on every request.
+        if (!$this->has_memory_for_retry($pending)) {
+            return;
+        }
+
+        if ($source === 'settings') {
+            $this->regenerate_sitemap_from_settings();
+            return;
+        }
+
+        $this->auto_regenerate_sitemap();
+    }
+
+    /**
+     * Acquire the shared generation lock.
+     *
+     * @since 2.2.1
+     * @return bool True when this process may generate.
+     */
+    private function acquire_generation_lock(): bool {
+        if (get_transient(self::GENERATION_LOCK_TRANSIENT)) {
+            return false;
+        }
+
+        set_transient(self::GENERATION_LOCK_TRANSIENT, time(), 5 * MINUTE_IN_SECONDS);
+
+        return true;
+    }
+
+    /**
+     * Release the shared generation lock.
+     *
+     * @since 2.2.1
+     * @return void
+     */
+    private function release_generation_lock(): void {
+        delete_transient(self::GENERATION_LOCK_TRANSIENT);
+    }
+
+    /**
+     * This process's PHP memory limit in bytes.
+     *
+     * @since 2.10.1
+     * @return int Bytes, or -1 when unlimited (or unreadable).
+     */
+    private function current_memory_limit(): int {
+        $limit = (string) ini_get('memory_limit');
+
+        if ($limit === '' || $limit === '-1') {
+            return -1;
+        }
+
+        $bytes = (int) wp_convert_hr_to_bytes($limit);
+
+        return $bytes > 0 ? $bytes : -1;
+    }
+
+    /**
+     * May this process retry a rebuild that last stopped at the memory limit?
+     *
+     * Raises the limit the way wp-admin does first, so a request that can get
+     * more room than the failed attempt had is still allowed to try.
+     *
+     * @since 2.10.1
+     * @param array $pending The pending marker.
+     * @return bool True when there is no recorded memory failure, or this
+     *              process has more memory than the attempt that failed.
+     */
+    private function has_memory_for_retry(array $pending): bool {
+        if (empty($pending['memory_limit'])) {
+            return true;
+        }
+
+        wp_raise_memory_limit('admin');
+
+        $limit = $this->current_memory_limit();
+
+        return $limit === -1 || $limit > (int) $pending['memory_limit'];
+    }
+
+    /**
+     * Release what one walked chunk left behind.
+     *
+     * Hydrating a chunk through get_posts()/get_terms() also stores every
+     * object and its meta in the in-process object cache, which nothing
+     * empties until the request ends. Unsetting the chunk therefore freed
+     * nothing, and the walk grew with the size of the site instead of the size
+     * of a chunk — about 1.3 GB on a 45k-post site.
+     *
+     * A persistent object cache that supports it drops only its in-process
+     * copy (`flush_runtime`); the shared store keeps its data. WordPress's
+     * default cache has no shared store, and flushing it would empty every
+     * group for the rest of the request (options, the queried object, other
+     * plugins' data), so there only the chunk's own entries are deleted. A
+     * persistent cache without `flush_runtime` is left alone: deleting from it
+     * would evict the objects for every other request too.
+     *
+     * @since 2.10.1
+     * @param int   $chunk_start memory_get_usage(true) before the chunk was hydrated.
+     * @param array $groups      Cache groups keyed by the chunk's object IDs.
+     * @param int[] $ids         The chunk's object IDs, plus any objects it
+     *                           hydrated under their own (featured images).
+     * @return void
+     * @throws \Error See assert_memory_headroom().
+     */
+    private function release_walk_memory(int $chunk_start, array $groups, array $ids): void {
+        // What one chunk costs before it is released: the margin the next one
+        // needs. Measured in the same real allocated size assert_memory_headroom()
+        // compares against the limit, so the two are the same unit.
+        $this->walk_chunk_cost = max($this->walk_chunk_cost, memory_get_usage(true) - $chunk_start);
+
+        if (wp_using_ext_object_cache()) {
+            if (
+                function_exists('wp_cache_supports')
+                && wp_cache_supports('flush_runtime')
+                && function_exists('wp_cache_flush_runtime')
+            ) {
+                wp_cache_flush_runtime();
+            }
+        } elseif (!empty($ids)) {
+            foreach ($groups as $group) {
+                wp_cache_delete_multiple($ids, $group);
+            }
+        }
+
+        $this->assert_memory_headroom();
+    }
+
+    /**
+     * Cache groups get_posts() fills per post for the given post types.
+     *
+     * The post, its meta, and one relationships group per taxonomy the post
+     * type uses (update_object_term_cache()). Term objects themselves are
+     * bounded by the number of terms, not posts, so they are left cached.
+     *
+     * @since 2.10.1
+     * @param string[] $post_types Post types being walked.
+     * @return string[] Cache groups keyed by post ID.
+     */
+    private function chunk_post_cache_groups(array $post_types): array {
+        $groups = ['posts', 'post_meta'];
+
+        foreach (get_object_taxonomies($post_types) as $taxonomy) {
+            $groups[] = $taxonomy . '_relationships';
+        }
+
+        return array_values(array_unique($groups));
+    }
+
+    /**
+     * Stop an automatic rebuild before the memory limit rather than at it.
+     *
+     * A PHP memory fatal skips every catch and finally, so the lock, the
+     * failure record and the backoff are all lost with it, while stopping here
+     * is an ordinary, fully recorded failure. Checked before each chunk is
+     * hydrated, against a margin of at least the largest chunk seen so far.
+     *
+     * It throws an \Error, not an \Exception, on purpose: the per-segment
+     * catch (\Exception) blocks in generate_multiple_sitemaps() would otherwise
+     * swallow it and carry on — writing an index without the aborted segments
+     * and then pruning their files as orphans. Only the automatic rebuild's
+     * catch (\Throwable) is meant to see it.
+     *
+     * @since 2.10.1
+     * @return void
+     * @throws \Error When the automatic rebuild is close to the memory limit.
+     */
+    private function assert_memory_headroom(): void {
+        if (!$this->memory_guard) {
+            return;
+        }
+
+        $limit = $this->current_memory_limit();
+        if ($limit === -1) {
+            return;
+        }
+
+        // A fifth of the limit (at least 32 MB) for writing the files, or one
+        // and a half of the costliest chunk if that is more — and never more
+        // than half the limit either way. Without that outer cap a single
+        // anomalously expensive chunk (500 posts of serialised page-builder or
+        // ACF meta reaches hundreds of megabytes) puts the margin above the
+        // limit itself, so every later check aborts at any usage at all, the
+        // failure records this process's limit, and has_memory_for_retry()
+        // then refuses every process that has the same limit. A site that
+        // never actually ran out of memory would stop rebuilding until WP-CLI
+        // or a system cron happened to run.
+        $headroom = (int) min(
+            max(
+                min(max($limit * 0.2, 32 * MB_IN_BYTES), $limit * 0.5),
+                $this->walk_chunk_cost * 1.5
+            ),
+            $limit * 0.5
+        );
+
+        // The real allocated size, which is what PHP enforces memory_limit
+        // against; memory_get_usage(false) reports only what is handed out of
+        // those allocations and so understates the margin by the allocator's
+        // slack.
+        $usage = memory_get_usage(true);
+
+        if ($usage > $limit - $headroom) {
+            throw new \Error(
+                sprintf(
+                    /* translators: 1: memory in use, 2: PHP memory limit. */
+                    esc_html__('The sitemap rebuild was stopped at %1$s of the %2$s PHP memory limit, before PHP would have run out of memory. It will be retried by a process with more memory (WP-CLI or a system cron). To let it finish in the admin, raise the PHP memory_limit.', 'thinkrank'),
+                    esc_html((string) size_format($usage)),
+                    esc_html((string) size_format($limit))
+                ),
+                // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- an integer class constant, not output.
+                self::MEMORY_ABORT_CODE
+            );
+        }
+    }
+
+    /**
+     * Run an automatic rebuild's generation with the fatal-safe bookkeeping.
+     *
+     * @since 2.10.1
+     * @param array $settings Sitemap settings.
+     * @return bool Whatever generate_and_save() returned.
+     * @throws \Throwable Whatever generation throws, after the memory guard is
+     *                    switched back off.
+     */
+    private function generate_for_regeneration(array $settings): bool {
+        // Same headroom wp-admin gives itself; a no-op when the limit is
+        // already higher or unlimited.
+        wp_raise_memory_limit('admin');
+
+        $this->claim_regeneration_attempt();
+        $this->memory_guard    = true;
+        $this->walk_chunk_cost = 0;
+
+        try {
+            return $this->generate_and_save($settings);
+        } finally {
+            $this->memory_guard = false;
+        }
+    }
+
+    /**
+     * Record a failure thrown by an automatic rebuild.
+     *
+     * @since 2.10.1
+     * @param \Throwable $e      What was thrown.
+     * @param string     $source Either 'content' or 'settings'.
+     * @return void
+     */
+    private function record_thrown_regeneration_failure(\Throwable $e, string $source): void {
+        $memory_limit = null;
+
+        if ($e instanceof \Error && $e->getCode() === self::MEMORY_ABORT_CODE) {
+            $memory_limit = $this->current_memory_limit();
+            $memory_limit = $memory_limit > 0 ? $memory_limit : null;
+        }
+
+        $this->record_regeneration_failure($e->getMessage(), $source, $memory_limit);
+    }
+
+    /**
+     * Report how automatic regeneration is faring, for the admin UI.
+     *
+     * The feature used to fail invisibly: `last_generated` simply stopped
+     * advancing and nothing drew attention to it (#629).
+     *
+     * @since 2.2.1
+     * @return array Health payload.
+     */
+    public function get_regeneration_health(): array {
+        $settings = $this->get_settings('site');
+        $pending  = get_option(self::REGENERATION_PENDING_OPTION, []);
+        $pending  = is_array($pending) ? $pending : [];
+        $error    = get_option(self::REGENERATION_ERROR_OPTION, []);
+        $error    = is_array($error) ? $error : [];
+
+        $since = !empty($pending['since']) ? (int) $pending['since'] : 0;
+
+        $next_scheduled = wp_next_scheduled('thinkrank_regenerate_sitemap');
+        if ($next_scheduled === false) {
+            $next_scheduled = wp_next_scheduled('thinkrank_regenerate_sitemap_settings');
+        }
+
+        return [
+            'auto_generate'   => !empty($settings['auto_generate']),
+            'last_generated'  => $settings['last_generated'] ?? '',
+            'pending_since'   => $since ? gmdate('c', $since) : null,
+            'pending_seconds' => $since ? max(0, time() - $since) : 0,
+            'next_scheduled'  => $next_scheduled ? gmdate('c', (int) $next_scheduled) : null,
+            'cron_disabled'   => defined('DISABLE_WP_CRON') && DISABLE_WP_CRON,
+            'stale'           => $this->is_sitemap_stale($settings),
+            'last_error'      => !empty($error['message'])
+                ? [
+                    'message' => (string) $error['message'],
+                    'source'  => isset($error['source']) ? (string) $error['source'] : 'content',
+                    'time'    => !empty($error['time']) ? gmdate('c', (int) $error['time']) : null,
+                ]
+                : null,
+        ];
+    }
+
+    /**
+     * Has published content changed since the served sitemap was last written?
+     *
+     * Uses core's cached last-modified lookup, which only considers published
+     * posts — the same content the sitemap covers.
+     *
+     * @since 2.2.1
+     * @param array $settings Sitemap settings.
+     * @return bool True when the sitemap is behind the content.
+     */
+    private function is_sitemap_stale(array $settings): bool {
+        if (empty($settings['enabled']) || empty($settings['last_generated'])) {
+            // Never generated is already reported separately by the UI.
+            return false;
+        }
+
+        $generated = strtotime((string) $settings['last_generated']);
+        if (!$generated) {
+            return false;
+        }
+
+        $modified = get_lastpostmodified('gmt');
+        if (!$modified) {
+            return false;
+        }
+
+        $modified = strtotime($modified . ' UTC');
+        if (!$modified) {
+            return false;
+        }
+
+        // A minute of slack keeps a rebuild that ran alongside the edit from
+        // reporting itself as stale.
+        return $modified > ($generated + MINUTE_IN_SECONDS);
+    }
+
+    /**
+     * Public entry point to debounce-rebuild the sitemap after a settings change
+     * (e.g. toggling inclusion rules via REST or the MCP ability), so the served
+     * file reflects the new settings instead of going stale until a content edit.
+     *
+     * @return void
+     */
+    public function schedule_regeneration(): void {
+        // Debounce against rapid successive saves, but use the settings-specific
+        // hook so the rebuild runs regardless of the auto_generate toggle (which
+        // only governs content-change-triggered regeneration).
+        $this->mark_regeneration_pending('settings');
+        $this->debounce_event('thinkrank_regenerate_sitemap_settings');
+    }
+
+    /**
+     * Rebuild the served sitemap after an explicit settings change.
+     *
+     * Unlike {@see auto_regenerate_sitemap()}, this is NOT gated on the
+     * auto_generate setting: the user deliberately changed inclusion rules and
+     * expects the served file to reflect them even if content-triggered
+     * auto-generation is turned off. Still respects the master `enabled` flag.
+     *
+     * @since 2.10.0 Reports whether the served sitemap was actually rebuilt, so
+     *              a caller can say so rather than assume it (#764). Existing
+     *              callers that ignore the return are unaffected.
+     *
+     * @return bool True when the served sitemap now reflects the settings.
+     */
+    public function regenerate_sitemap_from_settings(): bool {
+        if (!$this->acquire_generation_lock()) {
+            // A manual generation (or another request's takeover) is already
+            // writing the files; the pending marker survives so this rebuild is
+            // retried rather than lost.
+            return false;
+        }
+
+        try {
+            $settings = $this->get_settings('site');
+            if (empty($settings['enabled'])) {
+                // The sitemap was disabled: remove the previously generated static
+                // files so the web server stops serving a stale sitemap that
+                // crawlers would otherwise keep fetching.
+                //
+                // A file that could not be removed is still being served, so
+                // this is not a success. Reporting one here would tell a caller
+                // the sitemap was gone while the web server kept answering with
+                // it, which is the failure this return value exists to prevent
+                // (#764).
+                $removal = $this->delete_published_sitemaps($settings);
+                $stuck   = is_array($removal['failed'] ?? null) ? $removal['failed'] : [];
+
+                if (!empty($stuck)) {
+                    $this->record_regeneration_failure(
+                        $this->stuck_files_message($stuck, true),
+                        'settings'
+                    );
+
+                    return false;
+                }
+
+                $this->mark_regeneration_complete();
+
+                return true;
+            }
+
+            $revision = $this->current_regeneration_revision();
+
+            if ('dynamic' === $this->resolve_delivery_mode($settings)) {
+                // Returns false when a static file is stuck in the web root:
+                // the server keeps serving that file in preference to WordPress,
+                // so the switch has not taken effect (#764).
+                return $this->switch_to_dynamic_delivery($settings, $revision, 'settings');
+            }
+
+            if ($this->generate_for_regeneration($settings)) {
+                $this->mark_regeneration_complete($revision);
+
+                return true;
+            }
+
+            $this->record_regeneration_failure(
+                $this->write_failure_message(),
+                'settings'
+            );
+
+            return false;
+        } catch (\Throwable $e) {
+            $this->record_thrown_regeneration_failure($e, 'settings');
+
+            return false;
+        } finally {
+            $this->release_generation_lock();
+        }
+    }
+
+    /**
+     * When a rebuild has been outstanding since, or 0 when none is.
+     *
+     * Lets a caller report an honest "saved, but the served file has not caught
+     * up yet" instead of a bare success (#764).
+     *
+     * @since 2.10.0
+     * @return int Unix timestamp, or 0 when nothing is pending.
+     */
+    public static function regeneration_pending_since(): int {
+        $pending = get_option(self::REGENERATION_PENDING_OPTION, []);
+
+        if (!is_array($pending) || empty($pending['since'])) {
+            return 0;
+        }
+
+        return (int) $pending['since'];
+    }
+
+    /**
+     * Remove every static sitemap file ThinkRank publishes to the web root.
+     *
+     * Called when the sitemap feature is disabled, by the cleanup route, and by
+     * both removal paths, so /sitemap.xml, /sitemap_index.xml, the segmented
+     * children (incl. paginated -N pages), and /local-sitemap.xml stop being
+     * served. Only ThinkRank's own filenames are targeted; WordPress core's
+     * wp-sitemap.xml and any other plugin's sitemap in the web root are left
+     * untouched.
+     *
+     * @since 1.31.0 Returns the filenames removed, and accepts the settings to
+     *               derive them from, so a caller that already read them (and
+     *               needs to report what went) does not have to re-read or
+     *               re-derive the name list.
+     * @since 2.1.0  Delegates to thinkrank_webroot_delete_sitemaps(). Uninstall
+     *               needs the same removal but has no autoloader to reach this
+     *               class, so the logic moved to includes/cleanup-webroot.php
+     *               and this stays as the in-plugin entry point.
+     *
+     * @param array|null $settings Optional. Sitemap settings; defaults to the
+     *                             saved site settings.
+     * @return array{deleted: string[], failed: string[]} Basenames removed, and
+     *                             those that existed but could not be removed.
+     */
+    public function delete_published_sitemaps(?array $settings = null): array {
+        return thinkrank_webroot_delete_sitemaps($settings ?? $this->get_settings('site'));
+    }
+
+    /**
+     * Every child-sitemap filename this site could have published.
+     *
+     * @since 1.31.0
+     * @since 2.1.0 Delegates to thinkrank_webroot_segment_filenames().
+     *
+     * @param array $settings Sitemap settings (read for `custom_url_pattern`).
+     * @return string[] Basenames, e.g. ['sitemap-posts.xml', 'sitemap-pages.xml'].
+     */
+    private function publishable_segment_filenames(array $settings): array {
+        return thinkrank_webroot_segment_filenames($settings);
+    }
+
+    /**
+     * Can this web-root file be shown to be a sitemap ThinkRank wrote?
+     *
+     * The generator deletes as often as cleanup does — a segment that dropped
+     * out of the set, a pagination page beyond the new count, the local sitemap
+     * after the business identity was cleared — and until 2.1.1 it did all
+     * three by filename alone. That is the #515 bug on a far more frequent
+     * trigger: our names are the canonical ones, so an ordinary regeneration
+     * (post save, term change, settings save) destroyed RankMath's
+     * `sitemap-tags.xml` and `local-sitemap.xml` with no deactivation involved.
+     *
+     * Every name the generator derives comes from the current settings — the
+     * url pattern, the configured `sitemap_urls`, `local-sitemap.xml` — but the
+     * ownership test is still asked with `$name_derived = false`, which switches
+     * off the legacy fallback for the whole generator side.
+     *
+     * The fallback exists to recover a pre-2.1.1 file written with
+     * `enable_styling` off, which carries neither marker. That recovery belongs
+     * to the once-off cleanup paths. Here it can only do harm: this method runs
+     * on every post save, and everything this version writes carries
+     * THINKRANK_SITEMAP_MARKER, so after the site's first regeneration an
+     * unmarked file at one of our names is by definition somebody else's — and
+     * deleting it on an ordinary regeneration is #515 through the more common
+     * door. The cost is a stale unmarked segment left on disk until deactivation
+     * picks it up, which is the safe direction to fail in.
+     *
+     * @since 2.1.1
+     *
+     * @param string $path     Absolute path to a file in the web root.
+     * @param array  $settings Sitemap settings.
+     * @return bool True when the file may be deleted.
+     */
+    private function webroot_sitemap_is_ours(string $path, array $settings): bool {
+        return thinkrank_webroot_sitemap_is_ours($path, $settings, false);
+    }
+
+    /**
+     * Auto-regenerate sitemap (called by scheduled action)
+     *
+     * @since 1.0.0
+     * @return void
+     */
+    public function auto_regenerate_sitemap(): void {
+        if (!$this->acquire_generation_lock()) {
+            // A manual generation (or another request's takeover) is already
+            // writing the files; the pending marker survives so this rebuild is
+            // retried rather than lost.
+            return;
+        }
+
+        try {
+            // Double-check that auto-generation is still enabled
+            if (!$this->should_auto_generate()) {
+                // Nothing outstanding can be delivered while the feature is off,
+                // so drop the marker rather than let the takeover retry forever.
+                $this->mark_regeneration_complete();
+                return;
+            }
+
+            $revision = $this->current_regeneration_revision();
+            $settings = $this->get_settings('site');
+
+            // See regenerate_sitemap_from_settings(): nothing to write.
+            if ('dynamic' === $this->resolve_delivery_mode($settings)) {
+                $this->switch_to_dynamic_delivery($settings, $revision, 'content');
+                return;
+            }
+
+            if ($this->generate_for_regeneration($settings)) {
+                $this->mark_regeneration_complete($revision);
+            } else {
+                // Previously this returned quietly and last_generated simply
+                // stopped advancing, leaving the site owner with no way to learn
+                // the sitemap had stopped updating (#629).
+                $this->record_regeneration_failure(
+                    $this->write_failure_message(),
+                    'content'
+                );
+            }
+        } catch (\Throwable $e) {
+            $this->record_thrown_regeneration_failure($e, 'content');
+        } finally {
+            $this->release_generation_lock();
+        }
+    }
+
+    /**
+     * Build and write the sitemap files for the given settings.
+     *
+     * Segmented files plus an index when the settings configure one, a single
+     * file otherwise, and the standalone local business sitemap either way.
+     * Records `last_generated` so the UI's "View Generated Sitemaps" links
+     * unlock, mirroring the manual generate endpoint.
+     *
+     * @since 1.17.0
+     * @param array $settings Sitemap settings.
+     * @return bool True when the sitemap files were written.
+     */
+    public function generate_and_save(array $settings): bool {
+        // Dynamic delivery publishes no files, so writing them here would put a
+        // static copy back in the web root for the server to serve in place of
+        // the dynamic route. Guarding at each call site left gaps — the
+        // snapshot migrator's post-import regeneration had none — so the rule
+        // lives with the writing instead.
+        //
+        // `is_collecting()` is the exception that makes dynamic delivery work
+        // at all: render_document() and collect_documents() reach this same
+        // method with the writer swapped for a collector, and that is precisely
+        // the dynamic build. Only a real write is skipped.
+        if (!$this->is_collecting() && 'dynamic' === $this->resolve_delivery_mode($settings)) {
+            // Whatever prompted this call changed the sitemap's content, so the
+            // rendered copies must not outlive it.
+            $this->flush_dynamic_cache();
+
+            return true;
+        }
+
+        // Index mode is driven by the use_sitemap_index toggle (not merely by how
+        // many sitemap_urls happen to be configured). When the toggle is on but
+        // no child sitemaps are set up yet, synthesize the per-type segmented set
+        // so we emit a real <sitemapindex> with paginated children instead of a
+        // flat urlset misnamed sitemap_index.xml.
+        $settings = $this->maybe_promote_to_index($settings);
+
+        if (!empty($settings['use_sitemap_index']) || count((is_array($settings['sitemap_urls'] ?? null) ? $settings['sitemap_urls'] : [])) > 1) {
+            $results = $this->generate_multiple_sitemaps($settings);
+            $written = !empty($results['success']);
+        } else {
+            $xml = $this->generate_sitemap($settings);
+            $primary = $this->get_primary_sitemap_filename($settings);
+            $written = $this->save_sitemap_to_file($xml, $primary);
+
+            // Local business sitemap is a standalone file, regenerated on the
+            // single-sitemap path too (this is the default mode).
+            $this->regenerate_local_sitemap($settings);
+
+            // Switching out of index mode leaves sitemap_index.xml and every
+            // child on disk, still served and never refreshed again. The index
+            // path already prunes what it no longer owns; this path never did,
+            // so the site kept serving two sitemap trees (#563). Ownership is
+            // still tested per file, so another plugin's sitemap at one of our
+            // names is never touched (#515).
+            $this->prune_orphaned_segments($settings, [['filename' => basename($primary)]]);
+        }
+
+        // last_generated describes what is on disk. A dynamic render publishes
+        // nothing, so advancing it would report a static publication that never
+        // happened and would let primary_sitemap_file_exists() callers believe
+        // there is a file to serve.
+        if ($written && !$this->is_collecting()) {
+            $settings['last_generated'] = gmdate('c');
+            $this->save_settings('site', null, $settings);
+        }
+
+        return $written;
+    }
+
+    /**
+     * Whether this instance is rendering documents rather than publishing them.
+     *
+     * @since 2.9.0
+     *
+     * @return bool
+     */
+    private function is_collecting(): bool {
+        return $this->document_sink !== null;
+    }
+
+    /**
+     * Complete a regeneration that delivers dynamically, retiring stale files.
+     *
+     * Dynamic delivery renders nothing to disk, but that is only half the job.
+     * A web server hands back an existing `/sitemap.xml` without ever loading
+     * WordPress, so any file left over from a previous static generation goes on
+     * being served forever and {@see \ThinkRank\Frontend\SEO_Manager
+     * ::maybe_serve_sitemap()} is never reached. Switching to dynamic while
+     * leaving those files in place would therefore appear to do nothing at all.
+     *
+     * Both transitions matter and they differ:
+     *
+     * - An explicit switch to `dynamic` happens on a site whose root is usually
+     *   still writable, so the files can simply be removed.
+     * - An `auto` site that becomes read-only cannot remove them, because
+     *   deleting an entry needs write permission on the directory that holds
+     *   it. There the stale sitemap really is stuck in front of us, and the
+     *   honest outcome is a recorded failure naming it rather than a rebuild
+     *   reported as complete (#754 review).
+     *
+     * Ownership is tested per file by the shared helper, so another plugin's
+     * sitemap at one of our names is never deleted (#515).
+     *
+     * @since 2.9.0
+     *
+     * @param array  $settings Sitemap settings.
+     * @param int    $revision Revision this rebuild is completing.
+     * @param string $source   'settings' or 'content', for the failure record.
+     * @return void
+     */
+    private function switch_to_dynamic_delivery(array $settings, int $revision, string $source): bool {
+        $this->flush_dynamic_cache();
+
+        $removal = $this->delete_published_sitemaps($settings);
+        $stuck = is_array($removal['failed'] ?? null) ? $removal['failed'] : [];
+
+        if (!empty($stuck)) {
+            $this->record_regeneration_failure($this->stuck_files_message($stuck), $source);
+
+            return false;
+        }
+
+        $this->mark_regeneration_complete($revision);
+
+        return true;
+    }
+
+    /**
+     * Why a stale file left in the web root means the change has not landed.
+     *
+     * Shared by every path that removes published files, so they cannot
+     * describe the same situation differently (#764).
+     *
+     * The two situations that reach it differ in what WordPress is doing, and
+     * the message has to say which. After a switch to dynamic delivery
+     * WordPress IS serving the sitemap and the files shadow it. After the
+     * sitemap is switched off WordPress serves nothing, so the one message
+     * used to tell a site owner who had just disabled the sitemap that it was
+     * "being served from WordPress", which is the opposite of what they did.
+     *
+     * @since 2.10.0
+     * @since 2.10.0 Public, so the REST endpoint uses it rather than a copy;
+     *               takes $sitemap_disabled for the disabled path.
+     *
+     * @param string[] $stuck            Basenames that could not be removed.
+     * @param bool     $sitemap_disabled True when the files outlived disabling
+     *                                   the sitemap rather than a switch to
+     *                                   dynamic delivery.
+     * @return string
+     */
+    public function stuck_files_message(array $stuck, bool $sitemap_disabled = false): string {
+        if ($sitemap_disabled) {
+            return sprintf(
+                /* translators: 1: comma-separated file names, 2: absolute path to the WordPress root. */
+                __('The sitemap is disabled, but these files are still in the site root and your web server is still serving them: %1$s. They could not be removed because %2$s is not writable. Delete them, or ask your host to make the WordPress root writable.', 'thinkrank'),
+                implode(', ', $stuck),
+                untrailingslashit(ABSPATH)
+            );
+        }
+
+        return sprintf(
+            /* translators: 1: comma-separated file names, 2: absolute path to the WordPress root. */
+            __('The sitemap is being served from WordPress, but these files are still in the site root and your web server will keep serving them instead: %1$s. They could not be removed because %2$s is not writable. Delete them, or ask your host to make the WordPress root writable.', 'thinkrank'),
+            implode(', ', $stuck),
+            untrailingslashit(ABSPATH)
+        );
+    }
+
+    /**
+     * What to tell the site owner when publishing the files failed.
+     *
+     * The old wording stated the symptom and stopped there, so the reported
+     * cause was a guess and this reached support as a plugin fault rather than
+     * a folder permission (#752, #753). When the root is demonstrably
+     * unwritable, say that, and say what to do about it.
+     *
+     * @since 2.9.0
+     *
+     * @return string
+     */
+    private function write_failure_message(): string {
+        if (!wp_is_writable(ABSPATH)) {
+            return sprintf(
+                /* translators: %s: absolute path to the WordPress root. */
+                __('The sitemap could not be written because the folder %s is not writable by PHP. Ask your host to make the WordPress root writable, or set Sitemap Delivery to Dynamic to serve the sitemap without writing files.', 'thinkrank'),
+                untrailingslashit(ABSPATH)
+            );
+        }
+
+        return __('The sitemap files could not be written to the site root.', 'thinkrank');
+    }
+
+    /**
+     * How this site delivers its sitemap.
+     *
+     * `auto` is resolved on whether the web root can be written. That is the
+     * right signal here (unlike llms.txt, where the question is whether the
+     * server applies the .htaccess charset block): a site whose root is
+     * read-only cannot publish a sitemap file at all, and before this existed
+     * the feature simply failed with "The sitemap files could not be written to
+     * the site root." and served nothing (#752).
+     *
+     * @since 2.9.0
+     *
+     * @param array|null $settings Sitemap settings (falls back to saved ones).
+     * @return string One of 'static' or 'dynamic'. Never 'auto'.
+     */
+    public function resolve_delivery_mode(?array $settings = null): string {
+        $settings = $settings ?? $this->get_settings('site');
+        $mode = (string) ($settings['delivery_mode'] ?? 'auto');
+
+        if ('static' === $mode || 'dynamic' === $mode) {
+            return $mode;
+        }
+
+        return wp_is_writable(ABSPATH) ? 'static' : 'dynamic';
+    }
+
+    /**
+     * Render one published sitemap document without touching the filesystem.
+     *
+     * Runs the ordinary build pipeline with the writer swapped for a collector,
+     * so the bytes returned here are the bytes the static path would have
+     * written. `SitemapDeliveryParityTest` asserts that equivalence rather than
+     * trusting it.
+     *
+     * The whole set is built to answer for one file, because the index can only
+     * be assembled from the children that were actually produced. The result is
+     * cached per document, so that cost is paid once per change and not once
+     * per crawler request.
+     *
+     * @since 2.9.0
+     *
+     * @param string     $filename Published file name, e.g. 'sitemap.xml'.
+     * @param array|null $settings Sitemap settings (falls back to saved ones).
+     * @return string|null XML, or null when this site does not publish that name.
+     */
+    public function render_document(string $filename, ?array $settings = null): ?string {
+        $filename = basename($filename);
+        $settings = $settings ?? $this->get_settings('site');
+
+        if (empty($settings['enabled'])) {
+            return null;
+        }
+
+        $cached = get_transient($this->dynamic_cache_key($filename));
+        if (self::ABSENT_MARKER === $cached) {
+            return null;
+        }
+        if (is_string($cached) && '' !== $cached) {
+            return $cached;
+        }
+
+        // A miss builds the whole set, because the index can only be assembled
+        // from the children that were actually produced. Caching only the
+        // requested document therefore made a crawler walking the index and its
+        // children rebuild the entire site's sitemap once per file — every post
+        // and taxonomy query repeated N times on a public endpoint (#754
+        // review). The set is built once and stored in full.
+        return $this->stream_documents($settings, $filename);
+    }
+
+    /**
+     * Build every document, caching each as it is produced, keeping one.
+     *
+     * A miss has to build the whole set, because the index can only be
+     * assembled from the children that were actually produced. It does not have
+     * to *hold* the whole set: the static path never keeps more than one page
+     * in memory, writing each to disk as it goes, and buffering every
+     * document's XML to return one of them undid that on the request path,
+     * where a large site's entire sitemap corpus would sit in a single PHP
+     * process (#754 review).
+     *
+     * So the sink writes each document straight to its cache entry and lets it
+     * go, retaining only the one this request is answering. Peak retention is
+     * one document, whatever the site's size.
+     *
+     * Concurrency: the first request through takes a short lock and does the
+     * work. One that finds the lock held waits a bounded moment for the winner
+     * to publish, then builds anyway, because serving a correct sitemap late
+     * beats serving none.
+     *
+     * @since 2.9.0
+     *
+     * @param array  $settings Sitemap settings.
+     * @param string $wanted   Document this request is answering.
+     * @return string|null XML for $wanted, or null when the site does not publish it.
+     */
+    private function stream_documents(array $settings, string $wanted): ?string {
+        $lock = self::DYNAMIC_CACHE_PREFIX . 'lock';
+
+        if (!$this->acquire_render_lock($lock)) {
+            for ($attempt = 0; $attempt < self::RENDER_LOCK_WAIT_ATTEMPTS; $attempt++) {
+                usleep(self::RENDER_LOCK_WAIT_MICROSECONDS);
+
+                $cached = get_transient($this->dynamic_cache_key($wanted));
+                if (self::ABSENT_MARKER === $cached) {
+                    return null;
+                }
+                if (is_string($cached) && '' !== $cached) {
+                    return $cached;
+                }
+            }
+        }
+
+        $kept = null;
+        // Names only. Keeping the bodies here would be the very retention this
+        // method exists to avoid.
+        $produced = [];
+
+        $previous = $this->document_sink;
+        $this->document_sink = function (string $name, string $xml) use (&$kept, &$produced, $wanted): void {
+            $produced[$name] = true;
+            set_transient($this->dynamic_cache_key($name), $xml, self::DYNAMIC_CACHE_TTL);
+
+            if ($name === $wanted) {
+                $kept = $xml;
+            }
+        };
+
+        try {
+            $this->generate_and_save($settings);
+
+            // Names the configuration lists but this build did not produce get
+            // a negative entry, so asking for one again is a cache hit rather
+            // than another full rebuild.
+            $absent = $this->published_document_names($settings);
+
+            // Also the exact name this request asked for: a paginated page past
+            // the end of a stem is a legitimate request shape that the base
+            // list cannot enumerate, and without an entry it would rebuild on
+            // every hit.
+            $absent[] = $wanted;
+
+            foreach (array_unique($absent) as $name) {
+                if (!isset($produced[$name])) {
+                    set_transient($this->dynamic_cache_key($name), self::ABSENT_MARKER, self::DYNAMIC_CACHE_TTL);
+                }
+            }
+        } finally {
+            $this->document_sink = $previous;
+            delete_transient($lock);
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Take the render lock, if it is free.
+     *
+     * Not atomic across processes, and deliberately so: the fallback for losing
+     * a race is duplicated work, never a wrong or missing sitemap, so a
+     * heavier primitive would buy nothing here.
+     *
+     * @since 2.9.0
+     *
+     * @param string $lock Lock transient name.
+     * @return bool True when this request holds the lock.
+     */
+    private function acquire_render_lock(string $lock): bool {
+        if (false !== get_transient($lock)) {
+            return false;
+        }
+
+        set_transient($lock, time(), self::RENDER_LOCK_TTL);
+
+        return true;
+    }
+
+    /**
+     * Build every document this site publishes and return them all.
+     *
+     * Verification and tooling only. This retains the whole set in memory, so
+     * it must never be used to answer a request: {@see self::stream_documents()}
+     * is the serving path and keeps one document at a time regardless of site
+     * size (#754 review). `SitemapDeliveryParityTest` enforces that separation
+     * by failing if the request path routes back through here.
+     *
+     * @since 2.9.0
+     *
+     * @param array $settings Sitemap settings.
+     * @return array<string,string> Filename => XML.
+     */
+    public function collect_documents(array $settings): array {
+        $documents = [];
+
+        $previous = $this->document_sink;
+        $this->document_sink = static function (string $name, string $xml) use (&$documents): void {
+            $documents[$name] = $xml;
+        };
+
+        try {
+            $this->generate_and_save($settings);
+        } finally {
+            $this->document_sink = $previous;
+        }
+
+        return $documents;
+    }
+
+    /**
+     * The file names this site publishes, without building their contents.
+     *
+     * Used by the request router to decide whether a URL is ours before doing
+     * any work. Cheap: it reads the configured child list rather than querying
+     * for entries.
+     *
+     * @since 2.9.0
+     *
+     * @param array|null $settings Sitemap settings (falls back to saved ones).
+     * @return string[] File names, including paginated pages that may exist.
+     */
+    public function published_document_names(?array $settings = null): array {
+        $settings = $settings ?? $this->get_settings('site');
+        $resolved = $this->maybe_promote_to_index($settings);
+
+        $names = [$this->get_primary_sitemap_filename($settings), 'local-sitemap.xml'];
+
+        foreach ((array) ($resolved['sitemap_urls'] ?? []) as $child) {
+            if (!is_array($child) || empty($child['enabled'])) {
+                continue;
+            }
+
+            $path = (string) wp_parse_url((string) ($child['url'] ?? ''), PHP_URL_PATH);
+            if ('' !== $path) {
+                $names[] = basename($path);
+            }
+        }
+
+        return array_values(array_unique(array_filter($names)));
+    }
+
+    /**
+     * Does this site publish a document under that name?
+     *
+     * Not a plain membership test against {@see self::published_document_names()}:
+     * that lists the configured children, and a child over the per-file URL cap
+     * is split into `<stem>-2.xml`, `<stem>-3.xml` and so on, with every page
+     * listed in the index. Gating the request router on the base list alone
+     * therefore 404'd exactly the pages the index points at, which is worse than
+     * not serving them at all.
+     *
+     * Page counts are not knowable without building, so the stem is what is
+     * matched; a page that does not exist is answered by the build finding
+     * nothing for it, and is then cached as absent.
+     *
+     * @since 2.9.0
+     *
+     * @param string     $name     Requested file name.
+     * @param array|null $settings Sitemap settings (falls back to saved ones).
+     * @return bool
+     */
+    public function publishes_document_name(string $name, ?array $settings = null): bool {
+        $names = $this->published_document_names($settings);
+
+        if (in_array($name, $names, true)) {
+            return true;
+        }
+
+        if (!preg_match('/^(.*)-\d+\.xml$/i', $name, $m)) {
+            return false;
+        }
+
+        return in_array($m[1] . '.xml', $names, true);
+    }
+
+    /**
+     * Transient key for a rendered document.
+     *
+     * @since 2.9.0
+     *
+     * @param string $filename Published file name.
+     * @return string
+     */
+    private function dynamic_cache_key(string $filename): string {
+        return self::DYNAMIC_CACHE_PREFIX . md5($filename);
+    }
+
+    /**
+     * Drop every cached dynamic document.
+     *
+     * Called from the same places that mark the static files stale, so the two
+     * delivery modes invalidate on identical triggers.
+     *
+     * @since 2.9.0
+     *
+     * @return void
+     */
+    public function flush_dynamic_cache(): void {
+        foreach ($this->published_document_names() as $name) {
+            delete_transient($this->dynamic_cache_key($name));
+        }
+    }
+
+    /**
+     * Resolve index-vs-single mode, synthesizing child sitemaps when needed.
+     *
+     * - When use_sitemap_index is on but no child sitemaps are configured, build
+     *   the per-type segmented set so a real <sitemapindex> is produced (#127).
+     * - When the toggle is off but a single flat file would exceed the per-file
+     *   URL cap, auto-promote to a paginated index instead of one oversized file
+     *   that can cross Google's 50k-URL/50MB limits (#129).
+     *
+     * @param array $settings Sitemap settings.
+     * @return array Possibly-updated settings.
+     */
+    public function maybe_promote_to_index(array $settings): array {
+        $saved = $this->get_settings('site');
+
+        // Read from the *payload*, before the merge below folds the saved values
+        // in: "the caller named this" and "this has a value" are different
+        // questions, and the mode resolution turns on the former.
+        $mode_supplied = array_key_exists('use_sitemap_index', $settings);
+        $urls_supplied = is_array($settings['sitemap_urls'] ?? null);
+        $has_children = count($urls_supplied ? $settings['sitemap_urls'] : []) > 1;
+
+        // Which inclusion flags did the caller actually name? The child list is
+        // the only thing that reads them, and inheriting a saved one skipped
+        // that — so on an index-mode site the include_* flags were enforced
+        // nowhere but in the browser, where SitemapGeneration.js recomputes
+        // sitemap_urls itself. Every non-UI client, the shipped
+        // `update-sitemap-settings` ability included, saved the flag and changed
+        // nothing (#398). Read from the payload for the same reason as above:
+        // after the merge every saved flag would look like one the caller named.
+        $named_inclusions    = array_intersect(
+            array_keys(self::INCLUSION_CHILD_TYPES),
+            array_keys($settings)
+        );
+        $inclusions_supplied = (bool) $named_inclusions;
+
+        // Inclusion flags may be absent from a partial payload (e.g. the manual
+        // generate endpoint) — fall back to saved settings so synthesized child
+        // sitemaps reflect the real include_posts/pages/categories choices.
+        $inclusions = array_merge($saved, $settings);
+
+        // Hand the generators a *complete* settings array. Only the mode was
+        // resolved before, so every other unnamed key reached them missing: a
+        // bare `{}` from a REST/MCP client republished the sitemap with
+        // enable_styling and include_images read as off, overwriting the live
+        // files with output that had lost its XSL stylesheet, its image
+        // namespace and its image entries. Presentation and inclusion settings
+        // are not something a generate call opts into — they are the site's
+        // configuration, and only a value actually present in the payload
+        // overrides them.
+        $settings = $inclusions;
+
+        // The two keys that drive mode keep their own resolution rules below,
+        // so they must go back to "not specified" when the caller omitted them.
+        if (!$mode_supplied) {
+            unset($settings['use_sitemap_index']);
+        }
+        if (!$urls_supplied) {
+            unset($settings['sitemap_urls']);
+        }
+
+        // An absent use_sitemap_index means "not specified", which is not the
+        // same as "single file". Reading it as the latter meant a partial payload
+        // — `{}` from a REST/MCP client, or anything short of the full settings
+        // object the admin bundle sends — republished one flat sitemap.xml on an
+        // index-mode site and left sitemap_index.xml and its children stale or
+        // missing. Inherit the saved mode instead; only a value actually present
+        // in the payload decides the mode.
+        if (!array_key_exists('use_sitemap_index', $settings)) {
+            $settings['use_sitemap_index'] = $saved['use_sitemap_index'] ?? '';
+
+            // Inheriting the mode means inheriting its children too, unless the
+            // caller named its own set.
+            $saved_children = (is_array($saved['sitemap_urls'] ?? null) ? $saved['sitemap_urls'] : []);
+            if (!empty($settings['use_sitemap_index'])
+                && !$urls_supplied
+                && count($saved_children) > 1) {
+                // A named inclusion flag is applied *to* the inherited list, not
+                // used to regenerate it. build_segmented_sitemap_urls() also adds
+                // a child for every public custom post type, so rebuilding here
+                // would make `{include_pages: false}` — one thing off — silently
+                // switch on children the saved list never had (an Elementor
+                // internal CPT, a WooCommerce product feed). Only the flags the
+                // caller actually named change anything.
+                $settings['sitemap_urls'] = $inclusions_supplied
+                    ? $this->apply_inclusion_flags_to_children($saved_children, $named_inclusions, $inclusions)
+                    : $saved_children;
+
+                // The children are resolved either way — including when the
+                // caller switched the last one off, which leaves a bare index and
+                // is what they asked for.
+                $has_children = true;
+            }
+        }
+
+        if (!empty($settings['use_sitemap_index'])) {
+            if (!$has_children) {
+                $settings['sitemap_urls'] = $this->build_segmented_sitemap_urls($inclusions);
+            }
+            return $settings;
+        }
+
+        if (!$has_children) {
+            $limit = $this->get_links_per_sitemap($settings);
+            if ($limit > 0 && $this->estimate_total_sitemap_urls($inclusions) > $limit) {
+                $settings['use_sitemap_index'] = true;
+                $settings['sitemap_urls']     = $this->build_segmented_sitemap_urls($inclusions);
+            }
+        }
+
+        return $settings;
+    }
+
+    /**
+     * Rough count of URLs a single-file sitemap would contain, used only to
+     * decide whether to auto-promote to a paginated index. Cheap COUNT queries;
+     * intentionally approximate (homepage + published posts of enabled types +
+     * terms of enabled taxonomies).
+     *
+     * @param array $settings Sitemap settings.
+     * @return int
+     */
+    private function estimate_total_sitemap_urls(array $settings): int {
+        $total = 1; // homepage
+
+        foreach ($this->get_enabled_post_types($settings) as $post_type) {
+            $counts = wp_count_posts($post_type);
+            $total += isset($counts->publish) ? (int) $counts->publish : 0;
+        }
+
+        foreach ($this->get_enabled_taxonomies($settings) as $taxonomy) {
+            $count = wp_count_terms(['taxonomy' => $taxonomy, 'hide_empty' => true]);
+            if (!is_wp_error($count)) {
+                $total += (int) $count;
+            }
+        }
+
+        return $total;
+    }
+
+    /**
+     * Resolve the sitemap file the site publishes for the given settings.
+     *
+     * Index mode serves the index (`sitemap_index.xml`); the default single-file
+     * mode serves `sitemap.xml`. Callers use this to link to — or check for —
+     * the file the site actually serves, since ThinkRank's sitemap is a static
+     * file in the web root rather than a route.
+     *
+     * @since 1.17.0
+     * @param array $settings Sitemap settings.
+     * @return string Sitemap filename.
+     */
+    public function get_primary_sitemap_filename(array $settings): string {
+        return thinkrank_webroot_primary_sitemap_filename($settings);
+    }
+
+    /**
+     * Public URL of the sitemap the site serves.
+     *
+     * @since 1.17.0
+     * @param array|null $settings Sitemap settings (falls back to saved site settings).
+     * @return string Absolute sitemap URL.
+     */
+    public function get_primary_sitemap_url(?array $settings = null): string {
+        $settings = $settings ?? $this->get_settings('site');
+
+        return home_url('/' . $this->get_primary_sitemap_filename($settings));
+    }
+
+    /**
+     * Whether the sitemap file this site publishes exists on disk.
+     *
+     * @since 1.17.0
+     * @param array $settings Sitemap settings.
+     * @return bool True when the file is present.
+     */
+    public function primary_sitemap_file_exists(array $settings): bool {
+        return file_exists(ABSPATH . $this->get_primary_sitemap_filename($settings));
+    }
+
+    /**
+     * Save sitemap XML to file
+     *
+     * @since 1.0.0
+     * @param string $sitemap_xml Sitemap XML content
+     * @param string $filename Optional. Filename to save (defaults to 'sitemap.xml')
+     * @return bool True on success, false on failure
+     */
+    private function save_sitemap_to_file(string $sitemap_xml, string $filename = 'sitemap.xml'): bool {
+        // Validate and sanitize filename for security
+        try {
+            $filename = $this->validate_sitemap_filename($filename);
+        } catch (InvalidArgumentException $e) {
+            // File validation failed - error details available in exception
+            return false;
+        }
+
+        // Dynamic delivery: hand the document to the collector instead of the
+        // filesystem. Reported as published, because for this run it is — the
+        // caller's success/failure bookkeeping and the index assembly both key
+        // off this return value.
+        if ($this->document_sink !== null) {
+            ($this->document_sink)($filename, $sitemap_xml);
+
+            return true;
+        }
+
+        $sitemap_path = ABSPATH . $filename;
+
+        // Use WordPress filesystem API for better security
+        global $wp_filesystem;
+        if (!$wp_filesystem) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            WP_Filesystem();
+        }
+
+        if ($wp_filesystem) {
+            $written = $wp_filesystem->put_contents($sitemap_path, $sitemap_xml, FS_CHMOD_FILE);
+
+            if ($written) {
+                // Every sitemap this version writes carries the ownership
+                // marker, so once one has been written an unmarked file at one
+                // of our names cannot be ours. Recording that retires the
+                // legacy fallback for this install — see
+                // thinkrank_webroot_sitemap_is_ours().
+                if (get_option(THINKRANK_SITEMAP_MARKED_WRITE_OPTION) !== '1') {
+                    update_option(THINKRANK_SITEMAP_MARKED_WRITE_OPTION, '1', false);
+                }
+            }
+
+            return $written;
+        }
+
+        // WP_Filesystem initialization failed
+        return false;
+    }
+
+    /**
+     * Build a segmented, index-based sitemap_urls list from inclusion settings.
+     *
+     * Produces the index entry plus one child sitemap per enabled content type
+     * (posts/pages/categories) and one per public custom post type — the shape
+     * the "complete" preset creates and that generate_multiple_sitemaps() expects.
+     * Used when enabling the index during import so the index has real children
+     * instead of being empty.
+     *
+     * @since 1.14.0
+     *
+     * @param array $inclusions Inclusion flags (include_posts/pages/categories)
+     *                          and optionally custom_url_pattern.
+     * @return array Sitemap URL configs
+     */
+    public function build_segmented_sitemap_urls(array $inclusions): array {
+        $pattern = $inclusions['custom_url_pattern'] ?? 'sitemap-{type}.xml';
+
+        $urls = [$this->sitemap_child_entry('/sitemap_index.xml', 'index')];
+
+        foreach (self::INCLUSION_CHILD_TYPES as $flag => $type) {
+            if (!empty($inclusions[$flag])) {
+                $urls[] = $this->build_child_sitemap_entry($type, $pattern);
+            }
+        }
+
+        // Public custom post types each get a child sitemap (parity with the
+        // "complete" preset and with Rank Math, which lists every public CPT).
+        foreach (get_post_types(['public' => true, '_builtin' => false], 'names') as $cpt) {
+            if (!$this->should_include_post_type($cpt)) {
+                continue;
+            }
+
+            // ...and the per-content-type sitemap switch (#660).
+            // get_enabled_post_types() already honours it, but this list is what
+            // index mode builds its children from — so without the same test a
+            // CPT the user had switched off still got its own child sitemap,
+            // created and streamed in full. The flags live in $inclusions, which
+            // is the settings array these children are derived from.
+            if (!\ThinkRank\SEO\Content_Type_Settings::is_included_in_sitemap('post_type', $cpt, $inclusions)) {
+                continue;
+            }
+
+            $urls[] = $this->build_child_sitemap_entry($cpt, $pattern);
+        }
+
+        // Public custom taxonomies get the same treatment (#690). Flat mode has
+        // always walked them through get_enabled_taxonomies(); index mode built
+        // its children from the list above and never consulted a taxonomy at
+        // all, so every custom-taxonomy archive silently vanished from the
+        // sitemap the moment a site switched modes — and the per-taxonomy switch
+        // the matrix writes had nothing to act on. Same two tests the post-type
+        // walk applies, in the same order.
+        $taken = array_column($urls, 'type');
+
+        foreach (get_taxonomies(['public' => true, '_builtin' => false], 'names') as $taxonomy) {
+            if (!$this->should_include_taxonomy($taxonomy)) {
+                continue;
+            }
+
+            if (!\ThinkRank\SEO\Content_Type_Settings::is_included_in_sitemap('taxonomy', $taxonomy, $inclusions)) {
+                continue;
+            }
+
+            // Post types and taxonomies are separate registries, so a site can
+            // hold both a `foo` post type and a `foo` taxonomy. They would
+            // resolve to one filename, and stream_type_entries() answers post
+            // types first, so the second child would list the first one's file
+            // twice in the index rather than adding anything.
+            if (in_array($taxonomy, $taken, true)) {
+                continue;
+            }
+
+            $urls[] = $this->build_child_sitemap_entry($taxonomy, $pattern);
+        }
+
+        return $urls;
+    }
+
+    /**
+     * Apply only the inclusion flags the caller named to an existing child list.
+     *
+     * The narrow counterpart to build_segmented_sitemap_urls(): that one
+     * regenerates the whole set from scratch, which is right when there is no set
+     * yet and wrong when there is. Rebuilding an existing list would add a child
+     * for every public custom post type it had never contained, so a payload that
+     * switches one thing off would switch others on. Here a flag adds or removes
+     * exactly its own child and leaves every other entry — custom post types,
+     * hand-added URLs, per-child enabled/status state — untouched (#398).
+     *
+     * @since 1.31.0
+     *
+     * @param array    $children         Existing child sitemap entries.
+     * @param string[] $named_inclusions Inclusion flag keys present in the payload.
+     * @param array    $inclusions       Merged settings, for the resolved flag
+     *                                   values and custom_url_pattern.
+     * @return array Updated child sitemap entries.
+     */
+    private function apply_inclusion_flags_to_children(
+        array $children,
+        array $named_inclusions,
+        array $inclusions
+    ): array {
+        $pattern = $inclusions['custom_url_pattern'] ?? 'sitemap-{type}.xml';
+
+        foreach ($named_inclusions as $flag) {
+            $type = self::INCLUSION_CHILD_TYPES[$flag];
+
+            $present = false;
+            foreach ($children as $entry) {
+                if (($entry['type'] ?? '') === $type) {
+                    $present = true;
+                    break;
+                }
+            }
+
+            if (empty($inclusions[$flag])) {
+                if ($present) {
+                    $children = array_values(array_filter(
+                        $children,
+                        static function ($entry) use ($type): bool {
+                            return (is_array($entry) ? ($entry['type'] ?? '') : '') !== $type;
+                        }
+                    ));
+                }
+                continue;
+            }
+
+            if (!$present) {
+                $children[] = $this->build_child_sitemap_entry($type, $pattern);
+            }
+        }
+
+        return $children;
+    }
+
+    /**
+     * Build one child sitemap entry, resolving its filename from the url pattern.
+     *
+     * @since 1.31.0
+     *
+     * @param string $type    Child sitemap type (posts, pages, a post type name).
+     * @param string $pattern Filename pattern containing {type}.
+     * @return array Sitemap URL config.
+     */
+    private function build_child_sitemap_entry(string $type, string $pattern): array {
+        $file = str_replace('{type}', $type, $pattern);
+        if (strpos($file, '/') !== 0) {
+            $file = '/' . $file;
+        }
+
+        return $this->sitemap_child_entry($file, $type);
+    }
+
+    /**
+     * The shape generate_multiple_sitemaps() expects of a sitemap_urls entry.
+     *
+     * @since 1.31.0
+     *
+     * @param string $url  Sitemap path.
+     * @param string $type Entry type.
+     * @return array Sitemap URL config.
+     */
+    private function sitemap_child_entry(string $url, string $type): array {
+        return [
+            'url'          => $url,
+            'type'         => $type,
+            'enabled'      => true,
+            'last_checked' => null,
+            'status'       => 'unknown',
+        ];
+    }
+
+    /**
+     * Generate multiple sitemaps based on settings
+     *
+     * @since 1.0.0
+     * @param array $settings Sitemap settings
+     * @return array Results of sitemap generation
+     */
+    public function generate_multiple_sitemaps(array $settings): array {
+        $results = [
+            'success' => true,
+            'sitemaps_generated' => [],
+            'errors' => [],
+            'total_urls' => 0
+        ];
+
+        $sitemap_urls = (is_array($settings['sitemap_urls'] ?? null) ? $settings['sitemap_urls'] : []);
+
+        if (empty($sitemap_urls)) {
+            $results['success'] = false;
+            $results['errors'][] = 'No sitemap URLs configured';
+            return $results;
+        }
+
+        $limit = $this->get_links_per_sitemap($settings);
+
+        // Defer the index until every child sitemap has been generated, so it can
+        // list the actual files produced (including pagination pages).
+        $index_config = null;
+        $index_children = [];
+
+        foreach ($sitemap_urls as $sitemap_config) {
+            if (empty($sitemap_config['enabled'])) {
+                continue;
+            }
+
+            $type = $sitemap_config['type'];
+
+            if ($type === 'index') {
+                $index_config = $sitemap_config;
+                continue;
+            }
+
+            // Skip CPT children that no longer qualify (e.g. an internal store
+            // like Templately's `templately_library`) even when a previously
+            // saved config still lists them. Built-in aggregate types ('posts',
+            // 'pages', 'general', etc.) are not post type names, so this only
+            // affects real custom post types.
+            if (post_type_exists($type) && !$this->should_include_post_type($type)) {
+                continue;
+            }
+
+            // Same for the matrix switch: a child list saved before the user
+            // excluded this content type still names it, and regenerating from
+            // that list would rewrite the file they asked not to have. Built-in
+            // aggregates ('posts', 'pages', ...) are not post type names, so
+            // post_type_exists() keeps this to real custom post types.
+            if (post_type_exists($type)
+                && !\ThinkRank\SEO\Content_Type_Settings::is_included_in_sitemap('post_type', $type, $settings)) {
+                continue;
+            }
+
+            // The taxonomy counterpart of the two guards above (#690). A child
+            // list saved while a taxonomy was still included keeps naming it, so
+            // without this, excluding one in the matrix would still rewrite and
+            // re-list the file the user asked not to have. The built-in
+            // aggregates are named 'categories'/'tags' rather than
+            // 'category'/'post_tag', so taxonomy_exists() leaves them to the
+            // inclusion-flag check below.
+            $child_taxonomy = self::CHILD_TYPE_ALIASES[$type] ?? $type;
+            if (taxonomy_exists($child_taxonomy)
+                && (!$this->should_include_taxonomy($child_taxonomy)
+                    || !\ThinkRank\SEO\Content_Type_Settings::is_included_in_sitemap('taxonomy', $child_taxonomy, $settings))) {
+                continue;
+            }
+
+            // The built-in aggregates carry their switch in the inclusion flag
+            // rather than under a post type name, and they are the four most
+            // people actually use. build_segmented_sitemap_urls() drops a child
+            // whose flag is empty; regenerating from a list saved while it was
+            // still on has to make the same decision, or turning Posts, Pages,
+            // Categories or Tags off in the matrix rewrites and re-lists the
+            // very file it was asked to remove.
+            // An absent flag means "not configured", which every other reader
+            // treats as included; only a flag that is present and off excludes.
+            $aggregate_flag = array_search($type, self::INCLUSION_CHILD_TYPES, true);
+            if ($aggregate_flag !== false
+                && array_key_exists($aggregate_flag, $settings)
+                && empty($settings[$aggregate_flag])) {
+                continue;
+            }
+
+            try {
+                // The single "general"/"WordPress" sitemap is one un-paginated file
+                // (there is no index to reference extra pages); it no longer drops
+                // overflow URLs.
+                if ($type === 'general' || $type === 'wordpress') { // phpcs:ignore WordPress.WP.CapitalPDangit.MisspelledInText -- lowercase on purpose: this is the stored type slug.
+                    $xml = $this->generate_sitemap($settings);
+                    $this->write_sitemap_page($sitemap_config['url'], $xml, $type, $this->count_urls_in_xml($xml), $results, $index_children);
+                    continue;
+                }
+
+                $source = $this->stream_type_entries($type, $settings);
+
+                // Unknown type — fall back to a single general sitemap file.
+                if ($source === null) {
+                    $xml = $this->generate_sitemap($settings);
+                    $this->write_sitemap_page($sitemap_config['url'], $xml, $type, $this->count_urls_in_xml($xml), $results, $index_children);
+                    continue;
+                }
+
+                // Stream the entries into files of at most $limit URLs, matching
+                // Rank Math: page 1 keeps the base filename, pages 2+ get a -N
+                // suffix, and every page is listed in the index. Buffering only one
+                // page at a time keeps peak memory bounded to $limit entries rather
+                // than every URL of the type.
+                $image_ns = $source['image_ns'];
+                $buffer   = [];
+                $page     = 0;
+
+                foreach ($source['entries'] as $entry) {
+                    $buffer[] = $entry;
+                    if (count($buffer) >= $limit) {
+                        $page++;
+                        $this->write_sitemap_page($this->paginate_url($sitemap_config['url'], $page), $this->wrap_urlset($buffer, $settings, $image_ns), $type, count($buffer), $results, $index_children);
+                        $buffer = [];
+                    }
+                }
+
+                // Flush the trailing partial page.
+                //
+                // A type that produced nothing writes no page at all in index
+                // mode (#836). It used to write one empty urlset and list it in
+                // the index, so a crawler was asked to fetch a file that
+                // answers with no URLs — Search Console reports an empty
+                // sitemap referenced from an index as a warning, and the fetch
+                // is wasted on every pass. On this site three of eleven
+                // children were empty: a post type with nothing published and
+                // two taxonomies with no terms.
+                //
+                // Single-file mode still writes its one page even when empty,
+                // because that file IS the site's /sitemap.xml and a 404 there
+                // is worse than an empty urlset. Nothing lists it, so it costs
+                // no crawl budget.
+                //
+                // Skipping the write also keeps the filename out of
+                // $results['sitemaps_generated'], which is what
+                // prune_orphaned_segments() treats as "written this run" — so
+                // a type that empties after previously publishing has its
+                // stale file deleted rather than left serving.
+                if (!empty($buffer) || ($page === 0 && $index_config === null)) {
+                    $page++;
+                    $this->write_sitemap_page($this->paginate_url($sitemap_config['url'], $page), $this->wrap_urlset($buffer, $settings, $image_ns), $type, count($buffer), $results, $index_children);
+                }
+
+                // Remove pages left over from a previous, larger generation.
+                $this->cleanup_stale_pages($sitemap_config['url'], $page, $settings);
+
+            } catch (\Exception $e) {
+                $results['errors'][] = "Error generating {$type} sitemap: " . $e->getMessage();
+                $results['success'] = false;
+            }
+        }
+
+        // Local business sitemap (parity with Rank Math's local-sitemap.xml).
+        // The physical file is written whenever a business identity is
+        // configured — independent of segmented vs single mode — and is also
+        // listed in the sitemap index when one exists.
+        try {
+            if ($this->regenerate_local_sitemap($settings) && $index_config !== null) {
+                $index_children[] = ['url' => '/local-sitemap.xml'];
+            }
+        } catch (\Exception $e) {
+            $results['errors'][] = 'Error generating local sitemap: ' . $e->getMessage();
+            $results['success'] = false;
+        }
+
+        // Build the index last, from the child files actually generated, plus the
+        // sitemaps other plugins own: those serve their own URLs and write no
+        // file here, so they are appended to the index only (#104).
+        if ($index_config !== null) {
+            foreach (self::additional_sitemaps() as $extra) {
+                $index_children[] = ['url' => $extra];
+            }
+
+            try {
+                $index_xml = $this->generate_sitemap_index($index_children, $settings);
+                $filename = basename(wp_parse_url($index_config['url'], PHP_URL_PATH));
+
+                if ($this->save_sitemap_to_file($index_xml, $filename)) {
+                    $results['sitemaps_generated'][] = [
+                        'url'       => $index_config['url'],
+                        'type'      => 'index',
+                        'filename'  => $filename,
+                        'url_count' => count($index_children),
+                    ];
+                } else {
+                    $results['errors'][] = "Failed to save sitemap: {$filename}";
+                    $results['success'] = false;
+                }
+            } catch (\Exception $e) {
+                $results['errors'][] = 'Error generating index sitemap: ' . $e->getMessage();
+                $results['success'] = false;
+            }
+        }
+
+        // Remove segments that are no longer part of the set. Publishing was
+        // purely additive: a type that dropped out (Categories unticked, a CPT
+        // that stopped qualifying) simply stopped being overwritten, so its file
+        // kept serving and — until the index happened to be rebuilt — kept being
+        // listed in it. The index above is built from the children actually
+        // generated, so pruning here leaves disk and index agreeing.
+        $this->prune_orphaned_segments($settings, $results['sitemaps_generated']);
+
+        return $results;
+    }
+
+    /**
+     * Delete published segment files that this run did not write.
+     *
+     * Only filenames this site could have published under its own url pattern
+     * are considered, so another plugin's or core's sitemap in the web root is
+     * never a candidate — the same reason cleanup does not glob 'sitemap-*.xml'.
+     *
+     * @since 1.31.0
+     *
+     * @param array $settings  Sitemap settings (read for `custom_url_pattern`).
+     * @param array $generated Entries from $results['sitemaps_generated'].
+     * @return string[] Basenames removed.
+     */
+    private function prune_orphaned_segments(array $settings, array $generated): array {
+        // Rendering for a request, not publishing: there is nothing on disk
+        // this run owns, and a dynamic render must never delete the files a
+        // site's previous static mode left behind.
+        if ($this->is_collecting()) {
+            return [];
+        }
+
+        $kept = [];
+        foreach ($generated as $entry) {
+            if (!empty($entry['filename'])) {
+                $kept[strtolower((string) $entry['filename'])] = true;
+            }
+        }
+
+        // The current mode's primary and the local business sitemap are written
+        // by their own paths and are never orphans here.
+        $primary = strtolower(basename($this->get_primary_sitemap_filename($settings)));
+        $kept[$primary] = true;
+        $kept['local-sitemap.xml'] = true;
+
+        // The OTHER mode's primary is an orphan the moment the mode changes:
+        // index mode leaves sitemap.xml behind, flat mode leaves
+        // sitemap_index.xml and its children. Both used to be kept
+        // unconditionally, so the site served two sitemap trees and only ever
+        // refreshed one (#563). The children are already covered by the segment
+        // sweep below, which now sees them because the index is no longer kept.
+        $stale_primaries = array_diff(['sitemap.xml', 'sitemap_index.xml'], [$primary]);
+
+        $removed = [];
+
+        global $wp_filesystem;
+        if (!$wp_filesystem) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            WP_Filesystem();
+        }
+        if (!$wp_filesystem) {
+            return $removed;
+        }
+
+        $candidates = array_merge($this->publishable_segment_filenames($settings), $stale_primaries);
+
+        foreach ($candidates as $candidate) {
+            if (isset($kept[strtolower($candidate)])) {
+                continue;
+            }
+
+            if (!preg_match('/^(.*)\.xml$/i', $candidate, $m)) {
+                continue;
+            }
+
+            // The base file plus its numeric pagination pages.
+            $paths = [ABSPATH . $candidate];
+            foreach (glob(ABSPATH . $m[1] . '-*.xml') ?: [] as $paged) {
+                if (preg_match('/^' . preg_quote($m[1], '/') . '-\d+\.xml$/i', basename($paged))) {
+                    $paths[] = $paged;
+                }
+            }
+
+            foreach ($paths as $path) {
+                if (!file_exists($path)) {
+                    continue;
+                }
+                // A name we could have published is not proof we published
+                // this file: RankMath and core write at the same paths (#515).
+                if (!$this->webroot_sitemap_is_ours($path, $settings)) {
+                    continue;
+                }
+                if ($wp_filesystem->delete($path)) {
+                    $removed[] = basename($path);
+                }
+            }
+        }
+
+        return $removed;
+    }
+
+
+    /**
+     * Collect the full (un-paginated) entry list for a content sitemap type.
+     *
+     * @since 1.14.0
+     *
+     * @param string $type     Sitemap config type (posts, pages, categories, …)
+     * @param array  $settings Sitemap settings
+     * @return array{entries: array<string>, image_ns: bool}|null Null for an
+     *         unknown type (caller falls back to a general sitemap).
+     */
+    /**
+     * Write (or remove) the physical local-sitemap.xml file.
+     *
+     * Called from every sitemap regeneration path — segmented generation, the
+     * single-sitemap auto-regeneration, and the manual generate endpoint — so
+     * the local sitemap works regardless of whether the site uses a sitemap
+     * index. When no business identity is configured, any stale file is removed.
+     *
+     * @since 1.15.x
+     * @param array|null $settings Sitemap settings (falls back to saved site settings).
+     * @return bool True when the file was written, false when nothing was written.
+     */
+    public function regenerate_local_sitemap(?array $settings = null): bool {
+        $settings = $settings ?? $this->get_settings('site');
+        $entries  = $this->collect_local_entries();
+
+        if (empty($entries)) {
+            // Business identity was cleared — drop the file we left from
+            // before, but only ours. `local-sitemap.xml` is the name Rank Math
+            // publishes under too (this method mirrors it deliberately), so on
+            // a migrated site the file at that path may never have been ours
+            // to delete (#515).
+            $path = ABSPATH . 'local-sitemap.xml';
+            if (!$this->is_collecting() && file_exists($path) && $this->webroot_sitemap_is_ours($path, $settings)) {
+                wp_delete_file($path);
+            }
+            return false;
+        }
+
+        $xml = $this->wrap_urlset($entries, $settings, false);
+        return $this->save_sitemap_to_file($xml, 'local-sitemap.xml');
+    }
+
+    /**
+     * Build the local business sitemap entries.
+     *
+     * Returns a single URL entry pointing at the on-site page that carries the
+     * business's LocalBusiness/Organization schema (the configured business URL
+     * when it's on this site, otherwise the homepage). Gated — like Rank Math's
+     * `local-sitemap.xml` — on a business (non-person) type being configured
+     * with an actual location (address or geo coordinates). Returns an empty
+     * array when no business location is set, so no empty local sitemap is
+     * written or added to the index.
+     *
+     * @since 1.15.x
+     * @return array Zero or one URL entry
+     */
+    /**
+     * Does this site publish a local business sitemap right now?
+     *
+     * The same gate {@see self::regenerate_local_sitemap()} applies, asked
+     * without writing anything. Callers that need to know whether the document
+     * exists must not test the filesystem: under dynamic delivery it is served
+     * from PHP and there is no file, which is how `local-sitemap.xml` came to be
+     * dropped from robots.txt on exactly those sites (#752).
+     *
+     * @since 2.9.0
+     *
+     * @return bool True when the local sitemap has content to publish.
+     */
+    public function publishes_local_sitemap(): bool {
+        return !empty($this->collect_local_entries());
+    }
+
+    private function collect_local_entries(): array {
+        if (!class_exists('ThinkRank\\SEO\\Site_Identity_Manager')) {
+            require_once THINKRANK_PLUGIN_DIR . 'includes/seo/class-site-identity-manager.php';
+        }
+
+        $identity = (new \ThinkRank\SEO\Site_Identity_Manager())->get_settings('site');
+
+        // Gate like Rank Math's local sitemap: a business (non-person) identity
+        // is configured. We only emit a single URL (the location page), so a
+        // full postal address is NOT required — requiring one wrongly excluded
+        // migrated sites, since the Rank Math importer carries over business
+        // type/name/phone but not the address. Personal sites, and sites with no
+        // business identity at all, get no local sitemap.
+        $business_type = strtolower((string) ($identity['business_type'] ?? ''));
+        if ($business_type === 'person') {
+            return [];
+        }
+        if ($business_type === '' && empty($identity['business_name'])) {
+            return [];
+        }
+
+        // Prefer the configured business URL when it points at this site;
+        // otherwise fall back to the homepage (which outputs the schema).
+        $location_url = home_url('/');
+        if (!empty($identity['business_url'])) {
+            $candidate = esc_url_raw((string) $identity['business_url']);
+            if ($candidate && wp_parse_url($candidate, PHP_URL_HOST) === wp_parse_url(home_url(), PHP_URL_HOST)) {
+                $location_url = $candidate;
+            }
+        }
+
+        // Omit lastmod — no real modification source for the local business URL.
+        return [$this->generate_url_entry($location_url, '', 0.8, 'weekly')];
+    }
+
+    /**
+     * Resolve a streaming entry source for a sitemap type.
+     *
+     * Returns an iterable that yields the type's <url> entries one at a time
+     * (so the paginator never materializes the whole type), the image-namespace
+     * flag, or null when the type isn't one we build (caller falls back to a
+     * single general sitemap). Entry order matches the previous array-based
+     * collect_type_entries() exactly.
+     *
+     * @param string $type     Sitemap type.
+     * @param array  $settings Sitemap settings.
+     * @return array{entries: iterable<string>, image_ns: bool}|null
+     */
+    private function stream_type_entries(string $type, array $settings): ?array {
+        switch ($type) {
+            case 'posts':
+                return ['entries' => $this->collect_post_entries_iter(['post'], $settings), 'image_ns' => true];
+
+            case 'pages':
+                // The homepage lives in the pages sitemap (parity with prior
+                // output) and is emitted first; collect_post_entries_iter()
+                // already excludes the static front page, so there's no duplicate.
+                $entries = (function () use ($settings) {
+                    yield $this->generate_url_entry(home_url('/'), $this->get_homepage_lastmod(), 1.0, 'daily');
+                    yield from $this->collect_post_entries_iter(['page'], $settings);
+                })();
+                return ['entries' => $entries, 'image_ns' => true];
+
+            case 'categories':
+                return ['entries' => $this->collect_taxonomy_entries_iter('category', $settings), 'image_ns' => false];
+
+            case 'tags':
+                return ['entries' => $this->collect_taxonomy_entries_iter('post_tag', $settings), 'image_ns' => false];
+
+            case 'products':
+                $entries = post_type_exists('product') ? $this->collect_post_entries_iter(['product'], $settings) : [];
+                return ['entries' => $entries, 'image_ns' => true];
+
+            default:
+                // Resolve a preset's display name to the object it streams, so
+                // 'product_categories' is an ordinary taxonomy child rather than
+                // a case of its own (#690).
+                $alias  = self::CHILD_TYPE_ALIASES[$type] ?? null;
+                $object = $alias ?? $type;
+
+                $custom_post_types = get_post_types(['public' => true, '_builtin' => false], 'names');
+                if (in_array($object, $custom_post_types, true)) {
+                    return ['entries' => $this->collect_post_entries_iter([$object], $settings), 'image_ns' => true];
+                }
+
+                // Custom taxonomies reach index mode here, streamed through the
+                // same iterator flat mode uses so the two modes emit identical
+                // URLs for the same settings.
+                if (taxonomy_exists($object) && $this->should_include_taxonomy($object)) {
+                    return ['entries' => $this->collect_taxonomy_entries_iter($object, $settings), 'image_ns' => false];
+                }
+
+                // An aliased child whose object is gone (WooCommerce deactivated)
+                // keeps writing the empty file it always wrote. Returning null
+                // here would hand it the whole-site fallback instead, dumping
+                // every URL on the site into a file named for products.
+                //
+                // A registered taxonomy this generator will not emit
+                // (`post_format`, `nav_menu`, a non-public one) needs the same
+                // answer for the same reason. generate_multiple_sitemaps()
+                // skips those before they reach here, so nothing takes this
+                // path today — but it is the one branch where falling through
+                // to null is silently catastrophic rather than merely wrong,
+                // and the guard keeping it unreachable lives in another method.
+                if ($alias !== null || taxonomy_exists($object)) {
+                    return ['entries' => [], 'image_ns' => false];
+                }
+
+                return null;
+        }
+    }
+
+    /**
+     * Write one sitemap page file and record it in the results + index child list.
+     *
+     * @since 1.14.0
+     *
+     * @param string $url             Sitemap page URL
+     * @param string $xml             Sitemap XML
+     * @param string $type            Sitemap type (for reporting)
+     * @param int    $url_count       Number of URLs in this page
+     * @param array  $results         Results accumulator (by reference)
+     * @param array  $index_children  Index child list (by reference)
+     * @return void
+     */
+    private function write_sitemap_page(string $url, string $xml, string $type, int $url_count, array &$results, array &$index_children): void {
+        $filename = basename(wp_parse_url($url, PHP_URL_PATH));
+
+        if ($this->save_sitemap_to_file($xml, $filename)) {
+            $results['sitemaps_generated'][] = [
+                'url'       => $url,
+                'type'      => $type,
+                'filename'  => $filename,
+                'url_count' => $url_count,
+            ];
+            $results['total_urls'] += $url_count;
+            $index_children[] = ['url' => $url];
+        } else {
+            $results['errors'][] = "Failed to save sitemap: {$filename}";
+            $results['success'] = false;
+        }
+    }
+
+    /**
+     * Delete pagination files left over when a type shrinks to fewer pages.
+     *
+     * For a base URL like /sitemap-posts.xml, removes sitemap-posts-N.xml files
+     * whose page number N exceeds the current page count. Page 1 (the base file,
+     * which has no -N suffix) is never touched.
+     *
+     * @since 1.14.0
+     *
+     * @since 2.1.1 Each candidate must pass the content ownership test — a
+     *              `-N.xml` page of another plugin's sitemap paginates our
+     *              stem exactly as ours does (#515).
+     *
+     * @param string $base_url      Base (page 1) sitemap URL
+     * @param int    $current_pages Number of pages generated this run
+     * @param array  $settings      Sitemap settings, for the ownership test.
+     * @return void
+     */
+    private function cleanup_stale_pages(string $base_url, int $current_pages, array $settings): void {
+        // See prune_orphaned_segments(): a dynamic render deletes nothing.
+        if ($this->is_collecting()) {
+            return;
+        }
+
+        $filename = basename(wp_parse_url($base_url, PHP_URL_PATH));
+        if (!preg_match('/^(.*)\.xml$/i', $filename, $m)) {
+            return;
+        }
+        $stem = $m[1];
+
+        global $wp_filesystem;
+        if (!$wp_filesystem) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            WP_Filesystem();
+        }
+        if (!$wp_filesystem) {
+            return;
+        }
+
+        $candidates = glob(ABSPATH . $stem . '-*.xml') ?: [];
+        foreach ($candidates as $path) {
+            // Only delete numeric-suffixed pages beyond the current count.
+            if (preg_match('/-(\d+)\.xml$/', basename($path), $mm)
+                && (int) $mm[1] > $current_pages
+                && $this->webroot_sitemap_is_ours($path, $settings)) {
+                $wp_filesystem->delete($path);
+            }
+        }
+    }
+
+    /**
+     * Sitemap URLs contributed by other plugins.
+     *
+     * ThinkRank owns the sitemap index and the robots.txt `Sitemap:` lines, so a
+     * companion plugin that serves its own sitemap — Pro's news and video
+     * sitemaps, for instance — had no way to be discovered: it appeared in
+     * neither, leaving manual Search Console submission as the only route in
+     * (#104). Registering here puts a sitemap in the index when one exists, and
+     * in robots.txt when it does not.
+     *
+     * Callers get root-relative paths. Entries are normalised to a leading
+     * slash, de-duplicated, and anything that is not a non-empty string is
+     * dropped, so one badly-behaved callback cannot produce a malformed index.
+     *
+     * @since 2.3.1
+     *
+     * @return string[] Root-relative sitemap paths, e.g. ['/news-sitemap.xml'].
+     */
+    public static function additional_sitemaps(): array {
+        /**
+         * Filters the sitemaps contributed by other plugins.
+         *
+         * @since 2.3.1
+         *
+         * @param string[] $sitemaps Root-relative sitemap paths.
+         */
+        $sitemaps = apply_filters('thinkrank_additional_sitemaps', []);
+
+        if (!is_array($sitemaps)) {
+            return [];
+        }
+
+        // Both consumers resolve an entry with home_url(), which prefixes the
+        // install's own directory. Everything below is measured against that so
+        // an absolute URL is reduced to what home_url() will put back.
+        $home      = wp_parse_url(home_url('/'));
+        $home_host = strtolower((string) ($home['host'] ?? ''));
+        $home_path = '/' . trim((string) ($home['path'] ?? ''), '/');
+
+        $clean = [];
+        foreach ($sitemaps as $sitemap) {
+            if (!is_string($sitemap)) {
+                continue;
+            }
+
+            $sitemap = trim($sitemap);
+            if ('' === $sitemap) {
+                continue;
+            }
+
+            // A full URL on this site is accepted and reduced to the part
+            // home_url() does not already supply, so a caller that reached for
+            // home_url() still lands in the right place — including on a
+            // subdirectory install, where keeping the whole path would repeat
+            // the directory. A URL on another host is dropped rather than
+            // rewritten: the sitemaps protocol will not accept a cross-host
+            // child anyway, and reusing its path would advertise a URL on this
+            // site that does not exist.
+            if (preg_match('#^(https?:)?//#i', $sitemap)) {
+                $parts = wp_parse_url('//' === substr($sitemap, 0, 2) ? 'https:' . $sitemap : $sitemap);
+                if (!is_array($parts)) {
+                    continue;
+                }
+
+                if (strtolower((string) ($parts['host'] ?? '')) !== $home_host) {
+                    continue;
+                }
+
+                $path = (string) ($parts['path'] ?? '');
+                if ('' === $path) {
+                    continue;
+                }
+
+                if ('/' !== $home_path && ($path === $home_path || 0 === strpos($path, $home_path . '/'))) {
+                    $path = substr($path, strlen($home_path));
+                }
+
+                // A sitemap served from a query string keeps it; dropping the
+                // query would point at a different document.
+                $query   = (string) ($parts['query'] ?? '');
+                $sitemap = $path . ('' !== $query ? '?' . $query : '');
+            }
+
+            $clean[] = '/' . ltrim($sitemap, '/');
+        }
+
+        return array_values(array_unique($clean));
+    }
+
+    /**
+     * Generate sitemap index XML from the list of child sitemap files produced
+     * during generation (each already resolved to its final, possibly paginated,
+     * URL).
+     *
+     * @since 1.0.0 (signature updated 1.14.0)
+     * @param array $children Array of ['url' => string] child sitemap entries
+     * @param array $settings Sitemap settings
+     * @return string Sitemap index XML
+     */
+    private function generate_sitemap_index(array $children, array $settings): string {
+        $xml = $this->xml_prolog($settings, 'index');
+        $xml .= '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+
+        $site_url = home_url();
+
+        foreach ($children as $child) {
+            $sitemap_url = $child['url'] ?? '';
+            if ($sitemap_url === '') {
+                continue;
+            }
+            if (!str_starts_with($sitemap_url, 'http')) {
+                $sitemap_url = $site_url . $sitemap_url;
+            }
+
+            $xml .= "  <sitemap>\n";
+            $xml .= "    <loc>" . esc_url(Url_Scheme::apply($sitemap_url)) . "</loc>\n";
+            $xml .= "    <lastmod>" . gmdate('c') . "</lastmod>\n";
+            $xml .= "  </sitemap>\n";
+        }
+
+        $xml .= '</sitemapindex>';
+
+        return $xml;
+    }
+
+    /**
+     * Count URLs in sitemap XML content
+     *
+     * @since 1.0.0
+     * @param string $sitemap_xml Sitemap XML content
+     * @return int Number of URLs
+     */
+    private function count_urls_in_xml(string $sitemap_xml): int {
+        return substr_count($sitemap_xml, '<url>');
+    }
+
+    /**
+     * Validate and sanitize exclude posts input
+     *
+     * @since 1.0.0
+     * @param string $exclude_posts Comma-separated post IDs
+     * @return array Validated post IDs
+     * @throws InvalidArgumentException If validation fails
+     */
+    private function validate_exclude_posts(string $exclude_posts): array {
+        if (empty($exclude_posts)) {
+            return [];
+        }
+
+        // Limit input length to prevent DoS
+        if (strlen($exclude_posts) > 1000) {
+            throw new InvalidArgumentException('Exclude posts list too long (max 1000 characters)');
+        }
+
+        // Validate comma-separated integers only
+        if (!preg_match('/^[\d,\s]+$/', $exclude_posts)) {
+            throw new InvalidArgumentException('Exclude posts must contain only numbers and commas');
+        }
+
+        $ids = array_map('intval', array_filter(explode(',', $exclude_posts)));
+
+        // Limit number of exclusions to prevent performance issues
+        if (count($ids) > 100) {
+            throw new InvalidArgumentException('Too many posts to exclude (max 100)');
+        }
+
+        return array_filter($ids, function($id) {
+            return $id > 0; // Only positive integers
+        });
+    }
+
+    /**
+     * Validate and sanitize exclude terms input
+     *
+     * @since 1.0.0
+     * @param string $exclude_terms Comma-separated term IDs
+     * @return array Validated term IDs
+     * @throws InvalidArgumentException If validation fails
+     */
+    private function validate_exclude_terms(string $exclude_terms): array {
+        if (empty($exclude_terms)) {
+            return [];
+        }
+
+        // Limit input length to prevent DoS
+        if (strlen($exclude_terms) > 1000) {
+            throw new InvalidArgumentException('Exclude terms list too long (max 1000 characters)');
+        }
+
+        // Validate comma-separated integers only
+        if (!preg_match('/^[\d,\s]+$/', $exclude_terms)) {
+            throw new InvalidArgumentException('Exclude terms must contain only numbers and commas');
+        }
+
+        $ids = array_map('intval', array_filter(explode(',', $exclude_terms)));
+
+        // Limit number of exclusions to prevent performance issues
+        if (count($ids) > 100) {
+            throw new InvalidArgumentException('Too many terms to exclude (max 100)');
+        }
+
+        return array_filter($ids, function($id) {
+            return $id > 0; // Only positive integers
+        });
+    }
+
+    /**
+     * Validate and sanitize custom URL pattern
+     *
+     * @since 1.0.0
+     * @param string $pattern Custom URL pattern
+     * @return string Validated and sanitized pattern
+     * @throws InvalidArgumentException If validation fails
+     */
+    private function validate_custom_url_pattern(string $pattern): string {
+        if (empty($pattern)) {
+            return 'sitemap-{type}.xml';
+        }
+
+        // Remove any HTML/script tags to prevent XSS
+        $pattern = wp_strip_all_tags($pattern);
+
+        // Limit pattern length
+        if (strlen($pattern) > 100) {
+            throw new InvalidArgumentException('URL pattern too long (max 100 characters)');
+        }
+
+        // Validate pattern format - only allow safe characters
+        if (!preg_match('/^[a-zA-Z0-9\-_{}\.]+$/', $pattern)) {
+            throw new InvalidArgumentException('URL pattern contains invalid characters. Only letters, numbers, hyphens, underscores, dots, and {type} are allowed');
+        }
+
+        // Ensure it contains {type} placeholder
+        if (strpos($pattern, '{type}') === false) {
+            throw new InvalidArgumentException('URL pattern must contain {type} placeholder');
+        }
+
+        // Ensure it ends with .xml
+        if (!str_ends_with($pattern, '.xml')) {
+            $pattern .= '.xml';
+        }
+
+        return sanitize_file_name($pattern);
+    }
+
+    /**
+     * Validate sitemap URL
+     *
+     * @since 1.0.0
+     * @param string $url Sitemap URL
+     * @return string Validated and sanitized URL
+     * @throws InvalidArgumentException If validation fails
+     */
+    private function validate_sitemap_url(string $url): string {
+        if (empty($url)) {
+            throw new InvalidArgumentException('Sitemap URL cannot be empty');
+        }
+
+        // Remove leading/trailing whitespace
+        $url = trim($url);
+
+        // Limit URL length
+        if (strlen($url) > 200) {
+            throw new InvalidArgumentException('Sitemap URL too long (max 200 characters)');
+        }
+
+        // Ensure it starts with /
+        if (!str_starts_with($url, '/')) {
+            $url = '/' . $url;
+        }
+
+        // Validate URL path format
+        if (!preg_match('/^\/[a-zA-Z0-9\-_\/\.]+\.xml$/', $url)) {
+            throw new InvalidArgumentException('Invalid sitemap URL format. Must be a valid path ending with .xml');
+        }
+
+        // Prevent directory traversal
+        if (strpos($url, '..') !== false) {
+            throw new InvalidArgumentException('Directory traversal not allowed in sitemap URL');
+        }
+
+        // Prevent multiple slashes
+        $url = preg_replace('/\/+/', '/', $url);
+
+        return sanitize_url($url);
+    }
+
+    /**
+     * Validate links per sitemap setting
+     *
+     * @since 1.0.0
+     * @param mixed $links_per_sitemap Links per sitemap value
+     * @return int Validated links per sitemap
+     * @throws InvalidArgumentException If validation fails
+     */
+    private function validate_links_per_sitemap($links_per_sitemap): int {
+        $links = intval($links_per_sitemap);
+
+        if ($links < 1) {
+            throw new InvalidArgumentException('Links per sitemap must be at least 1');
+        }
+
+        if ($links > 50000) {
+            throw new InvalidArgumentException('Links per sitemap cannot exceed 50,000');
+        }
+
+        return $links;
+    }
+
+    /**
+     * Validate sitemap filename for security
+     *
+     * @since 1.0.0
+     * @param string $filename Filename to validate
+     * @return string Validated and sanitized filename
+     * @throws InvalidArgumentException If validation fails
+     */
+    private function validate_sitemap_filename(string $filename): string {
+        if (empty($filename)) {
+            return 'sitemap.xml';
+        }
+
+        // Remove any path components to prevent directory traversal
+        $filename = basename($filename);
+
+        // Limit filename length
+        if (strlen($filename) > 100) {
+            throw new InvalidArgumentException('Filename too long (max 100 characters)');
+        }
+
+        // Validate filename format - only allow safe characters
+        if (!preg_match('/^[a-zA-Z0-9\-_\.]+$/', $filename)) {
+            throw new InvalidArgumentException('Filename contains invalid characters. Only letters, numbers, hyphens, underscores, and dots are allowed');
+        }
+
+        // Prevent directory traversal attempts
+        if (strpos($filename, '..') !== false) {
+            throw new InvalidArgumentException('Directory traversal not allowed in filename');
+        }
+
+        // Ensure it ends with .xml
+        if (!str_ends_with($filename, '.xml')) {
+            $filename .= '.xml';
+        }
+
+        // Additional sanitization
+        $filename = sanitize_file_name($filename);
+
+        // Final security check - ensure it's still a valid XML filename
+        if (!preg_match('/^[a-zA-Z0-9\-_]+\.xml$/', $filename)) {
+            throw new InvalidArgumentException('Invalid XML filename after sanitization');
+        }
+
+        return $filename;
+    }
+}

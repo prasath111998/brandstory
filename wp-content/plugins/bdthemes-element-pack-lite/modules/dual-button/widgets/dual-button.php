@@ -1,0 +1,1612 @@
+<?php
+namespace ElementPack\Modules\DualButton\Widgets;
+
+use ElementPack\Base\Module_Base;
+use Elementor\Controls_Manager;
+use Elementor\Group_Control_Border;
+use Elementor\Group_Control_Background;
+use Elementor\Group_Control_Typography;
+use Elementor\Group_Control_Box_Shadow;
+
+use Elementor\Icons_Manager;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // Exit if accessed directly.
+}
+
+class DualButton extends Module_Base {
+	public function get_name() {
+		return 'bdt-dual-button';
+	}
+
+	public function get_title() {
+		return BDTEP . __( 'Dual Button', 'bdthemes-element-pack-lite' );
+	}
+
+	public function get_icon() {
+		return 'bdt-wi-dual-button';
+	}
+
+	public function get_categories() {
+		return [ 'element-pack' ];
+	}
+
+	public function get_keywords() {
+		return [ 'dual', 'button', 'link', 'double' ];
+	}
+
+	public function get_style_depends() {
+        if ($this->ep_is_edit_mode()) {
+            return ['ep-styles'];
+        } else {
+            return [ 'ep-dual-button' ];
+        }
+    }
+
+	public function get_script_depends() {
+		if ( $this->ep_is_edit_mode() ) {
+			return [ 'ep-scripts' ];
+		} else {
+			return [ 'ep-dual-button' ];
+		}
+	}
+
+	public function get_custom_help_url() {
+		return 'https://youtu.be/7hWWqHEr6s8';
+	}
+
+	public function has_widget_inner_wrapper(): bool {
+        return ! \Elementor\Plugin::$instance->experiments->is_feature_active( 'e_optimized_markup' );
+    }
+	protected function is_dynamic_content(): bool {
+		return false;
+	}
+
+	protected function register_controls() {
+		$this->start_controls_section(
+			'section_content_button',
+			[
+				'label' => __( 'Button', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'dual_button_size',
+			[
+				'label'   => __( 'Button Size', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'md',
+				'options' => [
+					'xs' => __( 'Extra Small', 'bdthemes-element-pack-lite' ),
+					'sm' => __( 'Small', 'bdthemes-element-pack-lite' ),
+					'md' => __( 'Medium', 'bdthemes-element-pack-lite' ),
+					'lg' => __( 'Large', 'bdthemes-element-pack-lite' ),
+					'xl' => __( 'Extra Large', 'bdthemes-element-pack-lite' ),
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'align',
+			[
+				'label' => __( 'Alignment', 'bdthemes-element-pack-lite' ),
+				'type' => Controls_Manager::CHOOSE,
+				'options' => [
+					'start' => [
+						'title' => __( 'Start', 'bdthemes-element-pack-lite' ),
+						'icon' => 'eicon-text-align-left',
+					],
+					'center' => [
+						'title' => __( 'Center', 'bdthemes-element-pack-lite' ),
+						'icon' => 'eicon-text-align-center',
+					],
+					'end' => [
+						'title' => __( 'End', 'bdthemes-element-pack-lite' ),
+						'icon' => 'eicon-text-align-right',
+					],
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-element-align-wrapper' => 'justify-content: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_width_auto',
+			[
+				'label' => __( 'Button Width Auto', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SWITCHER,
+				'prefix_class' => 'bdt-dual-button-width-',
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_width',
+			[
+				'label' => __( 'Button Width', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SLIDER,
+				'range' => [
+					'%' => [
+						'max' => 100,
+						'min' => 20,
+					],
+					'px' => [
+						'max' => 1200,
+						'min' => 300,
+					],
+				],
+				'size_units' => ['%', 'px'],
+				'default' => [
+					'size' => 40,
+					'unit' => '%',
+				],
+				'tablet_default' => [
+					'size' => 80,
+					'unit' => '%',
+				],
+				'mobile_default' => [
+					'size' => 100,
+					'unit' => '%',
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-dual-button'  => 'width: {{SIZE}}{{UNIT}};',
+				],
+				'condition' => [
+					'button_width_auto' => '',
+				],
+			]
+		);
+
+		$this->add_control(
+			'show_middle_text',
+			[
+				'label' => __( 'Middle Text', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SWITCHER,
+			]
+		);
+
+		$this->add_control(
+			'middle_text',
+			[
+				'label'       => __( 'Text', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::TEXT,
+				'dynamic'     => [ 'active' => true ],
+				'default'     => __( 'or', 'bdthemes-element-pack-lite' ),
+				'placeholder' => __( 'or', 'bdthemes-element-pack-lite' ),
+				'condition'   => [
+					'show_middle_text' => 'yes',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'dual_button_gap',
+			[
+				'label'   => __( 'Button Gap', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SLIDER,
+				'default' => [
+					'size' => 5,
+				],
+				'range' => [
+					'px' => [
+						'min' => 0,
+						'max' => 50,
+					],
+				],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-btn-a' => 'margin-inline-end: {{SIZE}}px;',
+				],
+				'condition' => [
+					'show_middle_text!' => 'yes',
+				],
+			]
+		);
+
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_content_button_a',
+			[
+				'label' => __( 'Button A', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_a_text',
+			[
+				'label'       => __( 'Text', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::TEXT,
+				'dynamic'     => [ 'active' => true ],
+				'default'     => __( 'Click Me', 'bdthemes-element-pack-lite' ),
+				'placeholder' => __( 'Click Me', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_a_link',
+			[
+				'label'       => __( 'Link', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::URL,
+				'dynamic'     => [ 'active' => true ],
+				'placeholder' => __( 'https://your-link.com', 'bdthemes-element-pack-lite' ),
+				'default'     => [
+					'url' => '#',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_a_onclick',
+			[
+				'label' => esc_html__( 'OnClick', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SWITCHER,
+			]
+		);
+
+		$this->add_control(
+			'button_a_onclick_event',
+			[
+				'label'       => __( 'OnClick Event', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::TEXT,
+				'dynamic' => [ 'active' => true ],
+				'placeholder' => 'myFunction()',
+/* translators: %s: URL to the onclick event documentation */
+				'description' => sprintf( __( 'For details please look <a href="%s" target="_blank">here</a>', 'bdthemes-element-pack-lite' ), 'https://www.w3schools.com/jsref/event_onclick.asp' ),
+				'condition' => [
+					'button_a_onclick' => 'yes'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_a_align',
+			[
+				'label'   => esc_html__( 'Alignment', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::CHOOSE,
+				'options' => [
+					'left' => [
+						'title' => esc_html__( 'Left', 'bdthemes-element-pack-lite' ),
+						'icon'  => 'eicon-text-align-left',
+					],
+					'center' => [
+						'title' => esc_html__( 'Center', 'bdthemes-element-pack-lite' ),
+						'icon'  => 'eicon-text-align-center',
+					],
+					'right' => [
+						'title' => esc_html__( 'Right', 'bdthemes-element-pack-lite' ),
+						'icon'  => 'eicon-text-align-right',
+					],
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-a, {{WRAPPER}} .bdt-btn-a .bdt-btn-icon' => 'justify-content: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_a_select_icon',
+			[
+				'label'       => __( 'Icon', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::ICONS,
+				'fa4compatibility' => 'button_a_icon',
+				'label_block' => false,
+				'skin' => 'inline'
+			]
+		);
+
+		$this->add_control(
+			'button_a_icon_align',
+			[
+				'label'   => __( 'Icon Position', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'right',
+				'options' => [
+					'left'   => __( 'Left', 'bdthemes-element-pack-lite' ),
+					'right'  => __( 'Right', 'bdthemes-element-pack-lite' ),
+					'top'    => __( 'Top', 'bdthemes-element-pack-lite' ),
+					'bottom' => __( 'Bottom', 'bdthemes-element-pack-lite' ),
+				],
+				'condition' => [
+					'button_a_select_icon[value]!' => '',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_a_icon_indent',
+			[
+				'label' => __( 'Icon Spacing', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SLIDER,
+				'range' => [
+					'px' => [
+						'max' => 100,
+					],
+				],
+					'default' => [
+						'size' => 8,
+					],
+				'condition' => [
+					'button_a_select_icon[value]!' => '',
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a .bdt-flex-align-right'  => is_rtl() ? 'margin-right: {{SIZE}}{{UNIT}};' : 'margin-left: {{SIZE}}{{UNIT}};',
+					'{{WRAPPER}} .bdt-btn-a .bdt-flex-align-left'   => is_rtl() ? 'margin-left: {{SIZE}}{{UNIT}};' : 'margin-right: {{SIZE}}{{UNIT}};',
+					'{{WRAPPER}} .bdt-btn-a .bdt-flex-align-top'    => 'margin-bottom: {{SIZE}}{{UNIT}};',
+					'{{WRAPPER}} .bdt-btn-a .bdt-flex-align-bottom' => 'margin-top: {{SIZE}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_css_id_a',
+			[
+				'label' => __( 'Button ID', 'bdthemes-element-pack-lite' ),
+				'type' => Controls_Manager::TEXT,
+				'dynamic' => [
+					'active' => true,
+				],
+				'default' => '',
+				'title' => __( 'Add your custom id WITHOUT the Pound key. e.g: my-id', 'bdthemes-element-pack-lite' ),
+				'description' => __( 'Please make sure the ID is unique and not used elsewhere on the page this form is displayed. This field allows <code>A-z 0-9</code> & underscore chars without spaces.', 'bdthemes-element-pack-lite' ),
+				'separator' => 'before',
+			]
+		);
+
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_content_button_b',
+			[
+				'label' => __( 'Button B', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_b_text',
+			[
+				'label'       => __( 'Text', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::TEXT,
+				'dynamic'     => [ 'active' => true ],
+				'default'     => __( 'Read More', 'bdthemes-element-pack-lite' ),
+				'placeholder' => __( 'Read More', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_b_link',
+			[
+				'label'       => __( 'Link', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::URL,
+				'dynamic'     => [ 'active' => true ],
+				'placeholder' => __( 'https://your-link.com', 'bdthemes-element-pack-lite' ),
+				'default'     => [
+					'url' => '#',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_b_size',
+			[
+				'label'   => __( 'Button Size', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'md',
+				'options' => [
+					'xs' => __( 'Extra Small', 'bdthemes-element-pack-lite' ),
+					'sm' => __( 'Small', 'bdthemes-element-pack-lite' ),
+					'md' => __( 'Medium', 'bdthemes-element-pack-lite' ),
+					'lg' => __( 'Large', 'bdthemes-element-pack-lite' ),
+					'xl' => __( 'Extra Large', 'bdthemes-element-pack-lite' ),
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_b_onclick',
+			[
+				'label' => esc_html__( 'OnClick', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SWITCHER,
+			]
+		);
+
+		$this->add_control(
+			'button_b_onclick_event',
+			[
+				'label'       => __( 'OnClick Event', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::TEXT,
+				'dynamic' => [ 'active' => true ],
+				'placeholder' => 'myFunction()',
+/* translators: %s: URL to the onclick event documentation */
+				'description' => sprintf( __('For details please look <a href="%s" target="_blank">here</a>', 'bdthemes-element-pack-lite' ), 'https://www.w3schools.com/jsref/event_onclick.asp' ),
+				'condition' => [
+					'button_b_onclick' => 'yes'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_b_align',
+			[
+				'label'   => esc_html__( 'Alignment', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::CHOOSE,
+				'options' => [
+					'left' => [
+						'title' => esc_html__( 'Left', 'bdthemes-element-pack-lite' ),
+						'icon'  => 'eicon-text-align-left',
+					],
+					'center' => [
+						'title' => esc_html__( 'Center', 'bdthemes-element-pack-lite' ),
+						'icon'  => 'eicon-text-align-center',
+					],
+					'right' => [
+						'title' => esc_html__( 'Right', 'bdthemes-element-pack-lite' ),
+						'icon'  => 'eicon-text-align-right',
+					],
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-b, {{WRAPPER}} .bdt-btn-b .bdt-btn-icon' => 'justify-content: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_b_select_icon',
+			[
+				'label'       => __( 'Icon', 'bdthemes-element-pack-lite' ),
+				'type'        => Controls_Manager::ICONS,
+				'fa4compatibility' => 'button_b_icon',
+				'label_block' => false,
+				'skin' => 'inline'
+			]
+		);
+
+		$this->add_control(
+			'button_b_icon_align',
+			[
+				'label'   => __( 'Icon Position', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'right',
+				'options' => [
+					'left'   => __( 'Left', 'bdthemes-element-pack-lite' ),
+					'right'  => __( 'Right', 'bdthemes-element-pack-lite' ),
+					'top'    => __( 'Top', 'bdthemes-element-pack-lite' ),
+					'bottom' => __( 'Bottom', 'bdthemes-element-pack-lite' ),
+				],
+				'condition' => [
+					'button_b_select_icon[value]!' => '',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_b_icon_indent',
+			[
+				'label' => __( 'Icon Spacing', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SLIDER,
+				'range' => [
+					'px' => [
+						'max' => 100,
+					],
+				],
+					'default' => [
+						'size' => 8,
+					],
+				'condition' => [
+					'button_b_select_icon[value]!' => '',
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b .bdt-flex-align-right'  => is_rtl() ? 'margin-right: {{SIZE}}{{UNIT}};' : 'margin-left: {{SIZE}}{{UNIT}};',
+					'{{WRAPPER}} .bdt-btn-b .bdt-flex-align-left'   => is_rtl() ? 'margin-left: {{SIZE}}{{UNIT}};' : 'margin-right: {{SIZE}}{{UNIT}};',
+					'{{WRAPPER}} .bdt-btn-b .bdt-flex-align-top'    => 'margin-bottom: {{SIZE}}{{UNIT}};',
+					'{{WRAPPER}} .bdt-btn-b .bdt-flex-align-bottom' => 'margin-top: {{SIZE}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'button_css_id_b',
+			[
+				'label' => __( 'Button ID', 'bdthemes-element-pack-lite' ),
+				'type' => Controls_Manager::TEXT,
+				'dynamic' => [
+					'active' => true,
+				],
+				'default' => '',
+				'title' => __( 'Add your custom id WITHOUT the Pound key. e.g: my-id', 'bdthemes-element-pack-lite' ),
+				'description' => __( 'Please make sure the ID is unique and not used elsewhere on the page this form is displayed. This field allows <code>A-z 0-9</code> & underscore chars without spaces.', 'bdthemes-element-pack-lite' ),
+				'separator' => 'before',
+			]
+		);
+
+		$this->end_controls_section();
+
+		//Style
+		$this->start_controls_section(
+			'section_content_style',
+			[
+				'label' => __( 'Button', 'bdthemes-element-pack-lite' ),
+				'tab'   => Controls_Manager::TAB_STYLE,
+			]
+		);
+
+		$this->start_controls_tabs( 'tabs_dual_button_style' );
+
+		$this->start_controls_tab(
+			'tab_dual_button_normal',
+			[
+				'label' => __( 'Normal', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_border_style',
+			[
+				'label'   => __( 'Border Style', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'none',
+				'options' => [
+					'none'   => __( 'None', 'bdthemes-element-pack-lite' ),
+					'solid'  => __( 'Solid', 'bdthemes-element-pack-lite' ),
+					'dotted' => __( 'Dotted', 'bdthemes-element-pack-lite' ),
+					'dashed' => __( 'Dashed', 'bdthemes-element-pack-lite' ),
+					'groove' => __( 'Groove', 'bdthemes-element-pack-lite' ),
+				],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button a' => 'border-style: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_border_width',
+			[
+				'label'      => __( 'Border Width', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'default'    => [
+					'top'    => 3,
+					'right'  => 3,
+					'bottom' => 3,
+					'left'   => 3,
+				],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button a' => 'border-width: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+				'condition' => [
+					'button_border_style!' => 'none'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'dual_button_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button a' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'dual_button_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button a',
+			]
+		);
+
+		$this->add_responsive_control(
+			'dual_button_padding',
+			[
+				'label'      => __( 'Padding', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', 'em', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button a' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Typography::get_type(),
+			[
+				'name'     => 'dual_button_typography',
+				//'scheme'   => Schemes\Typography::TYPOGRAPHY_4,
+				'selector' => '{{WRAPPER}} .bdt-dual-button a',
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->start_controls_tab(
+			'tab_dual_button_hover',
+			[
+				'label' => __( 'Hover', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_responsive_control(
+			'dual_button_hover_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button a:hover' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'dual_button_hover_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button a:hover',
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->end_controls_tabs();
+
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_content_style_a',
+			[
+				'label' => __( 'Button A', 'bdthemes-element-pack-lite' ),
+				'tab'   => Controls_Manager::TAB_STYLE,
+			]
+		);
+
+		$this->add_control(
+			'button_a_effect',
+			[
+				'label'   => __( 'Effect', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'a',
+				'options' => [
+					'a' => __( 'Effect A', 'bdthemes-element-pack-lite' ),
+					'b' => __( 'Effect B', 'bdthemes-element-pack-lite' ),
+					'c' => __( 'Effect C', 'bdthemes-element-pack-lite' ),
+					'd' => __( 'Effect D', 'bdthemes-element-pack-lite' ),
+					'e' => __( 'Effect E', 'bdthemes-element-pack-lite' ),
+					'f' => __( 'Effect F', 'bdthemes-element-pack-lite' ),
+					'g' => __( 'Effect G', 'bdthemes-element-pack-lite' ),
+					'h' => __( 'Effect H', 'bdthemes-element-pack-lite' ),
+					'i' => __( 'Effect I', 'bdthemes-element-pack-lite' ),
+				],
+			]
+		);
+
+		$this->start_controls_tabs( 'tabs_button_a_style' );
+
+		$this->start_controls_tab(
+			'tab_button_a_normal',
+			[
+				'label' => __( 'Normal', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_a_color',
+			[
+				'label'     => __( 'Text Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_a_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-btn-a, 
+								{{WRAPPER}} .bdt-btn-a.bdt-effect-i .bdt-btn-content-wrap:after,
+								{{WRAPPER}} .bdt-btn-a.bdt-effect-i .bdt-btn-content-wrap:before',
+			]
+		);
+
+		$this->add_control(
+			'button_a_border_color',
+			[
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'default'   => '#666',
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a' => 'border-color: {{VALUE}};',
+				],
+				'condition' => [
+					'button_border_style!' => 'none'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_a_border_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-a' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_a_padding',
+			[
+				'label'      => __( 'Padding', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', 'em', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-a' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'button_a_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button a.bdt-btn-a',
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->start_controls_tab(
+			'tab_button_a_hover',
+			[
+				'label' => __( 'Hover', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_a_hover_color',
+			[
+				'label'     => __( 'Text Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a:hover' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_a_hover_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-btn-a:after, 
+								{{WRAPPER}} .bdt-btn-a:hover,
+								{{WRAPPER}} .bdt-btn-a.bdt-effect-i,
+								{{WRAPPER}} .bdt-btn-a.bdt-effect-h:after',
+			]
+		);
+
+		$this->add_control(
+			'button_a_hover_border_color',
+			[
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a:hover' => 'border-color: {{VALUE}};',
+				],
+				'condition' => [
+					'button_border_style!' => 'none'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_a_hover_border_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-a:hover' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+		
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'button_a_hover_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button a.bdt-btn-a:hover',
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->end_controls_tabs();
+
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_content_style_b',
+			[
+				'label' => __( 'Button B', 'bdthemes-element-pack-lite' ),
+				'tab'   => Controls_Manager::TAB_STYLE,
+			]
+		);
+
+		$this->add_control(
+			'button_b_effect',
+			[
+				'label'   => __( 'Effect', 'bdthemes-element-pack-lite' ),
+				'type'    => Controls_Manager::SELECT,
+				'default' => 'a',
+				'options' => [
+					'a' => __( 'Effect A', 'bdthemes-element-pack-lite' ),
+					'b' => __( 'Effect B', 'bdthemes-element-pack-lite' ),
+					'c' => __( 'Effect C', 'bdthemes-element-pack-lite' ),
+					'd' => __( 'Effect D', 'bdthemes-element-pack-lite' ),
+					'e' => __( 'Effect E', 'bdthemes-element-pack-lite' ),
+					'f' => __( 'Effect F', 'bdthemes-element-pack-lite' ),
+					'g' => __( 'Effect G', 'bdthemes-element-pack-lite' ),
+					'h' => __( 'Effect H', 'bdthemes-element-pack-lite' ),
+					'i' => __( 'Effect I', 'bdthemes-element-pack-lite' ),
+				],
+			]
+		);
+
+		$this->start_controls_tabs( 'tabs_button_b_style' );
+
+		$this->start_controls_tab(
+			'tab_button_b_normal',
+			[
+				'label' => __( 'Normal', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_b_color',
+			[
+				'label'     => __( 'Text Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'     => 'button_b_background',
+				'types'    => [ 'classic', 'gradient' ],
+				'selector' => '{{WRAPPER}} .bdt-btn-b, 
+							   {{WRAPPER}} .bdt-btn-b.bdt-effect-i .bdt-btn-content-wrap:after, 
+							   {{WRAPPER}} .bdt-btn-b.bdt-effect-i .bdt-btn-content-wrap:before',
+			]
+		);
+
+		$this->add_control(
+			'button_b_border_color',
+			[
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'default'   => '#666',
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b' => 'border-color: {{VALUE}};',
+				],
+				'condition' => [
+					'button_border_style!' => 'none'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_b_border_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-b' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_b_padding',
+			[
+				'label'      => __( 'Padding', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', 'em', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-b' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'button_b_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button a.bdt-btn-b',
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->start_controls_tab(
+			'tab_button_b_hover',
+			[
+				'label' => __( 'Hover', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_b_hover_color',
+			[
+				'label'     => __( 'Text Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b:hover' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_b_hover_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-btn-b:after,
+								{{WRAPPER}} .bdt-btn-b:hover, 
+								{{WRAPPER}} .bdt-btn-b.bdt-effect-i,
+								{{WRAPPER}} .bdt-btn-b.bdt-effect-h:after
+								',
+			]
+		);
+
+		$this->add_control(
+			'button_b_hover_border_color',
+			[
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b:hover' => 'border-color: {{VALUE}};',
+				],
+				'condition' => [
+					'button_border_style!' => 'none'
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_b__hover_border_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button .bdt-btn-b:hover' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'button_b_hover_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button a.bdt-btn-b:hover',
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->end_controls_tabs();
+
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_style_button_a_icon',
+			[
+				'label'     => __( 'Button A Icon', 'bdthemes-element-pack-lite' ),
+				'tab'       => Controls_Manager::TAB_STYLE,
+				'condition' => [
+					'button_a_select_icon[value]!' => '',
+				],
+			]
+		);
+
+		$this->start_controls_tabs( 'tabs_button_a_icon_style' );
+
+		$this->start_controls_tab(
+			'tab_button_a_icon_normal',
+			[
+				'label' => __( 'Normal', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_a_icon_color',
+			[
+				'label'     => __( 'Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a .bdt-a-icon' => 'color: {{VALUE}};',
+					'{{WRAPPER}} .bdt-btn-a .bdt-a-icon svg' => 'fill: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_a_icon_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-ep-button .bdt-a-icon .bdt-ep-button-a-icon-inner',
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Border::get_type(),
+			[
+				'name'        => 'button_a_icon_border',
+				'placeholder' => '1px',
+				'default'     => '1px',
+				'selector'    => '{{WRAPPER}} .bdt-ep-button .bdt-a-icon .bdt-ep-button-a-icon-inner',
+			]
+		);
+		$this->add_responsive_control(
+			'button_a_icon_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-ep-button .bdt-a-icon .bdt-ep-button-a-icon-inner' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_a_icon_padding',
+			[
+				'label'      => __( 'Padding', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', 'em', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-ep-button .bdt-a-icon .bdt-ep-button-a-icon-inner' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'button_a_icon_shadow',
+				'selector' => '{{WRAPPER}} .bdt-ep-button .bdt-a-icon .bdt-ep-button-a-icon-inner',
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_a_icon_size',
+			[
+				'label' => __( 'Icon Size', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SLIDER,
+				'range' => [
+					'px' => [
+						'min'  => 10,
+						'max'  => 100,
+					],
+				],				
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-button .bdt-a-icon .bdt-ep-button-a-icon-inner' => 'font-size: {{SIZE}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->start_controls_tab(
+			'tab_button_a_icon_hover',
+			[
+				'label' => __( 'Hover', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_a_icon_hover_color',
+			[
+				'label'     => __( 'Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-a:hover .bdt-a-icon' => 'color: {{VALUE}};',
+					'{{WRAPPER}} .bdt-btn-a:hover .bdt-a-icon svg' => 'fill: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_a_icon_hover_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-ep-button:hover .bdt-a-icon .bdt-ep-button-a-icon-inner',
+				'separator' => 'after',
+			]
+		);
+
+		$this->add_control(
+			'button_a_icon_hover_border_color',
+			[
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'condition' => [
+					'button_a_icon_border_border!' => '',
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-button:hover .bdt-a-icon .bdt-ep-button-a-icon-inner' => 'border-color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->end_controls_tab();
+		$this->end_controls_tabs();
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_style_button_b_icon',
+			[
+				'label'     => __( 'Button B Icon', 'bdthemes-element-pack-lite' ),
+				'tab'       => Controls_Manager::TAB_STYLE,
+				'condition' => [
+					'button_b_select_icon[value]!' => '',
+				],
+			]
+		);
+
+		$this->start_controls_tabs( 'tabs_button_b_icon_style' );
+
+		$this->start_controls_tab(
+			'tab_button_b_icon_normal',
+			[
+				'label' => __( 'Normal', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_b_icon_color',
+			[
+				'label'     => __( 'Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b .bdt-btn-b-icon' => 'color: {{VALUE}};',
+					'{{WRAPPER}} .bdt-btn-b .bdt-btn-b-icon svg' => 'fill: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_b_icon_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-ep-button .bdt-btn-b-icon .bdt-b-icon-inner',
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Border::get_type(),
+			[
+				'name'        => 'button_b_icon_border',
+				'placeholder' => '1px',
+				'default'     => '1px',
+				'selector'    => '{{WRAPPER}} .bdt-ep-button .bdt-btn-b-icon .bdt-b-icon-inner',
+			]
+		);
+		$this->add_responsive_control(
+			'button_b_icon_radius',
+			[
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-ep-button .bdt-btn-b-icon .bdt-b-icon-inner' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_b_icon_padding',
+			[
+				'label'      => __( 'Padding', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', 'em', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-ep-button .bdt-btn-b-icon .bdt-b-icon-inner' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'button_b_icon_shadow',
+				'selector' => '{{WRAPPER}} .bdt-ep-button .bdt-btn-b-icon .bdt-b-icon-inner',
+			]
+		);
+
+		$this->add_responsive_control(
+			'button_b_icon_size',
+			[
+				'label' => __( 'Icon Size', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::SLIDER,
+				'range' => [
+					'px' => [
+						'min'  => 10,
+						'max'  => 100,
+					],
+				],				
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-button .bdt-btn-b-icon .bdt-b-icon-inner' => 'font-size: {{SIZE}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->start_controls_tab(
+			'tab_button_b_icon_hover',
+			[
+				'label' => __( 'Hover', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'button_b_icon_hover_color',
+			[
+				'label'     => __( 'Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-btn-b:hover .bdt-btn-b-icon' => 'color: {{VALUE}};',
+					'{{WRAPPER}} .bdt-btn-b:hover .bdt-btn-b-icon svg' => 'fill: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'      => 'button_b_icon_hover_background',
+				'types'     => [ 'classic', 'gradient' ],
+				'selector'  => '{{WRAPPER}} .bdt-ep-button:hover .bdt-btn-b-icon .bdt-b-icon-inner',
+				'separator' => 'after',
+			]
+		);
+
+		$this->add_control(
+			'button_b_icon_hover_border_color',
+			[
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'condition' => [
+					'button_b_icon_border_border!' => '',
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-ep-button:hover .bdt-btn-b-icon .bdt-b-icon-inner' => 'border-color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->end_controls_tab();
+		$this->end_controls_tabs();
+		$this->end_controls_section();
+
+		$this->start_controls_section(
+			'section_style_middle_text',
+			[
+				'label'      => __( 'Middle Text', 'bdthemes-element-pack-lite' ),
+				'tab'        => Controls_Manager::TAB_STYLE,
+				'conditions' => [
+					'terms' => [
+						[
+							'name'     => 'show_middle_text',
+							'value'    => 'yes',
+						],
+						[
+							'name'     => 'middle_text',
+							'operator' => '!=',
+							'value'    => '',
+						],
+					],
+				],
+			]
+
+		);
+
+		$this->add_control(
+			'middle_text_color',
+			[
+				'label'     => __( 'Text Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [
+					'{{WRAPPER}} .bdt-dual-button span' => 'color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Background::get_type(),
+			[
+				'name'     => 'middle_text_background',
+				'types'    => [ 'classic', 'gradient' ],
+				'selector' => '{{WRAPPER}} .bdt-dual-button span',
+				'separator' => 'after',
+			]
+		);
+
+		$this->add_responsive_control(
+			'middle_text_radius',
+			[
+				'label'      => __( 'Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [
+					'{{WRAPPER}} .bdt-dual-button span' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[
+				'name'     => 'middle_text_shadow',
+				'selector' => '{{WRAPPER}} .bdt-dual-button span',
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Typography::get_type(),
+			[
+				'name'     => 'middle_text_typography',
+				'selector' => '{{WRAPPER}} .bdt-dual-button span',
+			]
+		);
+		
+		$this->add_responsive_control(
+			'middle_text_horizontal_offset',
+			[
+				'label' => __( 'Horizontal Offset', 'bdthemes-element-pack-lite' ) . BDTEP_NC,
+				'type' => Controls_Manager::SLIDER,
+				'size_units' => [ 'px', '%' ],
+				'range' => [
+					'%' => [
+						'min' => 0,
+						'max' => 100,
+					],
+					'px' => [
+						'min' => 0,
+						'max' => 300,
+					],
+				],
+				'selectors' => [
+					'{{WRAPPER}} .bdt-dual-button span' => 'left: {{SIZE}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->end_controls_section();
+	}
+
+	public function render_text_a($settings) {
+
+		$this->add_render_attribute( 'content-wrapper-a', 'class', 'bdt-btn-content-wrap' );
+
+		if ( 'left' == $settings['button_a_icon_align'] or 'right' == $settings['button_a_icon_align'] ) {
+			$this->add_render_attribute( 'content-wrapper-a', 'class', 'bdt-flex bdt-flex-middle' );
+		}
+
+		$this->add_render_attribute( 'content-wrapper-a', 'class', ( 'top' == $settings['button_a_icon_align'] ) ? 'bdt-flex bdt-flex-column' : '' );
+		$this->add_render_attribute( 'content-wrapper-a', 'class', ( 'bottom' == $settings['button_a_icon_align'] ) ? 'bdt-flex bdt-flex-column-reverse' : '' );
+		$this->add_render_attribute( 'content-wrapper-a', 'data-text', esc_html($settings['button_a_text']));
+
+		$this->add_render_attribute( 'button-a-text', 'class', 'bdt-btn-text' );
+
+		if ( ! isset( $settings['button_a_icon'] ) && ! Icons_Manager::is_migration_allowed() ) {
+			// add old default
+			$settings['button_a_icon'] = 'fas fa-arrow-left';
+		}
+
+		$migrated  = isset( $settings['__fa4_migrated']['button_a_select_icon'] );
+		$is_new    = empty( $settings['button_a_icon'] ) && Icons_Manager::is_migration_allowed();
+
+		?>
+		<div <?php $this->print_render_attribute_string( 'content-wrapper-a' ); ?>>
+			<?php if ( ! empty( $settings['button_a_select_icon']['value'] ) ) : ?>
+				<div class="bdt-btn-icon bdt-a-icon bdt-flex-align-<?php echo esc_attr($settings['button_a_icon_align']); ?>">
+					<div class="bdt-ep-button-a-icon-inner">
+					
+					<?php if ( $is_new || $migrated ) :
+						Icons_Manager::render_icon( $settings['button_a_select_icon'], [ 'aria-hidden' => 'true', 'class' => 'fa-fw' ] );
+					else : ?>
+						<i class="<?php echo esc_attr( $settings['button_a_icon'] ); ?>" aria-hidden="true"></i>
+					<?php endif; ?>
+
+					</div>
+				</div>
+			<?php endif; ?>
+			<div <?php $this->print_render_attribute_string( 'button-a-text' ); ?>><?php echo wp_kses( $settings['button_a_text'], element_pack_allow_tags('title') ); ?></div>
+		</div>
+		<?php
+	}
+
+	public function render_text_b($settings) {
+
+		$this->add_render_attribute( 'content-wrapper-b', 'class', 'bdt-btn-content-wrap' );
+
+		if ( 'left' == $settings['button_b_icon_align'] or 'right' == $settings['button_b_icon_align'] ) {
+			$this->add_render_attribute( 'content-wrapper-b', 'class', 'bdt-flex bdt-flex-middle' );
+		}
+
+		$this->add_render_attribute( 'content-wrapper-b', 'class', ( 'top' == $settings['button_b_icon_align'] ) ? 'bdt-flex bdt-flex-column' : '' );
+		$this->add_render_attribute( 'content-wrapper-b', 'class', ( 'bottom' == $settings['button_b_icon_align'] ) ? 'bdt-flex bdt-flex-column-reverse' : '' );
+		$this->add_render_attribute( 'content-wrapper-b', 'data-text', esc_html($settings['button_b_text']));
+
+		$this->add_render_attribute( 'button-b-text', 'class', 'bdt-btn-text' );
+
+		if ( ! isset( $settings['button_b_icon'] ) && ! Icons_Manager::is_migration_allowed() ) {
+			// add old default
+			$settings['button_b_icon'] = 'fas fa-arrow-right';
+		}
+
+		$migrated  = isset( $settings['__fa4_migrated']['button_b_select_icon'] );
+		$is_new    = empty( $settings['button_b_icon'] ) && Icons_Manager::is_migration_allowed();
+
+		?>
+		<div <?php $this->print_render_attribute_string( 'content-wrapper-b' ); ?>>
+			<?php if ( ! empty( $settings['button_b_select_icon']['value'] ) ) : ?>
+				<div class="bdt-btn-icon bdt-btn-b-icon bdt-flex-align-<?php echo esc_attr($settings['button_b_icon_align']); ?>">
+					<div class="bdt-b-icon-inner">
+					
+					<?php if ( $is_new || $migrated ) :
+						Icons_Manager::render_icon( $settings['button_b_select_icon'], [ 'aria-hidden' => 'true', 'class' => 'fa-fw' ] );
+					else : ?>
+						<i class="<?php echo esc_attr( $settings['button_b_icon'] ); ?>" aria-hidden="true"></i>
+					<?php endif; ?>
+
+					</div>
+				</div>
+			<?php endif; ?>
+			<div <?php $this->print_render_attribute_string( 'button-b-text' ); ?>><?php echo wp_kses( $settings['button_b_text'], element_pack_allow_tags('title') ); ?></div>
+		</div>
+		<?php
+	}
+
+	protected function render() {
+		$settings = $this->get_settings_for_display();
+
+		$this->add_render_attribute( 'wrapper', 'class', 'bdt-dual-button bdt-ep-button-wrapper bdt-element' );
+
+		if ( ! empty( $settings['button_a_link']['url'] ) ) {
+			$this->add_link_attributes( 'button_a', $settings['button_a_link'] );
+		}
+
+		if ( ! empty( $settings['button_b_link']['url'] ) ) {
+			$this->add_link_attributes( 'button_b', $settings['button_b_link'] );
+		}
+
+		if ( 'yes' === $settings['button_a_onclick'] ) {
+			$this->add_render_attribute( 'button_a', 'data-onclick', $settings['button_a_onclick_event'] );
+		}
+
+		if ( 'yes' === $settings['button_b_onclick'] ) {
+			$this->add_render_attribute( 'button_b', 'data-onclick', $settings['button_b_onclick_event'] );
+		}
+
+		$this->add_render_attribute( 'button_a', 'class', 'bdt-btn-a bdt-ep-button' );
+		$this->add_render_attribute( 'button_a', 'class', 'bdt-effect-' . esc_attr($settings['button_a_effect']) );
+		$this->add_render_attribute( 'button_a', 'class', 'bdt-ep-button-size-' . esc_attr($settings['dual_button_size']) );
+
+		if ( ! empty( $settings['button_css_id_a'] ) ) {
+			$this->add_render_attribute( 'button_a', 'id', $settings['button_css_id_a'] );
+		}
+
+		$this->add_render_attribute( 'button_b', 'class', 'bdt-btn-b bdt-ep-button' );		
+		$this->add_render_attribute( 'button_b', 'class', 'bdt-effect-' . esc_attr($settings['button_b_effect']) );
+		$this->add_render_attribute( 'button_b', 'class', 'bdt-ep-button-size-' . esc_attr($settings['dual_button_size']) );
+
+		if ( ! empty( $settings['button_css_id_b'] ) ) {
+			$this->add_render_attribute( 'button_b', 'id', $settings['button_css_id_b'] );
+		}
+
+		?>
+		<div class="bdt-element-align-wrapper bdt-flex">
+			<div <?php $this->print_render_attribute_string( 'wrapper' ); ?>>
+				<a <?php $this->print_render_attribute_string( 'button_a' ); ?>>
+					<?php $this->render_text_a($settings); ?>
+				</a>
+
+				<?php if ( 'yes' === $settings['show_middle_text'] ) : ?>
+					<span><?php echo esc_html($settings['middle_text']); ?></span>
+				<?php endif; ?>
+
+				<a <?php $this->print_render_attribute_string( 'button_b' ); ?>>
+					<?php $this->render_text_b($settings); ?>
+				</a>
+			</div>
+		</div>
+		<?php
+	}
+
+	protected function content_template() {
+		?>
+		<#
+		var iconHtmlA  = elementor.helpers.renderIcon( view, settings.button_a_select_icon, { 'aria-hidden': true, 'class': 'fa-fw' }, 'i', 'object' );
+		var migratedA  = elementor.helpers.isIconMigrated( settings, 'button_a_select_icon' );
+		var iconHtmlB  = elementor.helpers.renderIcon( view, settings.button_b_select_icon, { 'aria-hidden': true, 'class': 'fa-fw' }, 'i', 'object' );
+		var migratedB  = elementor.helpers.isIconMigrated( settings, 'button_b_select_icon' );
+
+		var btnAClasses = 'bdt-btn-a bdt-ep-button bdt-effect-' + settings.button_a_effect + ' bdt-ep-button-size-' + settings.dual_button_size;
+		var btnBClasses = 'bdt-btn-b bdt-ep-button bdt-effect-' + settings.button_b_effect + ' bdt-ep-button-size-' + settings.dual_button_size;
+		var btnAHref = ( settings.button_a_link && settings.button_a_link.url ) ? settings.button_a_link.url : '#';
+		var btnBHref = ( settings.button_b_link && settings.button_b_link.url ) ? settings.button_b_link.url : '#';
+
+		var contentWrapAClasses = 'bdt-btn-content-wrap';
+		if ( 'left' === settings.button_a_icon_align || 'right' === settings.button_a_icon_align ) {
+			contentWrapAClasses += ' bdt-flex bdt-flex-middle';
+		} else if ( 'top' === settings.button_a_icon_align ) {
+			contentWrapAClasses += ' bdt-flex bdt-flex-column';
+		} else if ( 'bottom' === settings.button_a_icon_align ) {
+			contentWrapAClasses += ' bdt-flex bdt-flex-column-reverse';
+		}
+
+		var contentWrapBClasses = 'bdt-btn-content-wrap';
+		if ( 'left' === settings.button_b_icon_align || 'right' === settings.button_b_icon_align ) {
+			contentWrapBClasses += ' bdt-flex bdt-flex-middle';
+		} else if ( 'top' === settings.button_b_icon_align ) {
+			contentWrapBClasses += ' bdt-flex bdt-flex-column';
+		} else if ( 'bottom' === settings.button_b_icon_align ) {
+			contentWrapBClasses += ' bdt-flex bdt-flex-column-reverse';
+		}
+		#>
+		<div class="bdt-element-align-wrapper bdt-flex">
+			<div class="bdt-dual-button bdt-ep-button-wrapper bdt-element">
+				<a class="{{ btnAClasses }}" href="{{ btnAHref }}">
+					<div class="{{ contentWrapAClasses }}" data-text="{{ settings.button_a_text }}">
+						<# if ( iconHtmlA && iconHtmlA.rendered && ( ! settings.button_a_icon || migratedA ) ) { #>
+						<div class="bdt-btn-icon bdt-a-icon bdt-flex-align-{{ settings.button_a_icon_align }}">
+							<div class="bdt-ep-button-a-icon-inner">
+								{{{ iconHtmlA.value }}}
+							</div>
+						</div>
+						<# } #>
+						<div class="bdt-btn-text">{{{ settings.button_a_text }}}</div>
+					</div>
+				</a>
+
+				<# if ( 'yes' === settings.show_middle_text ) { #>
+				<span>{{ settings.middle_text }}</span>
+				<# } #>
+
+				<a class="{{ btnBClasses }}" href="{{ btnBHref }}">
+					<div class="{{ contentWrapBClasses }}" data-text="{{ settings.button_b_text }}">
+						<# if ( iconHtmlB && iconHtmlB.rendered && ( ! settings.button_b_icon || migratedB ) ) { #>
+						<div class="bdt-btn-icon bdt-btn-b-icon bdt-flex-align-{{ settings.button_b_icon_align }}">
+							<div class="bdt-b-icon-inner">
+								{{{ iconHtmlB.value }}}
+							</div>
+						</div>
+						<# } #>
+						<div class="bdt-btn-text">{{{ settings.button_b_text }}}</div>
+					</div>
+				</a>
+			</div>
+		</div>
+		<?php
+	}
+}

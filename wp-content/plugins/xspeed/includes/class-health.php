@@ -1,0 +1,797 @@
+<?php
+/**
+ * Health — shared diagnostic checks consumed by both Onboarding's
+ * environment surface and the Health module's dashboard panel.
+ *
+ * Each check returns:
+ *   [
+ *     'id'     => 'wp_version',
+ *     'tone'   => 'ok' | 'warn' | 'fail' | 'info',
+ *     'label'  => 'WordPress 6.6',
+ *     'detail' => 'Meets the 6.0+ minimum.',
+ *   ]
+ *
+ * Pure reads — never writes to disk, never makes outbound HTTP calls.
+ * Safe to call from any request including the loading dashboard.
+ *
+ * @package XSpeed
+ */
+
+declare(strict_types=1);
+
+namespace XSpeed;
+
+defined( 'ABSPATH' ) || exit;
+
+final class Health {
+
+	public const OK   = 'ok';
+	public const WARN = 'warn';
+	public const FAIL = 'fail';
+	public const INFO = 'info';
+
+	private const SERVER_LABELS = array(
+		'apache'    => 'Apache',
+		'litespeed' => 'LiteSpeed',
+		'nginx'     => 'nginx',
+		'iis'       => 'IIS',
+		'unknown'   => 'Unknown',
+	);
+
+	/**
+	 * Full check list used by the Health module's dashboard panel.
+	 *
+	 * @return array<int,array{id:string,tone:string,label:string,detail:string}>
+	 */
+	public static function checks(): array {
+		global $wp_version;
+
+		$server_type = Server::type();
+		$gzip_mode   = Server::gzip_mode();
+		$conflicts   = Server::conflicts();
+		$cache_dir   = defined( 'XSPEED_CACHE_DIR' ) ? XSPEED_CACHE_DIR : ( WP_CONTENT_DIR . '/cache/xspeed' );
+
+		$out = array();
+
+		// WordPress version
+		$wp_ok  = version_compare( (string) $wp_version, '6.0', '>=' );
+		$out[]  = array(
+			'id'     => 'wp_version',
+			'tone'   => $wp_ok ? self::OK : self::FAIL,
+			'label'  => sprintf( 'WordPress %s', (string) $wp_version ),
+			'detail' => $wp_ok ? 'Meets the 6.0+ minimum.' : 'Upgrade to WordPress 6.0 or higher.',
+		);
+
+		// PHP version
+		$php_ok      = version_compare( PHP_VERSION, '7.4', '>=' );
+		$php_modern  = version_compare( PHP_VERSION, '8.1', '>=' );
+		$out[]       = array(
+			'id'     => 'php_version',
+			'tone'   => $php_modern ? self::OK : ( $php_ok ? self::WARN : self::FAIL ),
+			'label'  => sprintf( 'PHP %s', PHP_VERSION ),
+			'detail' => $php_modern
+				? 'Modern PHP — full speed.'
+				: ( $php_ok
+					? 'Works, but 8.1+ is recommended for best performance.'
+					: 'Upgrade to PHP 7.4 or higher.' ),
+		);
+
+		// Server
+		$out[] = array(
+			'id'     => 'server',
+			'tone'   => self::INFO,
+			'label'  => sprintf( 'Server: %s', self::SERVER_LABELS[ $server_type ] ?? 'Unknown' ),
+			'detail' => 'auto' === $gzip_mode
+				? 'GZIP can be auto-configured via .htaccess.'
+				: 'GZIP requires a manual server-config snippet (shown in the GZIP module).',
+		);
+
+		// Cache directory writable
+		$dir_writable = wp_mkdir_p( $cache_dir ) && wp_is_writable( $cache_dir );
+		$out[]        = array(
+			'id'     => 'cache_dir',
+			'tone'   => $dir_writable ? self::OK : self::FAIL,
+			'label'  => 'Cache directory writable',
+			'detail' => $dir_writable
+				? $cache_dir
+				: sprintf( 'Cannot write to %s. Adjust file permissions before enabling cache.', $cache_dir ),
+		);
+
+		// Drop-in installed (only when cache is enabled — otherwise N/A)
+		$cache_enabled = (bool) Settings::get()['cache_enabled'];
+		if ( $cache_enabled ) {
+			// Ask the ownership oracle, not the bytes. A loose "xspeed"
+			// substring matched any foreign drop-in that so much as mentions
+			// us in a compatibility note, and reported it as "owned by
+			// xSpeed" while another plugin served every hit — the exact
+			// loose-substring test the drop-in contract forbids.
+			$dropin_match = Cache::DROPIN_XSPEED === Cache::dropin_owner();
+			$out[]        = array(
+				'id'     => 'dropin',
+				'tone'   => $dropin_match ? self::OK : self::FAIL,
+				'label'  => 'advanced-cache.php drop-in',
+				'detail' => $dropin_match
+					? 'Installed and owned by xSpeed.'
+					: 'Drop-in missing or owned by another plugin. Toggle Enable Cache off and on to reinstall.',
+			);
+		}
+
+		// WP_CACHE constant
+		$wp_cache_const = defined( 'WP_CACHE' ) && WP_CACHE;
+		if ( $cache_enabled ) {
+			// Why the constant is missing decides what we tell the user to
+			// do, so the two cases can't share one sentence. An unwritable
+			// wp-config.php (managed hosts make it read-only by design) is
+			// the common cause and the user must paste the line by hand.
+			// But it is NOT the only way to land here: a leftover
+			// `define( 'WP_CACHE', false );` from a previous cache plugin,
+			// a missing wp-config.php, or a WP_Filesystem that wants FTP
+			// credentials all fail set_wp_cache_constant() on a perfectly
+			// writable file. Asserting "not writable" unconditionally told
+			// those users something demonstrably false about their own
+			// server and sent them hand-editing a file the plugin could
+			// have fixed by toggling the cache off and on. (#19)
+			// The cost is real, but it is NOT "nothing is being cached": with
+			// the constant absent, Cache::maybe_start_cache() still serves on
+			// template_redirect and tags the response `HIT (php)`. What the
+			// constant buys is answering from the drop-in BEFORE WordPress
+			// boots — worth roughly an order of magnitude on TTFB, which is
+			// what makes this a WARN worth acting on. Claiming the cache was
+			// idle was simply false, and it is the sentence a worried user
+			// reads first. (#19, QA on #174)
+			//
+			// Ask the WRITER which branch to show, not a second oracle: Health
+			// used to run its own wp_is_writable() against its own path
+			// resolution, and the two disagreed with set_wp_cache_constant()
+			// in both directions — see Cache::can_write_wp_config().
+			$wp_config_writable = Cache::can_write_wp_config();
+			$check              = array(
+				'id'     => 'wp_cache_constant',
+				'tone'   => $wp_cache_const ? self::OK : self::WARN,
+				'label'  => 'WP_CACHE constant',
+				'detail' => $wp_cache_const
+					? 'Defined and truthy in wp-config.php.'
+					: 'Not set — cached pages are being served the slow way. Without this constant WordPress boots fully before xSpeed can answer from cache, costing roughly 10ms per hit. ' . ( $wp_config_writable
+						? 'wp-config.php is writable, so toggling Enable Cache off and on should set it for you; if it comes back, another plugin may have left define( \'WP_CACHE\', false ) behind — add the line below by hand instead.'
+						: 'wp-config.php is not writable here (managed hosts often make it read-only), so add the line below by hand, above the "That\'s all, stop editing!" comment.' ),
+			);
+			if ( ! $wp_cache_const ) {
+				// The line to paste, carried on the check itself so it
+				// survives on a persistent surface. Enabling the cache
+				// offered this only inside a toast that cleared after two
+				// seconds with no copy button, so a user who looked away
+				// had no way back to it anywhere in the dashboard — while
+				// the toggle read green and the site cached nothing.
+				// HealthCard already renders `snippet` through CopySnippet
+				// (the nginx check proves the wiring). (#19)
+				$check['snippet'] = "define( 'WP_CACHE', true );";
+			}
+			$out[] = $check;
+		}
+
+		// Static-rewrite probe. Active end-to-end check: writes a probe
+		// file under the static-cache dir, fetches it over HTTP, and
+		// confirms the web server (nginx OR Apache/LiteSpeed) served
+		// the raw file. Result is throttled to a 5-minute transient
+		// inside Cache::probe_static_rewrite so we never hit the
+		// network per-paint.
+		if ( $cache_enabled ) {
+			$server_type = Server::type();
+			// The live loopback probe only matters where a server-level static
+			// rewrite is actually used (nginx snippet / Apache .htaccess).
+			// LiteSpeed serves hits via the drop-in (see below), so skip the
+			// probe there entirely — no needless self-request. Health is the
+			// right place to pay for the probe when we DO run it (the admin
+			// bootstrap reads cache-only so it never blocks); the 5-minute
+			// transient still throttles repeat runs. (FBS-82142)
+			// LiteSpeed never pays for the probe, even with the Static Fast
+			// Path opt-in on (#509): OLS can't stamp the HIT header, so the
+			// probe can't distinguish "static-served" from "PHP-served"
+			// there and no LiteSpeed card below consumes its verdict — the
+			// card reports the installed state instead. A probe nothing
+			// reads is just a needless loopback self-request per paint.
+			$probe     = ( Server::LITESPEED === $server_type )
+				? array( 'active' => false )
+				: Cache::probe_static_rewrite( true );
+			$is_active = (bool) ( $probe['active'] ?? false );
+			// An inconclusive probe (blocked loopback, TLS failure, timeout, a
+			// CDN/WAF answering instead of the origin) proves nothing about the
+			// rewrite. Reporting it as "not yet routing to the cache" told users
+			// with a correct nginx config that their config was broken, and
+			// pointed them at a snippet they had already pasted. (FBS-84012)
+			$inconclusive = (bool) ( $probe['inconclusive'] ?? false );
+			$probe_reason = (string) ( $probe['reason'] ?? '' );
+
+			$block_reason = Cache::static_rewrite_block_reason();
+
+			// An OBSERVED refusal, from the last cacheable render. The settings
+			// above say whether the rewrite is allowed; this says whether pages
+			// are actually reaching the tree. They disagree whenever a page is
+			// refused per-response — a nonce being the common one — and in that
+			// case the settings are right and irrelevant: nginx is configured
+			// correctly, and every hit still comes from PHP. (#372)
+			$skip = Cache::last_static_skip();
+			if ( '' === $block_reason && ! empty( $skip['reason'] ) ) {
+				$block_reason = 'skipped_' . (string) $skip['reason'];
+			}
+			$mobile_block = ( 'mobile_separate' === $block_reason )
+				? ' Note: Separate Mobile Cache is on, which disables the device-blind static rewrite — if your site serves the same HTML to all devices, turn it off (Cache settings) for much faster cache hits.'
+				: '';
+
+			// A known refusal OUTRANKS the probe. probe_static_rewrite() writes
+			// its own file under the static-cache dir and fetches that — which
+			// succeeds whenever the server can serve a static file at all, even
+			// when static_rewrite_allowed() is false and no real page is being
+			// served that way. Checking $is_active first therefore reported
+			// "PHP bypassed" on a site whose pages were all returning
+			// HIT (php): the panel answered "why isn't static serving active?"
+			// with the opposite of the truth. When we already know why the
+			// rewrite is off, say that and ignore the probe. (FBS-83145)
+			$refused = ( '' !== $block_reason );
+			$is_active = $is_active && ! $refused;
+			// A refusal is a definite finding, so it also outranks
+			// "inconclusive" — otherwise a blocked rewrite whose probe merely
+			// failed to complete would be reported as INFO ("nothing to warn
+			// about") instead of the WARN the block deserves.
+			$inconclusive = $inconclusive && ! $refused;
+
+			if ( Server::NGINX === $server_type ) {
+				// One verdict for both surfaces: this panel and the Site
+				// Health test must answer from the SAME ordering, or they
+				// drift apart again — the whole point of #480.
+				$verdict = \XSpeed\Modules\Health\HealthModule::nginx_rewrite_verdict( $probe, $block_reason );
+				switch ( $verdict ) {
+					case 'active':
+						$nginx_detail = 'nginx is serving cache hits directly — PHP bypassed (~5-15ms TTFB).';
+						break;
+					case 'mobile_separate':
+						$nginx_detail = 'nginx detected, but the static rewrite is disabled because Separate Mobile Cache is on.' . $mobile_block;
+						break;
+					case 'skipped_nonce':
+						$nginx_detail = self::nonce_skip_detail( $skip );
+						break;
+					case 'unverified':
+						$nginx_detail = sprintf(
+							'Could not verify the static rewrite — the check itself did not complete, so this is not evidence that your config is wrong. If you have already pasted the snippet, it may well be working. Reason: %s',
+							$probe_reason
+						);
+						break;
+					default: // 'required'.
+						$nginx_detail = 'nginx detected but not yet routing to the cache. Paste the snippet below into your site\'s server { } block, then reload nginx.';
+				}
+
+				$out[] = array(
+					'id'      => 'static_rewrite_nginx',
+					// Inconclusive is INFO, not WARN — we have no finding to warn about.
+					'tone'    => 'active' === $verdict ? self::OK : ( 'unverified' === $verdict ? self::INFO : self::WARN ),
+					'label'   => 'Static-file rewrite (nginx server config)',
+					'detail'  => $nginx_detail,
+					// Always ship the snippet — even when active, so the
+					// admin has it handy for re-pasting after a server
+					// rebuild without having to find it elsewhere. Mirror
+					// the SAME unified block the "Server config" panel
+					// renders (cache + gzip + browser-cache directives),
+					// not the cache-only snippet — otherwise Health and
+					// the Cache panel disagree on what to paste.
+					'snippet' => Cache::full_nginx_server_block(),
+				);
+			} elseif ( Server::LITESPEED === $server_type ) {
+				// LiteSpeed defaults to the PHP drop-in — its .htaccess engine
+				// ignores mod_headers (no X-XSpeed-Cache stamp) and has no
+				// per-rule access_log, so a static hit would be invisible. The
+				// LiteSpeed Static Fast Path setting (#509) lets the user opt
+				// into web-server serving anyway; each state gets its own card
+				// so the trade the user made (or can make) is always stated.
+				if ( 'litespeed_dropin' === $block_reason ) {
+					// The intended default — healthy, not a fallback.
+					$out[] = array(
+						'id'     => 'static_rewrite_litespeed',
+						'tone'   => self::OK,
+						'label'  => 'Cache serving (LiteSpeed)',
+						'detail' => 'Cache hits are served by xSpeed\'s drop-in and tagged X-XSpeed-Cache: HIT — so every hit is visible and counted in your hit-ratio. (LiteSpeed\'s .htaccess can\'t add that header or log static hits, so xSpeed serves them itself for accurate reporting.) Prefer raw speed over hit accounting? Turn on LiteSpeed Static Fast Path in Cache settings to serve hits straight from the web server with no PHP — how much that saves depends on how quickly PHP answers on this host.',
+					);
+				} elseif ( 'mobile_separate' === $block_reason ) {
+					$out[] = array(
+						'id'     => 'static_rewrite_litespeed',
+						'tone'   => self::WARN,
+						'label'  => 'Static-file rewrite (LiteSpeed)',
+						'detail' => 'LiteSpeed Static Fast Path is on, but the static rewrite is disabled because Separate Mobile Cache is on.' . $mobile_block,
+					);
+				} elseif ( 'skipped_nonce' === $block_reason ) {
+					$out[] = array(
+						'id'     => 'static_rewrite_litespeed',
+						'tone'   => self::WARN,
+						'label'  => 'Static-file rewrite (LiteSpeed)',
+						'detail' => self::nonce_skip_detail( $skip ),
+					);
+				} elseif ( ! Cache::rewrite_installed() ) {
+					// Say WHY it is missing when we can tell. "Re-save to
+					// reinstall" on a read-only .htaccess is advice that
+					// cannot work — the same write that failed just fails
+					// again — and meanwhile the save itself succeeded
+					// silently, so this card is the only surface that can
+					// explain the state. (QA on #513)
+					$htaccess = ABSPATH . '.htaccess';
+					// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_is_writable -- Read-only diagnostic; mirrors install_rewrite()'s own pre-flight.
+					$writable = file_exists( $htaccess ) ? is_writable( $htaccess ) : is_writable( ABSPATH );
+					$out[]    = array(
+						'id'     => 'static_rewrite_litespeed',
+						'tone'   => self::WARN,
+						'label'  => 'Static-file rewrite (LiteSpeed)',
+						'detail' => $writable
+							? 'LiteSpeed Static Fast Path is on, but the block is missing from .htaccess. Re-save any Cache setting to reinstall it.'
+							: 'LiteSpeed Static Fast Path is on, but the block could not be written because .htaccess is not writable. Hits are still served (and counted) by the PHP drop-in. Make .htaccess writable and re-save any Cache setting, or turn the fast path off.',
+					);
+				} else {
+					// Opt-in on and the block is installed. The probe can't
+					// confirm "active" the way it does elsewhere (LiteSpeed
+					// serves the probe file but stamps no header), so report
+					// the installed state and restate the accounting trade.
+					$out[] = array(
+						'id'     => 'static_rewrite_litespeed',
+						'tone'   => self::OK,
+						'label'  => 'Static-file rewrite (LiteSpeed)',
+						'detail' => 'LiteSpeed Static Fast Path is on: the .htaccess block is installed and cache hits are served by the web server with no PHP. These responses carry no X-XSpeed-Cache header and are not counted in the hit ratio — that is the trade this setting makes. Turn it off in Cache settings to return every hit to the visible, counted PHP path.',
+					);
+				}
+			} elseif ( Server::APACHE === $server_type ) {
+				$installed = Cache::rewrite_installed();
+				if ( $is_active ) {
+					$tone   = self::OK;
+					$detail = 'Block installed and serving cache hits directly — PHP bypassed.';
+				} elseif ( 'mobile_separate' === $block_reason ) {
+					$tone   = self::WARN;
+					$detail = 'Static rewrite disabled because Separate Mobile Cache is on.' . $mobile_block;
+				} elseif ( 'no_mod_headers' === $block_reason ) {
+					// Not "missing" — deliberately not installed, because
+					// Apache can't stamp X-XSpeed-Cache without mod_headers
+					// and the hit would be invisible and uncountable. Caching
+					// still works via the drop-in; say so, and give the one
+					// step that actually changes the outcome.
+					$tone   = self::INFO;
+					$detail = 'Cache hits are served by xSpeed\'s drop-in and tagged X-XSpeed-Cache: HIT (php), so every hit is visible and counted. The faster .htaccess fast path is off because Apache\'s mod_headers module is not loaded — without it a static hit could not be tagged or counted. Enable mod_headers (`a2enmod headers` on Debian/Ubuntu, then restart Apache) to shave roughly 20-30ms off each cache hit.';
+				} elseif ( 'skipped_nonce' === $block_reason ) {
+					// Before this, Apache fell through to "probe failed —
+					// check AllowOverride", sending the admin to audit a
+					// config that was never the problem.
+					$tone   = self::WARN;
+					$detail = self::nonce_skip_detail( $skip );
+				} elseif ( ! $installed ) {
+					$tone   = self::WARN;
+					$detail = 'Block missing from .htaccess. Toggle Enable Cache off and on to reinstall it.';
+				} elseif ( $inconclusive ) {
+					// Same distinction as the nginx branch: the probe never
+					// reached a verdict, so telling the user to go re-check
+					// AllowOverride blames a config that may be perfectly
+					// fine. Report the failure honestly instead. (FBS-84012)
+					$tone   = self::INFO;
+					$detail = sprintf(
+						'Block is installed, but the check could not complete (%s), so this is not evidence that anything is misconfigured. Re-run it with `wp xspeed cache recheck-rewrite` once the site can reach itself over HTTP.',
+						$probe_reason
+					);
+				} else {
+					$tone   = self::WARN;
+					$detail = sprintf( 'Block installed but probe failed (%s). Confirm the .htaccess block is at the TOP of the file, and that AllowOverride is enabled for your site so mod_rewrite reads it.', $probe_reason );
+				}
+				$out[] = array(
+					'id'     => 'static_rewrite',
+					'tone'   => $tone,
+					'label'  => 'Static-file rewrite (.htaccess)',
+					'detail' => $detail,
+				);
+			}
+		}
+
+		/*
+		 * A full-page cache owned by the WEB SERVER, in front of PHP.
+		 *
+		 * Reported only when it is actually there, because it is a fact about
+		 * the host rather than a setting the admin can act on from here — an
+		 * "absent" row would be noise on the ~99% of sites that have no such
+		 * layer. When it IS there it outranks almost everything else on this
+		 * panel: nginx answers before WordPress runs, so what a visitor sees
+		 * is decided by that cache and not by anything xSpeed reports about
+		 * its own.
+		 *
+		 * The severity is about DOUBLE full-page caching, not about the layer
+		 * existing. Two independent full-page caches stacked in front of one
+		 * site have independent TTLs, and the outer one can re-serve HTML the
+		 * inner one has already regenerated — the classic "I purged and it is
+		 * still stale" report. With xSpeed's own page cache off there is only
+		 * one layer and nothing to warn about, so that case is INFO.
+		 */
+		$host_cache_path = Host_Page_Caches::nginx_helper_cache_path();
+		if ( null !== $host_cache_path ) {
+			$detail = $cache_enabled
+				? 'Your server is running its own full-page cache in nginx (FastCGI), managed by the Nginx Helper plugin your host installed — so this site has TWO full-page caches stacked in front of it. xSpeed clears the server layer too on a Purge All, and on the changes that affect every page — settings, updates, themes, plugins, menus. It leaves the routine purge after a post or comment edit to Nginx Helper, which clears just the pages that changed, as long as Nginx Helper\'s own Enable Purge setting is on. With it off, xSpeed clears the server layer after those edits too. The two caches expire on their own schedules (the server side is typically an hour), so a page can still be served from nginx after xSpeed has regenerated it. If edits keep looking stale, purge from your host\'s dashboard too, or turn xSpeed\'s page cache off and let the server layer do the work — it is the faster of the two, because it answers before PHP starts.'
+				: 'Your server is running a full-page cache in nginx (FastCGI), managed by the Nginx Helper plugin your host installed. xSpeed\'s own page cache is off, so this is the only full-page cache in front of the site — and it is the fastest kind, answering before PHP starts. Purge All in xSpeed still clears it, as do settings changes and plugin, theme or core updates. The routine purge after editing a post or approving a comment is left to Nginx Helper, which clears just the pages that changed rather than all of them, as long as Nginx Helper\'s own Enable Purge setting is on. With it off, xSpeed clears the server layer after those edits too.';
+
+			// Path prefix as a fingerprint for the WORDING only — never as a
+			// gate. Nginx Helper is not xCloud-only; other hosts and manual
+			// installs use it with a cache directory somewhere else entirely.
+			if ( 0 === strpos( $host_cache_path, '/etc/nginx/cache/' ) ) {
+				$detail .= sprintf( ' Cache directory: %s (the layout xCloud provisions).', $host_cache_path );
+			} else {
+				$detail .= sprintf( ' Cache directory: %s.', $host_cache_path );
+			}
+
+			// The purge is a direct unlink by the PHP-FPM user against a
+			// directory nginx owns. Whether that user can write there is a
+			// property of the host we cannot test from here without deleting
+			// someone's cache to find out, so say what to check rather than
+			// claiming an outcome either way.
+			if ( 'unlink_files' === Host_Page_Caches::nginx_helper_purge_method() ) {
+				$detail .= ' The server cache is purged by deleting its files directly, which needs PHP to have write access to that directory — if a purge here never changes what nginx serves, that permission is the thing to check with your host.';
+			}
+
+			if ( is_multisite() ) {
+				$detail .= ' On multisite, nginx keys one cache per install rather than per site, so this purge clears every site on the network.';
+			}
+
+			$out[] = array(
+				'id'     => 'host_page_cache',
+				'tone'   => $cache_enabled ? self::WARN : self::INFO,
+				'label'  => 'Server-level page cache (nginx FastCGI)',
+				'detail' => $detail,
+			);
+		}
+
+		// Cache expiry vs preloader schedule (deterministic rule, issue #31):
+		// pages that expire faster than the preloader re-warms them leave the
+		// cache cold for most real traffic — the classic "24.8% hit ratio with
+		// everything on" misconfiguration. Pure logic in
+		// expiry_preload_check() so it's unit-testable.
+		if ( $cache_enabled ) {
+			$cache_opts = Settings_Manager::get( 'cache' );
+			$pre_opts   = Settings_Manager::get( 'preloader' );
+			$schedule   = (string) ( $pre_opts['schedule'] ?? 'manual' );
+			$mismatch   = self::expiry_preload_check(
+				(int) ( $cache_opts['cache_expiry'] ?? \XSpeed\Modules\Cache\CacheModule::DEFAULT_EXPIRY_HOURS ),
+				$schedule,
+				! empty( $pre_opts['enabled'] ),
+				self::schedule_interval_hours( $schedule )
+			);
+			if ( null !== $mismatch ) {
+				$out[] = $mismatch;
+			}
+		}
+
+		// Permalinks
+		$permalinks_ok = (bool) get_option( 'permalink_structure' );
+		$out[]         = array(
+			'id'     => 'permalinks',
+			'tone'   => $permalinks_ok ? self::OK : self::WARN,
+			'label'  => 'Permalinks',
+			'detail' => $permalinks_ok
+				? 'Pretty permalinks active.'
+				: 'Set permalinks to anything other than "Plain" — page caching needs URL paths to key on.',
+		);
+
+		// What is in front of the site, and what we are telling it. Extracted
+		// so it can be exercised without paying for every other probe in
+		// checks(); see edge_check().
+		$edge_row = self::edge_check();
+		if ( null !== $edge_row ) {
+			$out[] = $edge_row;
+		}
+
+		// Cache-poisoning Set-Cookie detection (issue #33): a plugin emitting
+		// Set-Cookie on anonymous pageviews forces CDN/edge BYPASS for all
+		// HTML (Cloudflare never caches a response carrying Set-Cookie). Probe
+		// is transient-throttled inside Cookie_Inspector, same pattern as the
+		// static-rewrite probe above — Health is the right place to pay for it.
+		// Cached-only: Health runs inside the dashboard REST request and the
+		// MCP get_health tool, so this must never block on an HTTP call.
+		// A cold verdict schedules a background refresh and reports nothing
+		// this paint. See Cookie_Inspector::probe_cached().
+		$cookie_probe = Cookie_Inspector::probe_cached();
+		if ( $cookie_probe['checked'] ) {
+			$offenders = $cookie_probe['cookies'];
+			if ( empty( $offenders ) ) {
+				$out[] = array(
+					'id'     => 'set_cookie_poisoning',
+					'tone'   => self::OK,
+					'label'  => 'No cache-poisoning cookies',
+					'detail' => 'Anonymous pages are served without Set-Cookie, so CDN/edge caches can store them.',
+				);
+			} else {
+				$named = array();
+				foreach ( $offenders as $c ) {
+					$named[] = null !== $c['plugin']
+						? sprintf( '%s is setting %s', $c['plugin'], $c['name'] )
+						: sprintf( 'an unidentified plugin is setting %s', $c['name'] );
+				}
+				$out[] = array(
+					'id'     => 'set_cookie_poisoning',
+					'tone'   => self::WARN,
+					'label'  => 'Set-Cookie on cacheable pages',
+					'detail' => sprintf(
+						'%s — this prevents CDN edge caching (Cloudflare returns BYPASS for any response with Set-Cookie). Configure the plugin to set its cookie via JavaScript instead, or exclude it from anonymous pageviews.',
+						implode( '; ', $named )
+					),
+				);
+			}
+		}
+
+		// Conflicting plugins
+		$out[] = array(
+			'id'     => 'conflicts',
+			'tone'   => empty( $conflicts ) ? self::OK : self::WARN,
+			'label'  => 'Caching plugin conflicts',
+			// Not "Active:" — the list now includes a drop-in left behind by a
+			// plugin that is not running, which is exactly the case that made
+			// this row disagree with what the enable actually does.
+			'detail' => empty( $conflicts )
+				? 'No other caching plugins detected.'
+				: sprintf( 'Found: %s. Another page cache must be off, and its advanced-cache.php gone, before xSpeed can enable its own.', implode( ', ', $conflicts ) ),
+		);
+
+		/*
+		 * A migration whose source is STILL RUNNING.
+		 *
+		 * Distinct from the generic `conflicts` check above, which only says
+		 * "another caching plugin is active". This one knows the user imported
+		 * from it and chose (or was refused) to leave it on, so it can name the
+		 * plugin and the decision.
+		 *
+		 * The point is persistence: the import screen's warning disappears the
+		 * moment the user navigates away, and the risk does not. Two page
+		 * caches fighting over the drop-in is exactly what breaks caching for
+		 * both, so the warning has to outlive the screen it was raised on.
+		 * (#189 AC4)
+		 */
+		$pending = class_exists( '\\XSpeed\\Migration' ) ? Migration::pending_source() : null;
+		if ( null !== $pending ) {
+			$out[] = array(
+				'id'     => 'migration_source_active',
+				'tone'   => self::WARN,
+				'label'  => sprintf( '%s is still active after import', $pending['label'] ),
+				'detail' => sprintf(
+					'You imported settings from %s but left it running. Two page caches fight over the cache drop-in and can break caching for both — deactivate %s on the Plugins screen once you have checked the imported settings.',
+					$pending['label'],
+					$pending['label']
+				),
+			);
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Hours between recurring preloader crawls, per schedule option.
+	 * `twicedaily` is a WordPress core schedule — omitting it meant a site
+	 * using it got no check at all, not even a pass.
+	 */
+	public const PRELOAD_INTERVALS = array(
+		'hourly'     => 1,
+		'twicedaily' => 12,
+		'daily'      => 24,
+		'weekly'     => 168,
+	);
+
+	/**
+	 * Interval in hours for a cron schedule slug, or null when it isn't a
+	 * recurring schedule (`manual`) or can't be resolved.
+	 *
+	 * Falls back to `wp_get_schedules()` so custom crons registered by a
+	 * theme or another plugin are covered too, rather than silently
+	 * skipping the check.
+	 */
+	/**
+	 * Explain a static-tree refusal caused by nonces.
+	 *
+	 * Says four things, because leaving any of them out is what made this
+	 * invisible: the config is FINE (so nobody re-pastes a snippet that was
+	 * never the problem), hits are coming from PHP instead, which nonce keys
+	 * caused it, and that the refusal is deliberate rather than a bug to work
+	 * around. The keys are the actionable part — they name the plugin, and it
+	 * is usually a widget the page does not use. (#372)
+	 *
+	 * @param array{reason?:string,url?:string,keys?:string[]} $skip Recorded refusal.
+	 */
+	private static function nonce_skip_detail( array $skip ): string {
+		$detail = 'Your nginx config is correct, but pages are not reaching the static cache, so hits are served by PHP (typically ~1s instead of ~5-15ms). '
+			. 'They contain nonces, and a static file is served with no PHP — nothing could ever refresh them, so every anonymous form on the page would break once they expire. Keeping these pages on PHP is deliberate.';
+
+		$keys = array_filter( array_map( 'strval', (array) ( $skip['keys'] ?? array() ) ) );
+		if ( ! empty( $keys ) ) {
+			$detail .= ' Nonces found: ' . implode( ', ', $keys ) . '.';
+			$detail .= ' These come from plugin widgets — disabling the ones this site does not use lets its pages be served statically again.';
+		}
+
+		$url = (string) ( $skip['url'] ?? '' );
+		if ( '' !== $url ) {
+			$detail .= sprintf( ' Last seen on %s.', $url );
+		}
+
+		return $detail;
+	}
+
+	public static function schedule_interval_hours( string $schedule ): ?int {
+		if ( isset( self::PRELOAD_INTERVALS[ $schedule ] ) ) {
+			return self::PRELOAD_INTERVALS[ $schedule ];
+		}
+		if ( '' === $schedule || 'manual' === $schedule || ! function_exists( 'wp_get_schedules' ) ) {
+			return null;
+		}
+		$schedules = wp_get_schedules();
+		if ( ! isset( $schedules[ $schedule ]['interval'] ) ) {
+			return null;
+		}
+		$hours = (int) round( (int) $schedules[ $schedule ]['interval'] / HOUR_IN_SECONDS );
+		return $hours > 0 ? $hours : 1;
+	}
+
+	/**
+	 * Deterministic rule: warn when cache_expiry is shorter than the
+	 * preloader's recurring interval (pages go cold between crawls).
+	 *
+	 * Pure — no WP calls — so it can be unit-tested directly.
+	 *
+	 * @param int      $expiry_hours      Cache expiry in hours.
+	 * @param string   $schedule          Preloader schedule (manual|hourly|twicedaily|daily|weekly|custom).
+	 * @param bool     $preloader_enabled Whether the preloader module is on.
+	 * @param int|null $interval_hours    Pre-resolved interval, for schedules
+	 *                                    outside PRELOAD_INTERVALS. Keeps this
+	 *                                    function pure — the caller does the
+	 *                                    wp_get_schedules() lookup.
+	 * @return array{id:string,tone:string,label:string,detail:string}|null Check
+	 *         row, or null when the rule doesn't apply (preloader off/manual).
+	 */
+	/**
+	 * What cache is in front of the site, and what we are telling it.
+	 *
+	 * Reported whether or not anything is currently being held back, because
+	 * the useful half is the caveat rather than the header. A Cloudflare
+	 * Cache Rule set to ignore origin headers overrides everything xSpeed
+	 * sends, and someone debugging "my cart page is still being cached"
+	 * needs telling that rather than left to discover it.
+	 *
+	 * Null when nothing was detected and nothing was switched off: there is
+	 * no news in "we looked and saw nothing", and a row saying so on every
+	 * ordinary single-server site would be noise in a panel people scan for
+	 * problems.
+	 *
+	 * @return array{id:string,tone:string,label:string,detail:string}|null
+	 */
+	public static function edge_check(): ?array {
+		$edge = Edge_Provider::detect();
+
+		if ( Edge_Provider::is_off( $edge ) ) {
+			return array(
+				'id'     => 'edge_hold',
+				'tone'   => self::WARN,
+				'label'  => 'Edge cache not being told anything',
+				'detail' => 'xSpeed is set not to send cache headers to the CDN in front of this site, so first renders and bypassed pages can be stored at the edge. Set "Cache In Front Of This Site" back to automatic unless you are sending your own headers.',
+			);
+		}
+
+		if ( Edge_Provider::NONE === $edge['confidence'] ) {
+			return null;
+		}
+
+		$named = '' !== $edge['provider'] ? $edge['provider'] : 'a cache we could not identify';
+
+		// A pin outranks detection by design, so nothing re-checks it on the
+		// site's behalf — and it is the one answer that also reaches the
+		// drop-in and the server rules. Comparing it against the request is
+		// the only way a site that changed CDN ever finds out.
+		$sniffed = Edge_Provider::sniffed();
+		if ( in_array( $edge['source'], array( 'setting', 'constant', 'filter' ), true )
+			&& '' !== $sniffed['provider']
+			&& $sniffed['provider'] !== $edge['provider'] ) {
+			return array(
+				'id'     => 'edge_hold',
+				'tone'   => self::WARN,
+				'label'  => 'Edge cache setting looks out of date',
+				'detail' => sprintf(
+					'This request looks like %s, but the provider is pinned to %s. If the site moved, update it — the pinned answer is also baked into the drop-in and the server rules.',
+					$sniffed['provider'],
+					$named
+				),
+			);
+		}
+
+		$caveat = 'cloudflare' === $edge['provider']
+			? ' A Cloudflare Cache Rule whose Edge TTL is "Ignore cache-control header and use this TTL" overrides this; use "Respect origin TTL" on that rule.'
+			: '';
+
+		return array(
+			'id'     => 'edge_hold',
+			'tone'   => self::OK,
+			'label'  => 'Edge cache being told what not to store',
+			'detail' => sprintf( 'First renders, bypassed pages and mobile-split pages are marked do-not-store for %s.%s', $named, $caveat ),
+		);
+	}
+
+	public static function expiry_preload_check( int $expiry_hours, string $schedule, bool $preloader_enabled, ?int $interval_hours = null ): ?array {
+		if ( ! $preloader_enabled ) {
+			return null;
+		}
+		$interval = $interval_hours ?? ( self::PRELOAD_INTERVALS[ $schedule ] ?? null );
+		if ( null === $interval || $interval < 1 ) {
+			return null;
+		}
+		if ( $expiry_hours < $interval ) {
+			return array(
+				'id'     => 'expiry_preload_mismatch',
+				'tone'   => self::WARN,
+				'label'  => 'Cache expiry shorter than the preload schedule',
+				'detail' => sprintf(
+					'Pages expire after %dh but the preloader only re-warms them every %dh (%s), so most visits hit a cold cache. Raise Cache Expiry to at least %dh (Cache settings), or preload more often (Preloader settings).',
+					$expiry_hours,
+					$interval,
+					$schedule,
+					$interval
+				),
+			);
+		}
+		return array(
+			'id'     => 'expiry_preload_mismatch',
+			'tone'   => self::OK,
+			'label'  => 'Cache expiry covers the preload schedule',
+			'detail' => sprintf( 'Expiry %dh ≥ preload interval %dh (%s) — preloaded pages stay warm between crawls.', $expiry_hours, $interval, $schedule ),
+		);
+	}
+
+	/**
+	 * Lightweight environment payload for the onboarding wizard. Keeps
+	 * the legacy shape Onboarding::env_payload returned so the Welcome
+	 * step's HealthRow rendering doesn't change.
+	 */
+	public static function env_payload(): array {
+		global $wp_version;
+		$cache_dir = defined( 'XSPEED_CACHE_DIR' ) ? XSPEED_CACHE_DIR : ( WP_CONTENT_DIR . '/cache/xspeed' );
+		return array(
+			'wp'            => array(
+				'version' => (string) $wp_version,
+				'ok'      => version_compare( (string) $wp_version, '6.0', '>=' ),
+			),
+			'php'           => array(
+				'version' => PHP_VERSION,
+				'ok'      => version_compare( PHP_VERSION, '7.4', '>=' ),
+				'modern'  => version_compare( PHP_VERSION, '8.1', '>=' ),
+			),
+			'server'        => array(
+				'type'      => Server::type(),
+				'gzip_mode' => Server::gzip_mode(),
+			),
+			'cache_dir'     => array(
+				'path'     => $cache_dir,
+				'writable' => wp_mkdir_p( $cache_dir ) && wp_is_writable( $cache_dir ),
+			),
+			'wp_config'     => array(
+				'writable' => self::wp_config_writable(),
+			),
+			'permalinks_ok' => (bool) get_option( 'permalink_structure' ),
+			'conflicts'     => Server::conflicts(),
+			/*
+			 * The reason the enable would be refused right now, or null.
+			 *
+			 * `conflicts` is a list of plugins, and the wizard used it to
+			 * decide whether to open with page caching ticked. The two are
+			 * not the same question: an orphaned or doubly-defined WP_CACHE
+			 * refuses the enable with no plugin to name, so the wizard
+			 * offered a pre-ticked switch it already knew would fail. This
+			 * is the gate's own answer, so the box and the outcome agree.
+			 */
+			'page_cache_blocked' => Cache::acquisition_blocker(),
+		);
+	}
+
+	/**
+	 * Cheap writability probe for the onboarding env payload only.
+	 *
+	 * Deliberately NOT the oracle behind the WP_CACHE check — that asks
+	 * Cache::can_write_wp_config(), which runs the same WP_Filesystem test
+	 * the writer runs, so advice can never contradict behaviour. This one
+	 * stays a plain filesystem read because env_payload() is documented as
+	 * making no outbound calls, and WP_Filesystem() can try to open an
+	 * FTP/SSH connection. It shares the writer's path resolution so the two
+	 * at least agree on WHICH file they are describing. (#19, QA on #174)
+	 */
+	private static function wp_config_writable(): bool {
+		$path = Cache::wp_config_path();
+		return '' !== $path && wp_is_writable( $path );
+	}
+}

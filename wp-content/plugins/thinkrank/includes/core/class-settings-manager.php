@@ -1,0 +1,923 @@
+<?php
+
+/**
+ * Centralized Settings Manager Class
+ *
+ * Coordinates settings management across all ThinkRank components including
+ * core plugin settings, SEO-specific settings, and cross-manager coordination.
+ * Provides unified interface for the Settings Management API Endpoints with
+ * proper validation, import/export, and backup/restore functionality.
+ *
+ * @package ThinkRank
+ * @subpackage Core
+ * @since 1.0.0
+ */
+
+declare(strict_types=1);
+
+namespace ThinkRank\Core;
+
+use ThinkRank\Core\Settings;
+use ThinkRank\SEO\SEO_Settings_Manager;
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Centralized Settings Manager Class
+ *
+ * Provides unified settings management interface that coordinates between
+ * core plugin settings and SEO-specific settings. Handles cross-manager
+ * validation, import/export, backup/restore, and conflict resolution.
+ *
+ * @since 1.0.0
+ */
+class Settings_Manager {
+
+    /**
+     * Core Settings instance
+     *
+     * @since 1.0.0
+     * @var Settings
+     */
+    private Settings $core_settings;
+
+    /**
+     * SEO Settings Manager instance
+     *
+     * @since 1.0.0
+     * @var SEO_Settings_Manager
+     */
+    private SEO_Settings_Manager $seo_settings;
+
+    /**
+     * Keys the most recent core-category save could not persist.
+     *
+     * A batch save is all-or-nothing in its reporting but not in its writes, so
+     * a caller that gets false needs to know *which* settings did not make it —
+     * a bare boolean leaves the UI unable to say anything useful (#300).
+     *
+     * @since 1.30.0
+     * @var string[]
+     */
+    private array $last_failed_keys = [];
+
+    /**
+     * Settings categories mapping
+     *
+     * @since 1.0.0
+     * @var array
+     */
+    private array $settings_categories = [
+        'core' => [
+            'name' => 'Core Plugin Settings',
+            'manager' => 'core',
+            'keys' => [
+                'ai_provider',
+                'openai_api_key',
+                'openai_model',
+                'claude_api_key',
+                'claude_model',
+                'gemini_api_key',
+                'gemini_model',
+                'openrouter_api_key',
+                'openrouter_model',
+                'openai_compatible_base_url',
+                'openai_compatible_api_key',
+                'openai_compatible_model',
+                'openai_compatible_timeout',
+                'openai_compatible_supports_images',
+                'openai_compatible_json_mode',
+                'openai_compatible_price_per_million',
+                'max_tokens',
+                'temperature',
+                'cache_duration',
+                'max_requests_per_minute',
+                'ai_daily_request_limit',
+                'ai_paused',
+                'enable_logging',
+                'debug_mode',
+                'api_timeout',
+                'retry_attempts',
+                // 'rate_limit_enabled' used to be listed here, but it has no
+                // entry in Settings::defaults, so Settings::set() rejected it on
+                // every save and no code ever read it. Under the old 70%
+                // threshold that silent rejection was reported as success;
+                // all-or-nothing reporting would now fail every core save that
+                // carried it, so the dead key goes rather than the save (#300).
+                'data_retention_days',
+                'anonymize_logs',
+                'share_usage_data',
+                'keep_data_on_uninstall'
+            ]
+        ],
+        'seo' => [
+            'name' => 'SEO Settings',
+            'manager' => 'seo',
+            'keys' => [
+                'auto_optimize',
+                'seo_score_threshold',
+                'enable_meta_generation',
+                'enable_schema_markup'
+            ]
+        ],
+        'ui' => [
+            'name' => 'User Interface Settings',
+            'manager' => 'core',
+            'keys' => [
+                'show_welcome_message',
+                'dashboard_widgets',
+                'editor_panel_position'
+            ]
+        ],
+        'basic_integrations' => [
+            'name' => 'Basic Integration Settings',
+            'manager' => 'core',
+            'keys' => [
+                'google_analytics_id',
+                'search_console_property'
+            ]
+        ],
+        'social_media' => [
+            'name' => 'Social Media & Open Graph',
+            'manager' => 'seo',
+            'keys' => [
+                'enabled',
+                'enable_open_graph',
+                'og_site_name',
+                'og_description',
+                'og_type',
+                'og_locale',
+                'default_og_image',
+                'og_image_width',
+                'og_image_height',
+                'enable_twitter_cards',
+                'twitter_username',
+                'twitter_card_type',
+                'default_twitter_image',
+                'facebook_app_id',
+                'facebook_admins',
+                'enable_linkedin',
+                'enable_pinterest',
+                'pinterest_site_verification',
+                'enable_instagram',
+                'instagram_verification',
+                'enable_tiktok',
+                'tiktok_verification',
+                'enable_youtube',
+                'youtube_channel_id',
+                'enable_whatsapp',
+                'whatsapp_business_id',
+                'auto_generate_descriptions',
+                'fallback_to_excerpt',
+                'strip_html_tags',
+                'max_description_length'
+            ]
+        ],
+        'sitemap' => [
+            'name' => 'XML Sitemap Management',
+            'manager' => 'seo',
+            'keys' => [
+                'enabled',
+                'include_posts',
+                'include_pages',
+                'include_categories',
+                'include_tags',
+                'auto_generate',
+                'ping_search_engines',
+                'last_generated',
+                'exclude_posts',
+                'exclude_terms',
+                'exclude_password_protected',
+                'exclude_private_posts',
+                'enable_styling',
+                'custom_url_pattern',
+                'links_per_sitemap',
+                'include_images',
+                'include_featured_images',
+                'use_sitemap_index'
+            ]
+        ],
+        'site_identity' => [
+            'name' => 'Site Identity & Global SEO',
+            'manager' => 'seo',
+            'keys' => []
+        ],
+        'content_analysis' => [
+            'name' => 'AI Content Analysis',
+            'manager' => 'seo',
+            'keys' => []
+        ],
+        'content_optimization' => [
+            'name' => 'Content Optimization',
+            'manager' => 'seo',
+            'keys' => []
+        ],
+        'performance_monitoring' => [
+            'name' => 'Performance Monitoring',
+            'manager' => 'seo',
+            'keys' => []
+        ],
+        'schema_management' => [
+            'name' => 'Schema Management',
+            'manager' => 'seo',
+            'keys' => []
+        ],
+        'integrations' => [
+            'name' => 'Integrations',
+            'manager' => 'core',
+            'keys' => [
+                // Google API Keys
+                'google_analytics_api_key',
+                'google_search_console_api_key',
+                'google_pagespeed_api_key',
+                // Google OAuth Tokens
+                'google_access_token',
+                'google_refresh_token',
+                'google_token_expires_in',
+                'google_token_created',
+                'google_account_connected',
+                // API Configuration
+                'api_timeout',
+                'enable_rate_limiting',
+                'cache_duration',
+                // Connection settings
+                'auto_test_connections',
+                'retry_failed_requests'
+            ]
+        ],
+        'seo_analytics' => [
+            'name' => 'SEO Analytics & Intelligence',
+            'manager' => 'core',
+            'keys' => [
+                // Core settings
+                'seo_analytics_enabled',
+                'seo_analytics_setup_completed',
+
+                // Google Analytics configuration. NOTE: the account/property/
+                // data-stream picker that reads AND writes these three keys is
+                // thinkrank-pro's GoogleAnalyticsSettings.js (via this plugin's
+                // settings-management endpoint) — a free-repo grep will find no
+                // consumer. ga_analytics_data_stream_id was once removed as a
+                // "dead key" on that basis, which silently broke the Pro
+                // picker's stream selection persisting across reloads.
+                'seo_analytics_google_analytics_property_id',
+                'ga_analytics_account_id',
+                'ga_analytics_data_stream_id',
+
+                // Search Console configuration
+                'search_console_property',
+
+                // AI features
+                'seo_analytics_enable_ai_insights',
+                'seo_analytics_enable_automated_alerts',
+                'seo_analytics_enable_predictive_analysis',
+
+                // Monitoring settings
+                'seo_analytics_monitoring_frequency',
+                'seo_analytics_alert_thresholds',
+                'seo_analytics_report_schedule',
+
+                // Data retention
+                'seo_analytics_data_retention_days',
+                'seo_analytics_cache_analytics_data'
+            ]
+        ],
+
+    ];
+
+    /**
+     * Constructor
+     *
+     * @since 1.0.0
+     */
+    public function __construct() {
+        $this->core_settings = Settings::instance();
+        $this->seo_settings = new SEO_Settings_Manager();
+    }
+
+    /**
+     * Get settings for a specific category
+     *
+     * @since 1.0.0
+     *
+     * @param string $category Settings category
+     * @param string $context_type Optional. Context type for SEO settings
+     * @param int|null $context_id Optional. Context ID for SEO settings
+     * @return array Settings array
+     */
+    public function get_settings(string $category, string $context_type = 'site', ?int $context_id = null): array {
+        if (!isset($this->settings_categories[$category])) {
+            return [];
+        }
+
+        $category_config = $this->settings_categories[$category];
+
+        if ($category_config['manager'] === 'core') {
+            return $this->get_core_settings_by_category($category);
+        } else {
+            return $this->get_seo_settings_by_category($category, $context_type, $context_id);
+        }
+    }
+
+    /**
+     * Update settings for a specific category
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Settings to update
+     * @param string $category Settings category
+     * @param string $context_type Optional. Context type for SEO settings
+     * @param int|null $context_id Optional. Context ID for SEO settings
+     * @return bool|null True on success, false on failure, null when this store
+     *                   does not own the category (nothing was attempted).
+     */
+    public function update_settings(array $settings, string $category, string $context_type = 'site', ?int $context_id = null): ?bool {
+        // Unknown here means "not this store's category", not "the write
+        // failed" — the caller may still have a dedicated manager that owns it
+        // (#371). Failing closed made those saves report 500 after committing.
+        if (!isset($this->settings_categories[$category])) {
+            return null;
+        }
+
+        $category_config = $this->settings_categories[$category];
+
+        // Reset here, not only in the core path: a SEO-category save must not
+        // leave a previous core save's failed keys readable.
+        $this->last_failed_keys = [];
+
+        if ($category_config['manager'] === 'core') {
+            return $this->update_core_settings_by_category($settings, $category);
+        } else {
+            return $this->update_seo_settings_by_category($settings, $category, $context_type, $context_id);
+        }
+    }
+
+    /**
+     * Keys the most recent update_settings() call could not persist.
+     *
+     * Empty on success, and reset at the start of every update_settings()
+     * call. SEO categories persist through their own manager and do not
+     * report per key, so this stays empty for them.
+     *
+     * @since 1.30.0
+     *
+     * @return string[] Setting keys that failed to save.
+     */
+    public function get_last_failed_keys(): array {
+        return $this->last_failed_keys;
+    }
+
+    /**
+     * Get all settings across categories
+     *
+     * @since 1.0.0
+     *
+     * @param array $categories Optional. Specific categories to retrieve
+     * @return array All settings organized by category
+     */
+    public function get_all_settings(array $categories = []): array {
+        $all_settings = [];
+        $target_categories = empty($categories) ? array_keys($this->settings_categories) : $categories;
+
+        foreach ($target_categories as $category) {
+            if (isset($this->settings_categories[$category])) {
+                $all_settings[$category] = $this->get_settings($category);
+            }
+        }
+
+        return $all_settings;
+    }
+
+    /**
+     * Update multiple categories of settings
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings_by_category Settings organized by category
+     * @return array Update results for each category
+     */
+    public function update_multiple_settings(array $settings_by_category): array {
+        $results = [];
+
+        foreach ($settings_by_category as $category => $settings) {
+            try {
+                $success = $this->update_settings($settings, $category);
+                $results[$category] = [
+                    'success' => $success,
+                    'settings_count' => count($settings)
+                ];
+            } catch (\Exception $e) {
+                $results[$category] = [
+                    'success' => false,
+                    'error' => $e->getMessage()
+                ];
+            }
+        }
+
+        return $results;
+    }
+
+    /**
+     * Validate settings across categories
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings_by_category Settings organized by category
+     * @return array Validation results for each category
+     */
+    public function validate_settings(array $settings_by_category): array {
+        $validation_results = [];
+
+        foreach ($settings_by_category as $category => $settings) {
+            if (!isset($this->settings_categories[$category])) {
+                $validation_results[$category] = [
+                    'valid' => false,
+                    'errors' => ['Invalid category'],
+                    'warnings' => []
+                ];
+                continue;
+            }
+
+            $category_config = $this->settings_categories[$category];
+
+            if ($category_config['manager'] === 'core') {
+                $validation_results[$category] = $this->validate_core_settings($settings, $category);
+            } else {
+                $validation_results[$category] = $this->validate_seo_settings($settings, $category);
+            }
+        }
+
+        return $validation_results;
+    }
+
+    /**
+     * Get settings categories information
+     *
+     * @since 1.0.0
+     *
+     * @return array Categories information
+     */
+    /**
+     * The setting keys a category defines.
+     *
+     * Exposed so callers can reject keys a category does not define instead of
+     * persisting whatever they are handed (#395).
+     *
+     * @since 2.0.1
+     *
+     * @param string $category Category name.
+     * @return string[] Setting keys, or [] when the category is unknown here.
+     */
+    public function get_category_keys(string $category): array {
+        return $this->settings_categories[$category]['keys'] ?? [];
+    }
+
+    public function get_categories(): array {
+        $categories = [];
+
+        foreach ($this->settings_categories as $key => $config) {
+            $categories[$key] = [
+                'name' => $config['name'],
+                'manager' => $config['manager'],
+                'key_count' => count($config['keys'])
+            ];
+        }
+
+        return $categories;
+    }
+
+    /**
+     * Export settings
+     *
+     * @since 1.0.0
+     *
+     * @param array $categories Optional. Categories to export
+     * @return array Export data with metadata
+     */
+    public function export_settings(array $categories = []): array {
+        $export_data = [
+            'metadata' => [
+                'export_timestamp' => current_time('mysql'),
+                'plugin_version' => defined('THINKRANK_VERSION') ? THINKRANK_VERSION : '1.0.0',
+                'wordpress_version' => get_bloginfo('version'),
+                'site_url' => home_url(),
+                'exported_categories' => empty($categories) ? array_keys($this->settings_categories) : $categories
+            ],
+            'settings' => $this->get_all_settings($categories)
+        ];
+
+        return $export_data;
+    }
+
+    /**
+     * Import settings
+     *
+     * @since 1.0.0
+     *
+     * @param array $import_data Import data with settings
+     * @param bool $validate_before_import Whether to validate before importing
+     * @return array Import results
+     */
+    public function import_settings(array $import_data, bool $validate_before_import = true): array {
+        $settings = $import_data['settings'] ?? $import_data;
+        $import_results = [];
+
+        // Validate if requested
+        if ($validate_before_import) {
+            $validation_results = $this->validate_settings($settings);
+
+            foreach ($validation_results as $category => $validation) {
+                if (!$validation['valid']) {
+                    $import_results[$category] = [
+                        'success' => false,
+                        'error' => 'Validation failed',
+                        'validation_errors' => $validation['errors']
+                    ];
+                    continue;
+                }
+            }
+        }
+
+        // Import settings for each category
+        foreach ($settings as $category => $category_settings) {
+            if (isset($import_results[$category])) {
+                continue; // Skip if validation failed
+            }
+
+            try {
+                $success = $this->update_settings($category_settings, $category);
+                $import_results[$category] = [
+                    'success' => $success,
+                    'settings_count' => count($category_settings)
+                ];
+            } catch (\Exception $e) {
+                $import_results[$category] = [
+                    'success' => false,
+                    'error' => $e->getMessage()
+                ];
+            }
+        }
+
+        return $import_results;
+    }
+
+    /**
+     * Reset settings to defaults
+     *
+     * @since 1.0.0
+     *
+     * @param array $categories Optional. Categories to reset
+     * @return array Reset results
+     */
+    public function reset_settings(array $categories = []): array {
+        $target_categories = empty($categories) ? array_keys($this->settings_categories) : $categories;
+        $reset_results = [];
+
+        foreach ($target_categories as $category) {
+            if (!isset($this->settings_categories[$category])) {
+                continue;
+            }
+
+            try {
+                $category_config = $this->settings_categories[$category];
+
+                if ($category_config['manager'] === 'core') {
+                    $success = $this->reset_core_settings($category);
+                } else {
+                    $success = $this->reset_seo_settings($category);
+                }
+
+                $reset_results[$category] = [
+                    'success' => $success,
+                    'reset_to_defaults' => true
+                ];
+            } catch (\Exception $e) {
+                $reset_results[$category] = [
+                    'success' => false,
+                    'error' => $e->getMessage()
+                ];
+            }
+        }
+
+        return $reset_results;
+    }
+
+    /**
+     * Get settings statistics
+     *
+     * @since 1.0.0
+     *
+     * @return array Settings statistics
+     */
+    public function get_settings_statistics(): array {
+        $stats = [
+            'total_categories' => count($this->settings_categories),
+            'core_categories' => 0,
+            'seo_categories' => 0,
+            'total_settings' => 0,
+            'last_updated' => get_option('thinkrank_settings_last_updated'),
+            'version' => get_option('thinkrank_settings_version', '1.0.0')
+        ];
+
+        foreach ($this->settings_categories as $category => $config) {
+            if ($config['manager'] === 'core') {
+                $stats['core_categories']++;
+            } else {
+                $stats['seo_categories']++;
+            }
+
+            $category_settings = $this->get_settings($category);
+            $stats['total_settings'] += count($category_settings);
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Helper methods for core settings management
+     */
+
+    /**
+     * Get core settings by category
+     *
+     * @since 1.0.0
+     *
+     * @param string $category Category name
+     * @return array Core settings for category
+     */
+    private function get_core_settings_by_category(string $category): array {
+        $category_config = $this->settings_categories[$category];
+
+        // Prime the option cache in one query before the loop. Every
+        // thinkrank_* option is autoload=off, so WordPress cannot serve them
+        // from `alloptions` and each Settings->get() below was its own
+        // round-trip — 16 of them on every anonymous front-end request, on
+        // pages that use none of the values (#393).
+        $this->core_settings->prime($category_config['keys']);
+
+        $settings = [];
+
+        foreach ($category_config['keys'] as $key) {
+            $settings[$key] = $this->core_settings->get($key);
+        }
+
+        return $settings;
+    }
+
+    /**
+     * Update core settings by category
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Settings to update
+     * @param string $category Category name
+     * @return bool Success status
+     */
+    private function update_core_settings_by_category(array $settings, string $category): bool {
+        $category_config = $this->settings_categories[$category];
+        $total_count = 0;
+
+        $this->last_failed_keys = [];
+
+        // Sanitize per field before persisting. This is unconditional: callers
+        // (including the REST write routes, where the client can ask to skip
+        // validation) must not be able to reach Settings::set with unsanitized
+        // values — Settings::set only key-allowlists, it does not sanitize.
+        $settings = $this->core_settings->sanitize_settings($settings);
+
+        foreach ($settings as $key => $value) {
+            if (in_array($key, $category_config['keys'], true)) {
+                $total_count++;
+
+                if (!$this->core_settings->set($key, $value)) {
+                    $this->last_failed_keys[] = $key;
+
+                    // Name the key in the log: the UI can only ever show one
+                    // message for the batch, so without this a single dropped
+                    // setting is indistinguishable from a healthy save.
+                    // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- deliberate diagnostic, see above.
+                    error_log(sprintf('ThinkRank [%s]: settings save failed — key \'%s\' was not stored', $category, $key));
+                }
+            }
+        }
+
+        // Every requested key must persist. A partial save used to pass on a 70%
+        // threshold, so a batch could silently drop up to a third of the user's
+        // settings while the UI reported success and the values were simply gone
+        // (#300). Note the write is not transactional: the keys that did save
+        // stay saved, which is why the failed keys are reported rather than just
+        // a bare false.
+        $success = $total_count > 0 && empty($this->last_failed_keys);
+
+        if ($success) {
+            update_option('thinkrank_settings_last_updated', current_time('mysql'));
+        }
+
+        return $success;
+    }
+
+    /**
+     * Get SEO settings by category
+     *
+     * @since 1.0.0
+     *
+     * @param string $category Category name
+     * @param string $context_type Context type
+     * @param int|null $context_id Context ID
+     * @return array SEO settings for category
+     */
+    private function get_seo_settings_by_category(string $category, string $context_type, ?int $context_id): array {
+        // For SEO categories, delegate to SEO Settings Manager
+        return $this->seo_settings->get_settings_by_category($context_type, $context_id, $category);
+    }
+
+    /**
+     * Update SEO settings by category
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Settings to update
+     * @param string $category Category name
+     * @param string $context_type Context type
+     * @param int|null $context_id Context ID
+     * @return bool|null True on success, false on failure, null when the SEO
+     *                   store does not own the category.
+     */
+    private function update_seo_settings_by_category(array $settings, string $category, string $context_type, ?int $context_id): ?bool {
+        return $this->seo_settings->save_settings_by_category($context_type, $context_id, $settings, $category);
+    }
+
+    /**
+     * Validate core settings
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Settings to validate
+     * @param string $category Category name
+     * @return array Validation results
+     */
+    private function validate_core_settings(array $settings, string $category): array {
+        $validation = [
+            'valid' => true,
+            'errors' => [],
+            'warnings' => []
+        ];
+
+        $category_config = $this->settings_categories[$category];
+
+        foreach ($settings as $key => $value) {
+            if (!in_array($key, $category_config['keys'], true)) {
+                $validation['warnings'][] = "Unknown setting key: {$key}";
+                continue;
+            }
+
+            // Validate specific core settings
+            $field_validation = $this->validate_core_setting($key, $value);
+            if (!$field_validation['valid']) {
+                $validation['valid'] = false;
+                $validation['errors'] = array_merge($validation['errors'], $field_validation['errors']);
+            }
+        }
+
+        return $validation;
+    }
+
+    /**
+     * Validate SEO settings
+     *
+     * @since 1.0.0
+     *
+     * @param array $settings Settings to validate
+     * @param string $category Category name
+     * @return array Validation results
+     */
+    private function validate_seo_settings(array $settings, string $category): array {
+        // Delegate to SEO Settings Manager validation
+        return $this->seo_settings->validate_settings($settings);
+    }
+
+    /**
+     * Validate individual core setting
+     *
+     * @since 1.0.0
+     *
+     * @param string $key Setting key
+     * @param mixed $value Setting value
+     * @return array Validation result
+     */
+    private function validate_core_setting(string $key, $value): array {
+        $validation = ['valid' => true, 'errors' => []];
+
+        switch ($key) {
+            case 'openai_api_key':
+            case 'claude_api_key':
+            case 'openrouter_api_key':
+            case 'openai_compatible_api_key':
+            case 'openai_compatible_model':
+                if (!empty($value) && !is_string($value)) {
+                    $validation['valid'] = false;
+                    $validation['errors'][] = "{$key} must be a string";
+                }
+                break;
+
+            case 'openai_compatible_base_url':
+                // An unreachable or dangerous URL is refused with a reason
+                // rather than quietly stored (see Endpoint_URL_Validator).
+                if (!empty($value)) {
+                    $validated = \ThinkRank\AI\Endpoint_URL_Validator::validate((string) $value);
+                    if (is_wp_error($validated)) {
+                        $validation['valid'] = false;
+                        $validation['errors'][] = $validated->get_error_message();
+                    }
+                }
+                break;
+
+            case 'max_tokens':
+            case 'cache_duration':
+            case 'max_requests_per_minute':
+            case 'ai_daily_request_limit':
+            case 'seo_score_threshold':
+            case 'api_timeout':
+            case 'retry_attempts':
+            case 'data_retention_days':
+            case 'openai_compatible_timeout':
+                if (!is_numeric($value) || $value < 0) {
+                    $validation['valid'] = false;
+                    $validation['errors'][] = "{$key} must be a positive number";
+                }
+                break;
+
+            case 'temperature':
+                if (!is_numeric($value) || $value < 0 || $value > 2) {
+                    $validation['valid'] = false;
+                    $validation['errors'][] = "temperature must be between 0 and 2";
+                }
+                break;
+
+            case 'ai_provider':
+                // '' is legal: it is Settings::AI_PROVIDER_NONE, the state a
+                // fresh install starts in and the one a user returns to by
+                // deselecting their provider (#572).
+                if (!in_array($value, \ThinkRank\Core\Settings::selectable_ai_providers(), true)) {
+                    $validation['valid'] = false;
+                    $validation['errors'][] = "ai_provider must be empty (no provider) or one of: "
+                        . implode(', ', \ThinkRank\Core\Settings::SUPPORTED_AI_PROVIDERS);
+                }
+                break;
+
+            case 'dashboard_widgets':
+                if (!is_array($value)) {
+                    $validation['valid'] = false;
+                    $validation['errors'][] = "dashboard_widgets must be an array";
+                }
+                break;
+        }
+
+        return $validation;
+    }
+
+    /**
+     * Reset core settings for category
+     *
+     * @since 1.0.0
+     *
+     * @param string $category Category name
+     * @return bool Success status
+     */
+    private function reset_core_settings(string $category): bool {
+        $category_config = $this->settings_categories[$category];
+        $success = true;
+
+        foreach ($category_config['keys'] as $key) {
+            if (!$this->core_settings->delete($key)) {
+                $success = false;
+            }
+        }
+
+        return $success;
+    }
+
+    /**
+     * Reset SEO settings for category
+     *
+     * @since 1.0.0
+     *
+     * @param string $category Category name
+     * @return bool Success status
+     */
+    private function reset_seo_settings(string $category): bool {
+        try {
+            // Map the settings category to the SEO context type
+            return $this->seo_settings->reset_to_defaults('site');
+        } catch (\Exception $e) {
+            if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+                // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Debug logging only when WP_DEBUG is enabled.
+                error_log('ThinkRank: Failed to reset SEO settings for category "' . $category . '": ' . $e->getMessage());
+            }
+            return false;
+        }
+    }
+}

@@ -1,0 +1,1789 @@
+<?php
+
+/**
+ * Database Schema Manager Class
+ *
+ * Comprehensive database schema implementation for ThinkRank SEO plugin.
+ * Creates and manages all 11 ThinkRank tables with proper indexes, constraints,
+ * and WordPress-compliant database operations following 2025 best practices.
+ *
+ * Tables managed:
+ * - SEO Tables (7): Settings, Analysis, Keywords, Schema, Social, Performance, Local
+ * - AI/Core Tables (4): AI Cache, AI Usage, Content Briefs, SEO Scores
+ *
+ * @package ThinkRank
+ * @subpackage Database
+ * @since 1.0.0
+ */
+
+declare(strict_types=1);
+
+namespace ThinkRank\Database;
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Database Schema Manager Class
+ *
+ * Handles creation, management, and optimization of all SEO database tables.
+ * Implements WordPress database standards with proper indexing and constraints.
+ *
+ * @since 1.0.0
+ */
+class Database_Schema {
+
+    /**
+     * WordPress database instance
+     *
+     * @since 1.0.0
+     * @var \wpdb
+     */
+    private \wpdb $wpdb;
+
+    /**
+     * Database version for schema tracking
+     *
+     * @since 1.0.0
+     * @var string
+     */
+    private string $db_version = '1.9.2';
+
+    /**
+     * Widest single indexed COLUMN InnoDB accepts on a COMPACT/REDUNDANT row
+     * format, in bytes.
+     *
+     * The limit is per column, not per key: a key may total well over this as
+     * long as no one column contributes more than 767 bytes. MySQL 5.7+ and
+     * MariaDB 10.2+ default to DYNAMIC and raise it to 3072, but MySQL 5.6-era
+     * servers (and anything with innodb_large_prefix off) enforce 767 — and on
+     * a UNIQUE key it is fatal, because uniqueness cannot be guaranteed from a
+     * truncated prefix, so the whole CREATE TABLE is rejected and the table
+     * never exists (#298). A non-unique key is silently truncated instead.
+     *
+     * utf8mb4 costs 4 bytes per character, so varchar(191) = 764 bytes is the
+     * widest column that fits — the same reason WordPress core uses 191.
+     *
+     * @since 1.30.0
+     * @var int
+     */
+    private const MAX_INDEX_COLUMN_BYTES = 767;
+
+    /**
+     * Wide keys replaced by prefixed equivalents, as new name => legacy name.
+     *
+     * dbDelta never drops or rewrites an existing index, so installs created
+     * before #298 keep their full-width key. The prefixed key is added under a
+     * new name (dbDelta only adds what is absent) and the legacy one is dropped
+     * here once its replacement is confirmed present — never before, so a
+     * failed ALTER leaves the table exactly as it was.
+     *
+     * @since 1.30.0
+     * @var array<string, array<string, string>>
+     */
+    private const REPLACED_WIDE_INDEXES = [
+        'seo_settings' => ['unique_setting_v2' => 'unique_setting'],
+        'seo_social'   => ['unique_social_meta_v2' => 'unique_social_meta'],
+        'ai_cache'     => ['unique_cache_key' => 'cache_key'],
+    ];
+
+    /**
+     * Transient caching a verified-complete schema, so the missing-table probe
+     * costs one query per hour on a healthy site rather than one per request.
+     *
+     * @since 1.28.0
+     * @var string
+     */
+    private const TABLES_VERIFIED_TRANSIENT = 'thinkrank_schema_verified';
+
+    /**
+     * Option holding why the last create_tables() run left a table missing.
+     *
+     * A rejected CREATE TABLE is the one schema failure the plugin cannot
+     * recover from on its own: needs_update() re-runs creation on every request
+     * precisely because a missing table is normally self-healing, so a database
+     * that refuses the statement loops silently forever while every settings
+     * screen fails. dbDelta swallows the error, so capture it here — it names
+     * the cause (denied CREATE privilege, unsupported collation, index width)
+     * that nothing else on the site reports.
+     *
+     * @since 1.32.1
+     * @var string
+     */
+    private const CREATE_FAILURE_OPTION = 'thinkrank_schema_create_error';
+
+    /**
+     * Throttle for the create-failure log line. Creation is re-attempted on
+     * every request while a table is missing, and one log entry per request
+     * per table would bury the error it is meant to surface.
+     *
+     * @since 1.32.1
+     * @var string
+     */
+    private const CREATE_FAILURE_LOGGED_TRANSIENT = 'thinkrank_schema_create_error_logged';
+
+    /**
+     * Database table definitions with specifications
+     *
+     * Consolidated table definitions for all ThinkRank tables (11 total):
+     * - SEO Tables (7): Core SEO functionality with context-aware structure
+     * - AI/Core Tables (4): AI caching, usage tracking, content briefs, and scoring
+     *
+     * @since 1.0.0
+     * @var array
+     */
+    private array $table_definitions = [
+        // === SEO TABLES (7) ===
+        'seo_settings' => [
+            'description' => 'Universal SEO settings storage with context-aware structure',
+            'primary_key' => 'setting_id',
+            'indexes' => ['context_type', 'context_id', 'setting_category', 'is_active'],
+            'foreign_keys' => []
+        ],
+        'seo_analysis' => [
+            'description' => 'SEO analysis results and scoring data',
+            'primary_key' => 'analysis_id',
+            'indexes' => ['context_type', 'context_id', 'analysis_type', 'created_at'],
+            'composite_indexes' => [
+                'context_analysis_date' => ['context_type', 'analysis_type', 'created_at'],
+                'context_recent' => ['context_type', 'context_id', 'created_at']
+            ],
+            'foreign_keys' => []
+        ],
+        'seo_keywords' => [
+            'description' => 'Keyword tracking and optimization data',
+            'primary_key' => 'keyword_id',
+            'indexes' => ['context_type', 'context_id', 'keyword_type', 'keyword_hash'],
+            'foreign_keys' => []
+        ],
+        'seo_schema' => [
+            'description' => 'Schema markup storage and validation',
+            'primary_key' => 'schema_id',
+            'indexes' => ['context_type', 'context_id', 'schema_type', 'is_active'],
+            'foreign_keys' => []
+        ],
+        'seo_social' => [
+            'description' => 'Social media meta and optimization data',
+            'primary_key' => 'social_id',
+            'indexes' => ['context_type', 'context_id', 'platform', 'is_active'],
+            'foreign_keys' => []
+        ],
+        'seo_performance' => [
+            'description' => 'Performance metrics and Core Web Vitals data',
+            'primary_key' => 'performance_id',
+            'indexes' => ['context_type', 'context_id', 'metric_type', 'measured_at'],
+            'foreign_keys' => []
+        ],
+        'seo_local' => [
+            'description' => 'Local SEO and business data storage',
+            'primary_key' => 'local_id',
+            'indexes' => ['context_type', 'context_id', 'business_type', 'is_active'],
+            'foreign_keys' => []
+        ],
+
+        // === AI/CORE TABLES (4) ===
+        'ai_cache' => [
+            'description' => 'AI response caching for performance optimization',
+            'primary_key' => 'id',
+            'indexes' => ['cache_key', 'expires_at', 'created_at'],
+            'composite_indexes' => [
+                // cache_key is varchar(255) — 1020 bytes in utf8mb4, so it is
+                // prefixed here for the same reason as the unique key (#298).
+                'cache_lookup' => ['cache_key(191)', 'expires_at'],
+                'cleanup_expired' => ['expires_at', 'created_at']
+            ],
+            'foreign_keys' => []
+        ],
+        'ai_usage' => [
+            'description' => 'AI usage tracking and token consumption monitoring',
+            'primary_key' => 'id',
+            'indexes' => ['user_id', 'action', 'provider', 'created_at'],
+            'composite_indexes' => [
+                'user_analytics' => ['user_id', 'created_at', 'provider'],
+                'provider_action' => ['provider', 'action', 'created_at'],
+                'user_provider_date' => ['user_id', 'provider', 'created_at']
+            ],
+            'foreign_keys' => []
+        ],
+        'content_briefs' => [
+            'description' => 'Generated content briefs storage and management',
+            'primary_key' => 'id',
+            'indexes' => ['user_id', 'content_type', 'created_at'],
+            'composite_indexes' => [
+                'user_content_date' => ['user_id', 'content_type', 'created_at'],
+                'user_recent' => ['user_id', 'created_at']
+            ],
+            'foreign_keys' => []
+        ],
+        'seo_scores' => [
+            'description' => 'SEO score calculations and historical tracking',
+            'primary_key' => 'id',
+            'indexes' => ['post_id', 'user_id', 'overall_score', 'grade', 'calculated_at', 'created_at'],
+            'composite_indexes' => [
+                'post_user_date' => ['post_id', 'user_id', 'created_at'],
+                'user_score_date' => ['user_id', 'overall_score', 'created_at'],
+                'post_latest' => ['post_id', 'calculated_at']
+            ],
+            'foreign_keys' => []
+        ],
+        'instant_indexing_logs' => [
+            'description' => 'Log of IndexNow URL submissions',
+            'primary_key' => 'id',
+            'indexes' => ['url', 'status', 'response_code', 'created_at'],
+            'foreign_keys' => []
+        ],
+        'email_report_logs' => [
+            'description' => 'Audit + dedupe log for scheduled SEO email reports',
+            'primary_key' => 'id',
+            'indexes' => ['site_id', 'status', 'sent_at', 'period_start'],
+            'composite_indexes' => [
+                'dedupe_key' => ['site_id', 'period_start', 'recipient_hash'],
+                'site_recent' => ['site_id', 'sent_at']
+            ],
+            'foreign_keys' => []
+        ],
+
+        // === AI VISIBILITY TABLES (1) ===
+        'ai_traffic' => [
+            'description' => 'Daily aggregate counters for AI referral traffic, AI crawler hits, and the all-traffic baseline',
+            'primary_key' => 'id',
+            'indexes' => ['day', 'kind'],
+            'foreign_keys' => []
+        ]
+    ];
+
+    /**
+     * WordPress database charset and collation
+     *
+     * @since 1.0.0
+     * @var array
+     */
+    private array $db_config;
+
+    /**
+     * Table categories for better organization and maintenance
+     *
+     * @since 1.0.0
+     * @var array
+     */
+    private array $table_categories = [
+        'seo' => ['seo_settings', 'seo_analysis', 'seo_keywords', 'seo_schema', 'seo_social', 'seo_performance', 'seo_local', 'instant_indexing_logs'],
+        'ai' => ['ai_cache', 'ai_usage'],
+        'content' => ['content_briefs'],
+        'scoring' => ['seo_scores'],
+        'reporting' => ['email_report_logs'],
+        'ai_visibility' => ['ai_traffic']
+    ];
+
+    /**
+     * Constructor
+     *
+     * @since 1.0.0
+     */
+    public function __construct() {
+        global $wpdb;
+        $this->wpdb = $wpdb;
+
+        // Set database configuration
+        // Ask WordPress for the clause rather than assembling one. Charset and
+        // collation are not independent: DB_COLLATE is empty on most installs,
+        // so a per-value fallback pairs the site's real charset with a default
+        // collation that may not belong to it — `CHARACTER SET utf8 COLLATE
+        // utf8mb4_unicode_ci` is rejected outright (MySQL 1253), and dbDelta
+        // reports nothing, so every table silently fails to be created.
+        // get_charset_collate() omits COLLATE when there is none to state.
+        $this->db_config = ['charset_collate' => $wpdb->get_charset_collate()];
+    }
+
+    /**
+     * Create all database tables
+     *
+     * @since 1.0.0
+     *
+     * @return array Creation results with success/failure status
+     */
+    public function create_tables(): array {
+        $results = [
+            'success' => true,
+            'tables_created' => [],
+            'tables_failed' => [],
+            'errors' => [],
+            'total_tables' => count($this->table_definitions)
+        ];
+
+        // Require WordPress upgrade functions
+        if (!function_exists('dbDelta')) {
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        }
+
+        foreach ($this->table_definitions as $table_name => $definition) {
+            try {
+                $full_table_name = $this->get_table_name($table_name);
+                $sql = $this->get_table_sql($table_name);
+
+                // Create table using dbDelta for WordPress compatibility
+                $result = dbDelta($sql);
+
+                // dbDelta reports nothing when the database refuses the
+                // statement, so wpdb's own error is the only account of why.
+                // Read it now: table_exists() runs a query of its own, and
+                // every wpdb query starts by clearing last_error.
+                $db_error = (string) $this->wpdb->last_error;
+
+                // Verify table creation
+                if ($this->table_exists($full_table_name)) {
+                    $results['tables_created'][] = $full_table_name;
+
+                    // Create indexes
+                    $this->create_table_indexes($table_name);
+
+                    // Add constraints if needed
+                    $this->add_table_constraints($table_name);
+                } else {
+                    $results['tables_failed'][] = $full_table_name;
+                    $results['errors'][] = "Failed to create table: {$full_table_name}"
+                        . ('' !== $db_error ? ': ' . $db_error : '');
+                    $results['success'] = false;
+                }
+            } catch (\Exception $e) {
+                $results['tables_failed'][] = $this->get_table_name($table_name);
+                $results['errors'][] = "Error creating {$table_name}: " . $e->getMessage();
+                $results['success'] = false;
+            }
+        }
+
+        // Retire the pre-#298 full-width keys now that their prefixed
+        // replacements are in place.
+        $this->drop_replaced_wide_indexes();
+
+        // Evict REST envelope keys that earlier saves stored as settings.
+        $this->purge_envelope_setting_rows();
+
+        // And every other key no manager declares, stored the same way.
+        $this->purge_unknown_setting_rows();
+
+        // Update database version
+        if ($results['success']) {
+            update_option('thinkrank_seo_db_version', $this->db_version);
+            update_option('thinkrank_seo_db_created', current_time('mysql'));
+            delete_option(self::CREATE_FAILURE_OPTION);
+        } else {
+            $this->record_create_failure($results['errors']);
+        }
+
+        // The schema just changed, so any cached "verified complete" answer is
+        // stale either way — drop it and let the next probe re-check.
+        delete_transient(self::TABLES_VERIFIED_TRANSIENT);
+
+        return $results;
+    }
+
+    /**
+     * Keep the reason a table could not be created, and say it out loud once.
+     *
+     * @since 1.32.1
+     *
+     * @param string[] $errors Failure messages from create_tables().
+     * @return void
+     */
+    private function record_create_failure(array $errors): void {
+        $reason = implode('; ', array_filter($errors));
+
+        if ('' === $reason) {
+            return;
+        }
+
+        update_option(self::CREATE_FAILURE_OPTION, $reason, false);
+
+        if (get_transient(self::CREATE_FAILURE_LOGGED_TRANSIENT)) {
+            return;
+        }
+
+        set_transient(self::CREATE_FAILURE_LOGGED_TRANSIENT, 1, HOUR_IN_SECONDS);
+
+        // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- deliberate diagnostic; the UI can only report that a table is missing, never why.
+        error_log('ThinkRank [schema]: table creation failed — ' . $reason);
+    }
+
+    /**
+     * Why the last table creation attempt failed, if it did.
+     *
+     * Read by the SEO managers so a "settings table does not exist" message can
+     * name the database error behind it instead of guessing at causes.
+     *
+     * @since 1.32.1
+     *
+     * @return string Failure reason, or '' if creation last succeeded.
+     */
+    public static function get_last_create_failure(): string {
+        return (string) get_option(self::CREATE_FAILURE_OPTION, '');
+    }
+
+    /**
+     * Drop all database tables
+     *
+     * @since 1.0.0
+     *
+     * @return array Deletion results
+     */
+    public function drop_tables(): array {
+        $results = [
+            'success' => true,
+            'tables_dropped' => [],
+            'tables_failed' => [],
+            'errors' => []
+        ];
+
+        foreach (array_keys($this->table_definitions) as $table_name) {
+            try {
+                $full_table_name = $this->get_table_name($table_name);
+
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Plugin deactivation requires direct schema changes, DDL cannot be prepared, table name is validated
+                $result = $this->wpdb->query("DROP TABLE IF EXISTS `{$full_table_name}`");
+
+                if ($result !== false) {
+                    $results['tables_dropped'][] = $full_table_name;
+                } else {
+                    $results['tables_failed'][] = $full_table_name;
+                    $results['errors'][] = "Failed to drop table: {$full_table_name}";
+                    $results['success'] = false;
+                }
+            } catch (\Exception $e) {
+                $results['tables_failed'][] = $this->get_table_name($table_name);
+                $results['errors'][] = "Error dropping {$table_name}: " . $e->getMessage();
+                $results['success'] = false;
+            }
+        }
+
+        // Clean up options
+        if ($results['success']) {
+            delete_option('thinkrank_seo_db_version');
+            delete_option('thinkrank_seo_db_created');
+        }
+
+        return $results;
+    }
+
+    /**
+     * Check if database schema needs updates
+     *
+     * @since 1.0.0
+     *
+     * @return bool True if update needed
+     */
+    public function needs_update(): bool {
+        $current_version = get_option('thinkrank_seo_db_version', '0.0.0');
+
+        if (version_compare($current_version, $this->db_version, '<')) {
+            return true;
+        }
+
+        // Version-only gating has now failed twice (#252, #270): if tables are
+        // added but the version isn't moved — or a table is dropped, or an
+        // upgrade half-completes — the stored version matches, the gate says
+        // "nothing to do", and the feature is dead with no way back except
+        // deactivate/reactivate. So also heal when a registered table is
+        // actually missing. dbDelta only creates what's absent, making this
+        // safe to re-run.
+        return !empty($this->missing_tables());
+    }
+
+    /**
+     * Registered tables that don't exist in the database.
+     *
+     * One `SHOW TABLES LIKE` for all of them, and the healthy answer is cached
+     * so a correct install pays at most one extra query per hour rather than
+     * one per request. The cache is cleared whenever tables are created.
+     *
+     * @since 1.28.0
+     *
+     * @return string[] Missing table names (full, prefixed).
+     */
+    public function missing_tables(): array {
+        $cached = get_transient(self::TABLES_VERIFIED_TRANSIENT);
+        if ($cached === $this->db_version) {
+            return [];
+        }
+
+        $expected = [];
+        foreach (array_keys($this->table_definitions) as $table) {
+            $expected[] = $this->get_table_name($table);
+        }
+
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema probe; result cached below.
+        $existing = (array) $this->wpdb->get_col(
+            // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- table name is $wpdb->prefix plus a literal, and every value is passed as a placeholder replacement.
+            $this->wpdb->prepare(
+                'SHOW TABLES LIKE %s',
+                // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- table name is $wpdb->prefix plus a literal, and every value is passed as a placeholder replacement.
+                $this->wpdb->esc_like($this->wpdb->prefix . 'thinkrank_') . '%'
+            )
+        );
+            // phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+                // phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+        $missing = array_values(array_diff($expected, $existing));
+
+        if (empty($missing)) {
+            set_transient(self::TABLES_VERIFIED_TRANSIENT, $this->db_version, HOUR_IN_SECONDS);
+        }
+
+        return $missing;
+    }
+
+    /**
+     * The schema version this plugin build expects (the target of needs_update).
+     *
+     * @since 1.23.0
+     *
+     * @return string Expected schema version, e.g. "1.2.0".
+     */
+    public function get_schema_version(): string {
+        return $this->db_version;
+    }
+
+    /**
+     * Get database status and information
+     *
+     * @since 1.0.0
+     *
+     * @return array Database status information
+     */
+    public function get_database_status(): array {
+        $status = [
+            'version' => get_option('thinkrank_seo_db_version', 'Not installed'),
+            'created_at' => get_option('thinkrank_seo_db_created', 'Unknown'),
+            'tables' => [],
+            'total_records' => 0,
+            'database_size' => 0,
+            'needs_update' => $this->needs_update()
+        ];
+
+        foreach (array_keys($this->table_definitions) as $table_name) {
+            $full_table_name = $this->get_table_name($table_name);
+            $table_info = $this->get_table_info($full_table_name);
+
+            $status['tables'][$table_name] = $table_info;
+            $status['total_records'] += $table_info['row_count'];
+            $status['database_size'] += $table_info['data_size'];
+        }
+
+        return $status;
+    }
+
+    /**
+     * Optimize all database tables
+     *
+     * @since 1.0.0
+     *
+     * @return array Optimization results
+     */
+    public function optimize_tables(): array {
+        $results = [
+            'success' => true,
+            'tables_optimized' => [],
+            'tables_failed' => [],
+            'space_saved' => 0,
+            'errors' => []
+        ];
+
+        foreach (array_keys($this->table_definitions) as $table_name) {
+            try {
+                $full_table_name = $this->get_table_name($table_name);
+
+                // Get table size before optimization
+                $size_before = $this->get_table_size($full_table_name);
+
+                // Optimize table
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table optimization requires direct database access, DDL cannot be prepared, table name is validated
+                $result = $this->wpdb->query("OPTIMIZE TABLE `{$full_table_name}`");
+
+                if ($result !== false) {
+                    $size_after = $this->get_table_size($full_table_name);
+                    $space_saved = $size_before - $size_after;
+
+                    $results['tables_optimized'][] = [
+                        'table' => $full_table_name,
+                        'space_saved' => $space_saved
+                    ];
+                    $results['space_saved'] += $space_saved;
+                } else {
+                    $results['tables_failed'][] = $full_table_name;
+                    $results['errors'][] = "Failed to optimize table: {$full_table_name}";
+                    $results['success'] = false;
+                }
+            } catch (\Exception $e) {
+                $results['tables_failed'][] = $this->get_table_name($table_name);
+                $results['errors'][] = "Error optimizing {$table_name}: " . $e->getMessage();
+                $results['success'] = false;
+            }
+        }
+
+        return $results;
+    }
+
+    /**
+     * Get full table name with WordPress prefix
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Base table name
+     * @return string Full table name with prefix
+     */
+    private function get_table_name(string $table_name): string {
+        return $this->wpdb->prefix . 'thinkrank_' . $table_name;
+    }
+
+    /**
+     * Check if table exists
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @return bool True if table exists
+     */
+    private function table_exists(string $table_name): bool {
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Schema validation requires direct database access
+        $result = $this->wpdb->get_var(
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- SQL is properly prepared with placeholders
+            $this->wpdb->prepare("SHOW TABLES LIKE %s", $table_name)
+        );
+
+        return $result === $table_name;
+    }
+
+    /**
+     * Get SQL for creating a specific table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Table name
+     * @return string SQL for table creation
+     *
+     * @throws \InvalidArgumentException On failure.
+     */
+    private function get_table_sql(string $table_name): string {
+        $full_table_name = $this->get_table_name($table_name);
+
+        // Pin the engine instead of inheriting the server's
+        // default_storage_engine. The indexes below assume InnoDB: MyISAM caps
+        // a key at 1000 bytes (seo_settings and seo_social exceed it) and
+        // rejects descending indexes (seo_schema), so on a server defaulting
+        // to MyISAM those tables were never created (#725).
+        $charset_collate = trim('ENGINE=InnoDB ' . $this->db_config['charset_collate']);
+
+        switch ($table_name) {
+            // SEO Tables
+            case 'seo_settings':
+                return $this->get_seo_settings_table_sql($full_table_name, $charset_collate);
+            case 'seo_analysis':
+                return $this->get_seo_analysis_table_sql($full_table_name, $charset_collate);
+            case 'seo_keywords':
+                return $this->get_seo_keywords_table_sql($full_table_name, $charset_collate);
+            case 'seo_schema':
+                return $this->get_seo_schema_table_sql($full_table_name, $charset_collate);
+            case 'seo_social':
+                return $this->get_seo_social_table_sql($full_table_name, $charset_collate);
+            case 'seo_performance':
+                return $this->get_seo_performance_table_sql($full_table_name, $charset_collate);
+            case 'seo_local':
+                return $this->get_seo_local_table_sql($full_table_name, $charset_collate);
+
+                // AI/Core Tables
+            case 'ai_cache':
+                return $this->get_ai_cache_table_sql($full_table_name, $charset_collate);
+            case 'ai_usage':
+                return $this->get_ai_usage_table_sql($full_table_name, $charset_collate);
+            case 'content_briefs':
+                return $this->get_content_briefs_table_sql($full_table_name, $charset_collate);
+            case 'seo_scores':
+                return $this->get_seo_scores_table_sql($full_table_name, $charset_collate);
+            case 'instant_indexing_logs':
+                return $this->get_instant_indexing_logs_table_sql($full_table_name, $charset_collate);
+            case 'email_report_logs':
+                return $this->get_email_report_logs_table_sql($full_table_name, $charset_collate);
+
+                // AI Visibility Tables
+            case 'ai_traffic':
+                return $this->get_ai_traffic_table_sql($full_table_name, $charset_collate);
+
+            default:
+                throw new \InvalidArgumentException('Unknown table: ' . esc_html($table_name));
+        }
+    }
+
+    /**
+     * Get SQL for SEO Settings table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_settings_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            setting_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            setting_category varchar(100) NOT NULL DEFAULT 'general',
+            setting_key varchar(255) NOT NULL,
+            setting_value longtext NULL,
+            setting_type varchar(50) NOT NULL DEFAULT 'string',
+            is_active tinyint(1) NOT NULL DEFAULT 1,
+            priority int(11) NOT NULL DEFAULT 0,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            created_by bigint(20) unsigned NULL,
+            updated_by bigint(20) unsigned NULL,
+            PRIMARY KEY (setting_id),
+            UNIQUE KEY unique_setting_v2 (context_type, context_id, setting_category, setting_key(191)),
+            KEY idx_context (context_type, context_id),
+            KEY idx_category (setting_category),
+            KEY idx_active (is_active),
+            KEY idx_created (created_at),
+            KEY idx_updated (updated_at),
+            KEY idx_context_cat_active (context_type, context_id, setting_category, is_active)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Analysis table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_analysis_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            analysis_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            analysis_type varchar(100) NOT NULL,
+            analysis_data longtext NULL,
+            score int(11) NOT NULL DEFAULT 0,
+            status varchar(50) NOT NULL DEFAULT 'pending',
+            ai_confidence decimal(3,2) NULL,
+            recommendations longtext NULL,
+            validation_errors longtext NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            analyzed_by bigint(20) unsigned NULL,
+            PRIMARY KEY (analysis_id),
+            KEY idx_context (context_type, context_id),
+            KEY idx_type (analysis_type),
+            KEY idx_status (status),
+            KEY idx_score (score),
+            KEY idx_created (created_at),
+            KEY idx_confidence (ai_confidence)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Keywords table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_keywords_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            keyword_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            keyword_text varchar(500) NOT NULL,
+            keyword_hash varchar(64) NOT NULL,
+            keyword_type varchar(50) NOT NULL DEFAULT 'primary',
+            search_volume int(11) NULL,
+            competition_score decimal(3,2) NULL,
+            difficulty_score decimal(3,2) NULL,
+            density decimal(5,2) NULL,
+            position int(11) NULL,
+            ranking_url varchar(2048) NULL,
+            is_tracking tinyint(1) NOT NULL DEFAULT 0,
+            is_active tinyint(1) NOT NULL DEFAULT 1,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            tracked_by bigint(20) unsigned NULL,
+            PRIMARY KEY (keyword_id),
+            UNIQUE KEY unique_keyword (context_type, context_id, keyword_hash),
+            KEY idx_context (context_type, context_id),
+            KEY idx_type (keyword_type),
+            KEY idx_hash (keyword_hash),
+            KEY idx_tracking (is_tracking),
+            KEY idx_active (is_active),
+            KEY idx_position (position),
+            KEY idx_created (created_at),
+            FULLTEXT KEY ft_keyword (keyword_text)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Schema table (Optimized Version 2.0)
+     *
+     * @since 1.0.0
+     * @updated 2.0.0 - Optimized structure with fewer columns and better indexes
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_schema_table_sql(string $table_name, string $charset_collate): string {
+        // Check MySQL version for JSON column support with caching
+        $schema_data_type = $this->get_mysql_json_support() ? 'JSON' : 'longtext';
+
+        return "CREATE TABLE `{$table_name}` (
+            schema_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            schema_type varchar(100) NOT NULL,
+            schema_data {$schema_data_type} NOT NULL,
+            validation_status varchar(50) NOT NULL DEFAULT 'pending',
+            is_active tinyint(1) NOT NULL DEFAULT 1,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (schema_id),
+            KEY idx_context_active (context_type, context_id, is_active),
+            KEY idx_type_active (schema_type, is_active),
+            KEY idx_created (created_at),
+            KEY idx_context_schema_active (context_type, schema_type, is_active, created_at DESC),
+            KEY idx_validation_active (validation_status, is_active)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Social table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_social_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            social_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            platform varchar(50) NOT NULL,
+            meta_type varchar(100) NOT NULL,
+            meta_key varchar(255) NOT NULL,
+            meta_value longtext NULL,
+            image_url varchar(2048) NULL,
+            image_width int(11) NULL,
+            image_height int(11) NULL,
+            is_optimized tinyint(1) NOT NULL DEFAULT 0,
+            is_active tinyint(1) NOT NULL DEFAULT 1,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            created_by bigint(20) unsigned NULL,
+            PRIMARY KEY (social_id),
+            UNIQUE KEY unique_social_meta_v2 (context_type, context_id, platform, meta_key(191)),
+            KEY idx_context (context_type, context_id),
+            KEY idx_platform (platform),
+            KEY idx_type (meta_type),
+            KEY idx_optimized (is_optimized),
+            KEY idx_active (is_active),
+            KEY idx_created (created_at)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Performance table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_performance_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            performance_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            metric_type varchar(100) NOT NULL,
+            metric_value decimal(10,4) NOT NULL,
+            metric_unit varchar(50) NOT NULL DEFAULT 'score',
+            threshold_good decimal(10,4) NULL,
+            threshold_poor decimal(10,4) NULL,
+            status varchar(50) NOT NULL DEFAULT 'unknown',
+            device_type varchar(20) NOT NULL DEFAULT 'desktop',
+            connection_type varchar(50) NULL,
+            measured_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            measured_by varchar(100) NULL,
+            PRIMARY KEY (performance_id),
+            KEY idx_context (context_type, context_id),
+            KEY idx_metric (metric_type),
+            KEY idx_status (status),
+            KEY idx_device (device_type),
+            KEY idx_measured (measured_at),
+            KEY idx_created (created_at),
+            KEY idx_value (metric_value)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Local table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_local_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            local_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            context_type varchar(50) NOT NULL DEFAULT 'site',
+            context_id bigint(20) unsigned NULL,
+            business_type varchar(100) NOT NULL DEFAULT 'LocalBusiness',
+            business_name varchar(255) NOT NULL,
+            business_address longtext NULL,
+            business_phone varchar(50) NULL,
+            business_email varchar(255) NULL,
+            business_website varchar(2048) NULL,
+            latitude decimal(10,8) NULL,
+            longitude decimal(11,8) NULL,
+            google_place_id varchar(255) NULL,
+            google_my_business_url varchar(2048) NULL,
+            business_hours longtext NULL,
+            nap_consistency_score int(11) NOT NULL DEFAULT 0,
+            local_seo_score int(11) NOT NULL DEFAULT 0,
+            is_verified tinyint(1) NOT NULL DEFAULT 0,
+            is_active tinyint(1) NOT NULL DEFAULT 1,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            created_by bigint(20) unsigned NULL,
+            PRIMARY KEY (local_id),
+            UNIQUE KEY unique_business (context_type, context_id),
+            KEY idx_context (context_type, context_id),
+            KEY idx_type (business_type),
+            KEY idx_location (latitude, longitude),
+            KEY idx_verified (is_verified),
+            KEY idx_active (is_active),
+            KEY idx_nap_score (nap_consistency_score),
+            KEY idx_local_score (local_seo_score),
+            KEY idx_created (created_at)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for AI Cache table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_ai_cache_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            cache_key varchar(255) NOT NULL,
+            cache_data longtext NOT NULL,
+            expires_at bigint(20) unsigned NOT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY unique_cache_key (cache_key(191)),
+            KEY expires_at_idx (expires_at),
+            KEY created_at_idx (created_at)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for AI Usage table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_ai_usage_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) unsigned NOT NULL,
+            action varchar(100) NOT NULL,
+            tokens_used int(11) NOT NULL DEFAULT 0,
+            provider varchar(50) NOT NULL,
+            post_id bigint(20) unsigned NULL,
+            metadata longtext NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY user_id_idx (user_id),
+            KEY action_idx (action),
+            KEY created_at_idx (created_at),
+            KEY provider_idx (provider)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for Content Briefs table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_content_briefs_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) unsigned NOT NULL,
+            title varchar(255) NOT NULL,
+            target_keywords text NOT NULL,
+            content_type varchar(50) NOT NULL DEFAULT 'blog_post',
+            brief_data longtext NOT NULL,
+            parsing_status varchar(50) NOT NULL DEFAULT 'success',
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY user_id_idx (user_id),
+            KEY created_at_idx (created_at),
+            KEY content_type_idx (content_type),
+            KEY parsing_status_idx (parsing_status)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for Instant Indexing Logs table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_instant_indexing_logs_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            url varchar(2048) NOT NULL,
+            status varchar(50) NOT NULL,
+            response_code int(11) NULL,
+            response_message text NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_url (url(191)),
+            KEY idx_status (status),
+            KEY idx_response_code (response_code),
+            KEY idx_created (created_at)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for SEO Scores table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name    Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_seo_scores_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            post_id bigint(20) unsigned NOT NULL,
+            user_id bigint(20) unsigned NOT NULL,
+            overall_score int(11) NOT NULL,
+            score_breakdown longtext NOT NULL,
+            suggestions longtext NOT NULL,
+            grade varchar(2) NOT NULL,
+            readability_score varchar(100) DEFAULT NULL,
+            content_quality varchar(100) DEFAULT NULL,
+            algorithm_version varchar(20) NOT NULL DEFAULT '2024.1',
+            calculated_at datetime NOT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY post_id_idx (post_id),
+            KEY user_id_idx (user_id),
+            KEY created_at_idx (created_at),
+            KEY overall_score_idx (overall_score)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Get SQL for Email Report Logs table.
+     *
+     * Audit + dedupe log for scheduled SEO email reports. The
+     * `unique_send` constraint on (site_id, period_start, recipient_hash)
+     * is what prevents a given site from being sent the same period twice
+     * to the same recipient — required by the PRD.
+     *
+     * `recipient_hash` is a sha256 of the lowercased, sorted recipient list
+     * (so [a@x, b@x] and [b@x, a@x] dedupe to the same row).
+     *
+     * @since 1.9.0
+     *
+     * @param string $table_name      Full table name.
+     * @param string $charset_collate Charset and collation.
+     * @return string SQL for table creation.
+     */
+    private function get_email_report_logs_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            site_id bigint(20) unsigned NOT NULL DEFAULT 0,
+            period_start datetime NOT NULL,
+            period_end datetime NOT NULL,
+            recipient_hash char(64) NOT NULL,
+            recipient_count smallint(5) unsigned NOT NULL DEFAULT 1,
+            frequency_days smallint(5) unsigned NOT NULL DEFAULT 30,
+            status varchar(20) NOT NULL DEFAULT 'pending',
+            attempts smallint(5) unsigned NOT NULL DEFAULT 1,
+            error_message text NULL,
+            sent_at datetime NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY unique_send (site_id, period_start, recipient_hash),
+            KEY idx_site (site_id),
+            KEY idx_status (status),
+            KEY idx_sent (sent_at),
+            KEY idx_period (period_start)
+        ) {$charset_collate};";
+    }
+
+    /**
+     * Create indexes for a specific table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Table name
+     * @return bool Success status
+     */
+    private function create_table_indexes(string $table_name): bool {
+        $full_table_name = $this->get_table_name($table_name);
+        $definition = $this->table_definitions[$table_name] ?? [];
+
+        $success = true;
+
+        // Create single column indexes
+        if (!empty($definition['indexes'])) {
+            foreach ($definition['indexes'] as $index_name) {
+                try {
+                    // Check if index already exists
+                    if ($this->index_exists($full_table_name, $index_name)) {
+                        continue;
+                    }
+
+                    $index_sql = $this->get_index_sql($full_table_name, $index_name);
+                    if ($index_sql) {
+                        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Index creation requires direct schema changes, DDL cannot be prepared
+                        $result = $this->wpdb->query($index_sql);
+                        if (false === $result) {
+                            $success = false;
+                        }
+                    }
+                } catch (\Exception $e) {
+                    $success = false;
+                }
+            }
+        }
+
+        // Create composite indexes for performance optimization
+        if (!empty($definition['composite_indexes'])) {
+            foreach ($definition['composite_indexes'] as $index_name => $columns) {
+                try {
+                    // Check if index already exists
+                    if ($this->index_exists($full_table_name, "idx_{$index_name}")) {
+                        continue;
+                    }
+
+                    $index_sql = $this->get_composite_index_sql($full_table_name, $index_name, $columns);
+                    if ($index_sql) {
+                        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Composite index creation requires direct schema changes, DDL cannot be prepared
+                        $result = $this->wpdb->query($index_sql);
+                        if (false === $result) {
+                            $success = false;
+                        }
+                    }
+                } catch (\Exception $e) {
+                    $success = false;
+                }
+            }
+        }
+
+        return $success;
+    }
+
+    /**
+     * Add constraints for a specific table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Table name
+     * @return bool Success status
+     */
+    private function add_table_constraints(string $table_name): bool {
+        $full_table_name = $this->get_table_name($table_name);
+        $definition = $this->table_definitions[$table_name] ?? [];
+
+        if (empty($definition['foreign_keys'])) {
+            return true;
+        }
+
+        $success = true;
+        foreach ($definition['foreign_keys'] as $constraint) {
+            try {
+                $constraint_sql = $this->get_constraint_sql($full_table_name, $constraint);
+                if ($constraint_sql) {
+                    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Constraint creation requires direct schema changes, DDL cannot be prepared
+                    $result = $this->wpdb->query($constraint_sql);
+                    if (false === $result) {
+                        $success = false;
+                    }
+                }
+            } catch (\Exception $e) {
+                $success = false;
+            }
+        }
+
+        return $success;
+    }
+
+    /**
+     * Get index SQL for a table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @param string $index_name Index name
+     * @return string Index SQL
+     */
+    private function get_index_sql(string $table_name, string $index_name): string {
+        // Most indexes are already created in the table definition
+        // This method is for additional indexes if needed
+        return '';
+    }
+
+    /**
+     * Get composite index SQL for performance optimization
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @param string $index_name Index name
+     * @param array $columns Column names for composite index
+     * @return string Composite index SQL
+     */
+    private function get_composite_index_sql(string $table_name, string $index_name, array $columns): string {
+        if (empty($columns)) {
+            return '';
+        }
+
+        // Escape column names, preserving an optional key prefix — `col(191)`
+        // stays a prefix rather than becoming part of the column name (#298).
+        $escaped_columns = array_map(function ($column) {
+            if (preg_match('/^([A-Za-z0-9_]+)\((\d+)\)$/', trim($column), $matches)) {
+                return "`{$matches[1]}`({$matches[2]})";
+            }
+
+            return "`{$column}`";
+        }, $columns);
+
+        $columns_sql = implode(', ', $escaped_columns);
+        $index_name_escaped = esc_sql($index_name);
+
+        return "CREATE INDEX `idx_{$index_name_escaped}` ON `{$table_name}` ({$columns_sql})";
+    }
+
+    /**
+     * Get constraint SQL for a table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @param array  $constraint Constraint definition
+     * @return string Constraint SQL
+     */
+    private function get_constraint_sql(string $table_name, array $constraint): string {
+        // Foreign key constraints would be defined here
+        // Currently not implemented as tables are designed to be independent
+        return '';
+    }
+
+    /**
+     * Get table information
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @return array Table information
+     */
+    private function get_table_info(string $table_name): array {
+        $info = [
+            'exists' => false,
+            'row_count' => 0,
+            'data_size' => 0,
+            'index_size' => 0,
+            'total_size' => 0,
+            'created' => null,
+            'updated' => null
+        ];
+
+        if (!$this->table_exists($table_name)) {
+            return $info;
+        }
+
+        $info['exists'] = true;
+
+        // Get row count
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table statistics require direct database access, table name cannot be prepared, table name is validated
+        $row_count = $this->wpdb->get_var("SELECT COUNT(*) FROM `{$table_name}`");
+        $info['row_count'] = (int) $row_count;
+
+        // Get table size information
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table size information requires direct database access
+        $size_info = $this->wpdb->get_row(
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- SQL is properly prepared with placeholders
+            $this->wpdb->prepare(
+                "SELECT
+                    data_length as data_size,
+                    index_length as index_size,
+                    (data_length + index_length) as total_size,
+                    create_time as created,
+                    update_time as updated
+                FROM information_schema.TABLES
+                WHERE table_schema = %s AND table_name = %s",
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- DB_NAME is a WordPress constant, safe to use
+                DB_NAME,
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table_name is validated and used as parameter
+                $table_name
+            ),
+            ARRAY_A
+        );
+
+        if ($size_info) {
+            $info['data_size'] = (int) $size_info['data_size'];
+            $info['index_size'] = (int) $size_info['index_size'];
+            $info['total_size'] = (int) $size_info['total_size'];
+            $info['created'] = $size_info['created'];
+            $info['updated'] = $size_info['updated'];
+        }
+
+        return $info;
+    }
+
+    /**
+     * Get table size in bytes
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @return int Table size in bytes
+     */
+    private function get_table_size(string $table_name): int {
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Table size calculation requires direct database access
+        $size = $this->wpdb->get_var(
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- SQL is properly prepared with placeholders
+            $this->wpdb->prepare(
+                "SELECT (data_length + index_length) as total_size
+                FROM information_schema.TABLES
+                WHERE table_schema = %s AND table_name = %s",
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- DB_NAME is a WordPress constant, safe to use
+                DB_NAME,
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table_name is validated and used as parameter
+                $table_name
+            )
+        );
+
+        return (int) $size;
+    }
+
+    /**
+     * Get tables by category for better organization
+     *
+     * @since 1.0.0
+     *
+     * @param string $category Category name (seo, ai, content, scoring)
+     * @return array Table names in the category
+     */
+    public function get_tables_by_category(string $category): array {
+        return $this->table_categories[$category] ?? [];
+    }
+
+    /**
+     * Get all table categories
+     *
+     * @since 1.0.0
+     *
+     * @return array All table categories with their tables
+     */
+    public function get_table_categories(): array {
+        return $this->table_categories;
+    }
+
+    /**
+     * Get table count by category
+     *
+     * @since 1.0.0
+     *
+     * @return array Table counts per category
+     */
+    public function get_table_count_by_category(): array {
+        $counts = [];
+        foreach ($this->table_categories as $category => $tables) {
+            $counts[$category] = count($tables);
+        }
+        $counts['total'] = count($this->table_definitions);
+        return $counts;
+    }
+
+    /**
+     * Validate table definition structure
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Table name to validate
+     * @return array Validation results
+     */
+    public function validate_table_definition(string $table_name): array {
+        $definition = $this->table_definitions[$table_name] ?? null;
+
+        if (!$definition) {
+            return [
+                'valid' => false,
+                'errors' => ["Table definition not found: {$table_name}"]
+            ];
+        }
+
+        $errors = [];
+        $required_keys = ['description', 'primary_key', 'indexes', 'foreign_keys'];
+
+        foreach ($required_keys as $key) {
+            if (!isset($definition[$key])) {
+                $errors[] = "Missing required key '{$key}' in table definition for {$table_name}";
+            }
+        }
+
+        return [
+            'valid' => empty($errors),
+            'errors' => $errors
+        ];
+    }
+
+    /**
+     * Add composite indexes to existing tables for performance optimization
+     *
+     * @since 1.0.0
+     *
+     * @return bool Success status
+     */
+    public function add_performance_indexes(): bool {
+        $success = true;
+
+        foreach ($this->table_definitions as $table_name => $definition) {
+            if (!empty($definition['composite_indexes'])) {
+                $full_table_name = $this->get_table_name($table_name);
+
+                // Check if table exists before adding indexes
+                if (!$this->table_exists($full_table_name)) {
+                    continue;
+                }
+
+                foreach ($definition['composite_indexes'] as $index_name => $columns) {
+                    try {
+                        // Check if index already exists
+                        if ($this->index_exists($full_table_name, "idx_{$index_name}")) {
+                            continue;
+                        }
+
+                        $index_sql = $this->get_composite_index_sql($full_table_name, $index_name, $columns);
+                        if ($index_sql) {
+                            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Performance index creation requires direct schema changes, DDL cannot be prepared
+                            $result = $this->wpdb->query($index_sql);
+                            if (false === $result) {
+                                $success = false;
+                                // Index creation failed - logged in database operations
+                            }
+                        }
+                    } catch (\Exception $e) {
+                        $success = false;
+                        // Exception during index creation - logged in database operations
+                    }
+                }
+            }
+        }
+
+        return $success;
+    }
+
+    /**
+     * Drop the full-width keys replaced by prefixed ones in #298.
+     *
+     * Installs created before the fix carry a key that spans more bytes than a
+     * 767-byte-limit server accepts; the prefixed replacement is added by
+     * dbDelta under a new name, and only once that replacement is confirmed
+     * present is the legacy key dropped. If the ALTER that adds the prefixed
+     * key failed — the one realistic cause being two existing rows that differ
+     * only past the prefix — nothing is dropped and the table keeps working
+     * exactly as before.
+     *
+     * @since 1.30.0
+     *
+     * @return void
+     */
+    /**
+     * Delete settings rows that hold a REST envelope instead of a setting.
+     *
+     * A caller that posted a settings endpoint's whole response body back as
+     * `settings` wrote `settings`, `schema`, `context_type` and `context_id`
+     * as rows. get_settings() returns every stored row, so those four then
+     * round-tripped into every later request — a serialized copy of the
+     * settings plus their JSON schema, several KB per save. Nothing reads
+     * them; sanitize_settings() now drops them on the way in, and this clears
+     * what is already stored.
+     *
+     * @since 2.0.1
+     *
+     * @return void
+     */
+    private function purge_envelope_setting_rows(): void {
+        $table = $this->get_table_name('seo_settings');
+
+        if (!$this->table_exists($table)) {
+            return;
+        }
+
+        // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- one-off cleanup; the table name comes from $wpdb->prefix and the keys are placeholders.
+        $this->wpdb->query(
+            $this->wpdb->prepare(
+                "DELETE FROM `{$table}` WHERE `setting_key` IN (%s, %s, %s, %s)",
+                'settings',
+                'schema',
+                'context_type',
+                'context_id'
+            )
+        );
+        // phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+        if (function_exists('wp_cache_flush_group')) {
+            wp_cache_flush_group('thinkrank_seo');
+        }
+    }
+
+    /**
+     * Settings categories owned by an SEO manager, and the class that owns them.
+     *
+     * Used only by purge_unknown_setting_rows(). A category absent here is left
+     * alone rather than guessed at.
+     *
+     * @since 2.0.1
+     *
+     * @var array<string, string>
+     */
+    private const SETTINGS_CATEGORY_MANAGERS = [
+        'site_identity'                  => \ThinkRank\SEO\Site_Identity_Manager::class,
+        'sitemap'                        => \ThinkRank\SEO\Sitemap_Generator::class,
+        'image_seo'                      => \ThinkRank\SEO\Image_SEO_Manager::class,
+        'schema_management_system'       => \ThinkRank\SEO\Schema_Management_System::class,
+        'llms_txt'                       => \ThinkRank\SEO\LLMs_Txt_Manager::class,
+        'social_meta'                    => \ThinkRank\SEO\Social_Meta_Manager::class,
+        'seo_settings'                   => \ThinkRank\SEO\SEO_Settings_Manager::class,
+        'content_optimization_manager'   => \ThinkRank\SEO\Content_Optimization_Manager::class,
+        'performance_monitoring_manager' => \ThinkRank\SEO\Performance_Monitoring_Manager::class,
+        'ai_content_analyzer'            => \ThinkRank\SEO\AI_Content_Analyzer::class,
+    ];
+
+    /**
+     * Delete settings rows holding keys no manager declares.
+     *
+     * The envelope purge above cleared four specific keys; this clears the
+     * general case behind them (#452). Any key a client posted was written as
+     * a row, and because get_settings() returns every row for a category — and
+     * save_settings() merges what it read before writing — a stray was echoed
+     * into every later response and rewritten on every save, so it never aged
+     * out on its own.
+     *
+     * Deliberately conservative: a category with no manager in the map, and a
+     * manager that cannot be constructed, are skipped rather than cleared, and
+     * the judgement is the manager's own accepts_setting_key() — the same gate
+     * the save path now applies, so the migration cannot delete a row the
+     * plugin would accept today.
+     *
+     * @since 2.0.1
+     *
+     * @return void
+     */
+    private function purge_unknown_setting_rows(): void {
+        $table = $this->get_table_name('seo_settings');
+
+        if (!$this->table_exists($table)) {
+            return;
+        }
+
+        // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- one-off cleanup; the table name comes from $wpdb->prefix and every value is a placeholder.
+        foreach (self::SETTINGS_CATEGORY_MANAGERS as $category => $class) {
+            if (!class_exists($class)) {
+                continue;
+            }
+
+            try {
+                $manager = new $class();
+            } catch (\Throwable $e) {
+                continue;
+            }
+
+            if (!method_exists($manager, 'accepts_setting_key')) {
+                continue;
+            }
+
+            $rows = $this->wpdb->get_results(
+                $this->wpdb->prepare(
+                    "SELECT DISTINCT `setting_key`, `context_type` FROM `{$table}` WHERE `setting_category` = %s",
+                    $category
+                )
+            );
+
+            if (empty($rows)) {
+                continue;
+            }
+
+            $unknown = [];
+
+            foreach ($rows as $row) {
+                $context = (string) $row->context_type;
+
+                if (!$manager->accepts_setting_key((string) $row->setting_key, $context)) {
+                    $unknown[] = (string) $row->setting_key;
+                }
+            }
+
+            $unknown = array_values(array_unique($unknown));
+
+            if (empty($unknown)) {
+                continue;
+            }
+
+            $placeholders = implode(', ', array_fill(0, count($unknown), '%s'));
+
+            $this->wpdb->query(
+                $this->wpdb->prepare(
+                    "DELETE FROM `{$table}` WHERE `setting_category` = %s AND `setting_key` IN ({$placeholders})",
+                    array_merge([$category], $unknown)
+                )
+            );
+        }
+        // phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+
+        if (function_exists('wp_cache_flush_group')) {
+            wp_cache_flush_group('thinkrank_seo');
+        }
+    }
+
+    private function drop_replaced_wide_indexes(): void {
+        foreach (self::REPLACED_WIDE_INDEXES as $table => $renames) {
+            $full_table_name = $this->get_table_name($table);
+
+            if (!$this->table_exists($full_table_name)) {
+                continue;
+            }
+
+            foreach ($renames as $current_index => $legacy_index) {
+                if (!$this->index_exists($full_table_name, $legacy_index)) {
+                    continue;
+                }
+
+                if (!$this->index_exists($full_table_name, $current_index)) {
+                    // The replacement is not there yet; keep the old key so the
+                    // upsert still has a unique constraint to collide against.
+                    continue;
+                }
+
+                // phpcs:disable WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- DDL cannot be prepared; both names come from a class constant and the table name from $wpdb->prefix.
+                $this->wpdb->query(
+                    "ALTER TABLE `{$full_table_name}` DROP INDEX `" . esc_sql($legacy_index) . '`'
+                );
+                // phpcs:enable WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter
+            }
+        }
+    }
+
+    /**
+     * Check if an index exists on a table
+     *
+     * @since 1.0.0
+     *
+     * @param string $table_name Full table name
+     * @param string $index_name Index name
+     * @return bool Whether index exists
+     */
+    private function index_exists(string $table_name, string $index_name): bool {
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching, PluginCheck.Security.DirectDB.UnescapedDBParameter -- Index existence check requires direct database access
+        $result = $this->wpdb->get_var(
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- SQL is properly prepared with placeholders
+            $this->wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.statistics
+                 WHERE table_schema = %s AND table_name = %s AND index_name = %s",
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- DB_NAME is a WordPress constant, safe to use
+                DB_NAME,
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $table_name is validated and used as parameter
+                $table_name,
+                // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter -- $index_name is validated and used as parameter
+                $index_name
+            )
+        );
+
+        return (int) $result > 0;
+    }
+
+    /**
+     * Check if the database server supports the JSON column type
+     *
+     * MySQL added JSON in 5.7.8 and MariaDB in 10.2.7. MariaDB's own 10.x
+     * number passes any MySQL threshold, and on older PHP the server string
+     * carries a `5.5.5-` replication prefix that db_version() reads as the
+     * version, so MariaDB's version is taken from the server string itself.
+     * Neither lookup queries the database.
+     *
+     * @since 1.0.0
+     * @return bool True if the server supports JSON columns
+     */
+    private function get_mysql_json_support(): bool {
+        global $wpdb;
+
+        $server_info = method_exists($wpdb, 'db_server_info') ? (string) $wpdb->db_server_info() : '';
+
+        if (preg_match('/(\d+(?:\.\d+)+)-MariaDB/i', $server_info, $matches)) {
+            return version_compare($matches[1], '10.2.7', '>=');
+        }
+
+        return version_compare((string) $wpdb->db_version(), '5.7.8', '>=');
+    }
+
+    /**
+     * Get SQL for the AI traffic table.
+     *
+     * Daily aggregate counters only — one row per (day, kind, source, path).
+     * `kind` is 'referral' (human visit from an AI platform), 'crawler' (AI
+     * bot user-agent), or 'baseline' (all human pageviews, for the share-of-
+     * traffic figure). No IPs, no user agents, no per-visit rows: aggregates
+     * keep the table small and the feature privacy-clean.
+     *
+     * @since 1.27.0
+     *
+     * @param string $table_name      Full table name
+     * @param string $charset_collate Charset and collation
+     * @return string SQL for table creation
+     */
+    private function get_ai_traffic_table_sql(string $table_name, string $charset_collate): string {
+        return "CREATE TABLE `{$table_name}` (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            day date NOT NULL,
+            kind varchar(12) NOT NULL,
+            source varchar(40) NOT NULL DEFAULT '',
+            path varchar(191) NOT NULL DEFAULT '',
+            hits bigint(20) unsigned NOT NULL DEFAULT 1,
+            PRIMARY KEY (id),
+            UNIQUE KEY uniq_bucket (day, kind, source, path),
+            KEY idx_day (day),
+            KEY idx_kind (kind)
+        ) {$charset_collate};";
+    }
+}

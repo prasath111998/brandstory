@@ -1,0 +1,1157 @@
+<?php
+/**
+ * Cache module.
+ *
+ * Owns the cache_expiry and excluded_urls settings. cache_enabled is
+ * deliberately NOT in this schema — flipping it triggers the
+ * advanced-cache.php drop-in install + WP_CACHE constant edit in
+ * wp-config.php, which is a sensitive single-purpose code path and lives
+ * in Cache::toggle() with its own dedicated /xspeed/v1/cache/toggle REST
+ * route. The dashboard's Cache page renders the special hero UI for it
+ * above this module's schema-driven settings panel.
+ *
+ * Tier: Free.
+ *
+ * @package XSpeed
+ */
+
+declare(strict_types=1);
+
+namespace XSpeed\Modules\Cache;
+
+defined( 'ABSPATH' ) || exit;
+
+use XSpeed\Module;
+use XSpeed\Settings_Manager;
+
+final class CacheModule extends Module {
+
+	/**
+	 * Default Excluded Cookies.
+	 *
+	 * A constant for the same reason as DEFAULT_IGNORED_QUERY_PARAMS:
+	 * Cache::rewrite_block_lines() needs the list at boot, where building
+	 * the settings schema would translate its labels too early. The schema
+	 * and that fallback both read THIS, so they cannot drift.
+	 *
+	 * @var string[]
+	 */
+	public const DEFAULT_EXCLUDED_COOKIES = array(
+		'comment_author',
+		'~wordpress_[a-f0-9]+',
+		'wp-postpass',
+		'wordpress_no_cache',
+		'wordpress_logged_in',
+		'edd_items_in_cart',
+		'woocommerce_items_in_cart',
+		'fct_cart_hash',
+		'comment_',
+		'woocommerce_',
+		'wordpress',
+		'xf_',
+		'edd_',
+		'jetpack',
+		'yith_wcwl_session_',
+		'yith_wrvp_',
+		'wpsc_',
+		'ecwid',
+		'ec_',
+		'bookly',
+	);
+
+	/**
+	 * Default Ignored Query Parameters.
+	 *
+	 * A constant because Cache::sync_query_allowlist() needs this list at
+	 * boot, where building the settings schema would translate its labels
+	 * before WordPress allows it. Both the schema below and that boot-time
+	 * fallback read THIS, so the two cannot drift.
+	 *
+	 * @var string[]
+	 */
+	public const DEFAULT_IGNORED_QUERY_PARAMS = array(
+		'__s',
+		'_ga',
+		'_ke',
+		'~[a-zA-Z0-9_-]+_sid',
+		'adgroupid',
+		'age-verified',
+		'ao_noptimize',
+		'campaignid',
+		'ck_subscriber_id',
+		'cn-reloaded',
+		'dclid',
+		'epik',
+		'fb_action_ids',
+		'fb_action_types',
+		'fb_source',
+		'fbclid',
+		'gclid',
+		'jobid',
+		'mc_cid',
+		'mc_eid',
+		'mkt_tok',
+		'msclkid',
+		'ref',
+		// Twitter/X (`ref_src`, `ref_url`) and Facebook (`refid`)
+		// decorations. Enumerated because param names match
+		// whole-name: the bare `ref` above no longer absorbs them,
+		// and a `ref*` glob would over-match `referrer` and
+		// `refund_id`, which are page-selecting.
+		'ref_src',
+		'ref_url',
+		'refid',
+		'~session_[a-zA-Z0-9_-]+_alive',
+		'sseid',
+		'sslid',
+		'usqp',
+		'~utm_[a-zA-Z0-9_-]+',
+	);
+
+	/**
+	 * Click and campaign IDs added to the defaults in 1.3.6.
+	 *
+	 * Each is unique per click and never changes the page, yet each one
+	 * bypassed the page cache and, with xSpeed Pro, was a new CSS entry to
+	 * build: Google Merchant's `srsltid` and Ads' `gad_*`/`gbraid`/`wbraid`,
+	 * GA4's cross-domain `_gl`, TikTok, X, Instagram, Yandex, HubSpot email
+	 * and LinkedIn IDs. Kept as their own list so the upgrade can add exactly
+	 * these to a saved list without re-adding anything a site removed.
+	 *
+	 * @var string[]
+	 */
+	public const TRACKING_PARAMS_1_3_6 = array(
+		'_gl',
+		'_hsenc',
+		'_hsmi',
+		'gad_campaignid',
+		'gad_source',
+		'gbraid',
+		'igshid',
+		'li_fat_id',
+		'srsltid',
+		'ttclid',
+		'twclid',
+		'wbraid',
+		'yclid',
+	);
+
+
+	/**
+	 * The shipped default list: the base list plus later additions, sorted.
+	 *
+	 * @return string[]
+	 */
+	public static function default_ignored_query_params(): array {
+		$all = array_values( array_unique( array_merge( self::DEFAULT_IGNORED_QUERY_PARAMS, self::TRACKING_PARAMS_1_3_6 ) ) );
+		sort( $all );
+		return $all;
+	}
+
+	public const SLUG    = 'cache';
+	public const TIER    = self::TIER_FREE;
+	public const VERSION = '1.0.0';
+
+	/**
+	 * Default cache lifetime in hours (7 days).
+	 *
+	 * Named so the readers that need a fallback share ONE value with the
+	 * schema below. Three of them carried their own hardcoded `?? 24`, which
+	 * silently became a stale copy the moment the default moved. They are
+	 * unreachable today — Settings_Manager::get() always merges defaults —
+	 * but an unreachable wrong number is still a trap for the next change.
+	 * (#284 B5)
+	 */
+	public const DEFAULT_EXPIRY_HOURS = 24 * 7;
+
+	public function ui_metadata(): array {
+		return array(
+			'label'       => __( 'Page Cache', 'xspeed' ),
+			'icon'        => 'Database',
+			'description' => __( 'Saves each page as a file and serves it to logged-out visitors.', 'xspeed' ),
+			'group'       => 'cache',
+		);
+	}
+
+	/**
+	 * @inheritDoc
+	 *
+	 * Nothing exempt. Purging only ever touches xSpeed's own cache, so on an
+	 * occupied site the setting is inert either way — but a host installing xSpeed
+	 * on a user's behalf should leave nothing switched on that the user did not
+	 * ask for, and "inert today" is a weak reason to make an exception.
+	 */
+	public function conflict_safe_exempt(): array {
+		return array();
+	}
+
+	public function settings_schema(): array {
+		$schema = array(
+			'cache_expiry'  => array(
+				'type'        => 'int',
+				// Matches the wizard's Balanced preset, which is what a fresh
+				// install starts on — a shorter module default meant the two
+				// disagreed about what "default" means. (#284)
+				'default'     => self::DEFAULT_EXPIRY_HOURS,
+				'min'         => 1,
+				'max'         => 720,
+				'label'       => __( 'Cache expiry (hours)', 'xspeed' ),
+				'unit'        => 'hours',
+				'description' => __( 'How long a cached page is kept before xSpeed builds it again. 1 to 720 hours (30 days).', 'xspeed' ),
+			),
+			'excluded_urls' => array(
+				'type'        => 'list',
+				// Comprehensive LiteSpeed / WP Rocket-parity default URL
+				// exclusions (FBS-82181). Plain text = "contains", glob via
+				// * ? [ ], or a `~` prefix for raw regex (e.g. ~wp-.*\.php).
+				'default'     => array(
+					'/wp-admin/',
+					'/wp-json/',
+					'/xmlrpc.php',
+					'~wp-.*\.php',
+					'/feed/',
+					'index.php',
+					// `sitemaps?` — SEOPress generates sitemaps.xml (plural).
+					'~sitemaps?(_index)?\.xml',
+					'/robots.txt',
+					// Bare (no trailing slash) so "contains" matches both
+					// /cart and /cart/items — WooCommerce serves both forms.
+					'/cart',
+					'/checkout',
+					'/my-account',
+					'ao_noptirocket',
+					'ao_speedup_cachebuster',
+					'removed_item',
+					'/wc-api',
+					'/edd-api',
+					'/wp-login',
+				),
+				'item_type'   => 'string',
+				'label'       => __( 'Excluded URLs', 'xspeed' ),
+				'description' => __( 'Pages whose URL matches a line here are never cached. Plain text matches anywhere (/cart). A pattern with * matches from the start of the path: /cart/* matches /cart/items but not /shop/cart/items. ~ starts a regex.', 'xspeed' ),
+			),
+			'excluded_cookies' => array(
+				'type'        => 'list',
+				// Cookies that signal a logged-in / transactional visitor
+				// whose response must not be served from a shared cache.
+				// `~` prefix = raw regex (e.g. ~wordpress_[a-f0-9]+). (FBS-82181)
+				'default'     => self::DEFAULT_EXCLUDED_COOKIES,
+				'item_type'   => 'string',
+				'label'       => __( 'Excluded cookies', 'xspeed' ),
+				'description' => __( 'Visitors with a cookie whose name matches a line here always get a fresh page. One per line; * and ~regex work.', 'xspeed' ),
+			),
+			'bypass_user_agents' => array(
+				'type'        => 'list',
+				'default'     => array(),
+				'item_type'   => 'string',
+				'label'       => __( 'Excluded browsers and bots', 'xspeed' ),
+				'description' => __( 'Visitors whose user agent contains a line here always get a fresh page. Useful for screenshot bots and uptime monitors.', 'xspeed' ),
+			),
+			'ignored_query_params' => array(
+				'type'        => 'list',
+				// Analytics / ad / session query keys stripped before the
+				// cache key is computed, so /post?utm_source=x and /post
+				// share one entry. `~` prefix = raw regex. (FBS-82181)
+				// Matched whole-name, so every entry here means the param
+				// it names and nothing that merely contains it.
+				'default'     => self::default_ignored_query_params(),
+				'item_type'   => 'string',
+				'label'       => __( 'Ignored query parameters', 'xspeed' ),
+				'advanced'    => true,
+				'description' => __( 'URL parameters to ignore, so /post?utm_source=x gets the same cached page as /post. Each line matches a whole parameter name.', 'xspeed' ),
+			),
+			'purge_on_upgrade' => array(
+				'type'        => 'bool',
+				'default'     => true,
+				'label'       => __( 'Clear cache after updates', 'xspeed' ),
+				'description' => __( 'Clear the page cache when a plugin, theme or WordPress is updated, so visitors never get old pages with broken asset links.', 'xspeed' ),
+			),
+			'mobile_separate' => array(
+				'type'        => 'bool',
+				'default'     => false,
+				'label'       => __( 'Separate mobile cache', 'xspeed' ),
+				'description' => __( 'Keep a separate cached copy for phones. Turn on only if your theme or plugins show different pages on mobile.', 'xspeed' ),
+			),
+			'edge_provider'   => array(
+				'type'          => 'enum',
+				'default'       => 'auto',
+				'options'       => array( 'auto', 'off', 'cloudflare', 'fastly', 'varnish', 'nginx', 'akamai', 'cloudfront', 'google', 'keycdn', 'bunny', 'sucuri', 'incapsula', 'generic', 'custom' ),
+				'option_labels' => array(
+					'auto'       => 'Detect automatically',
+					'off'        => 'Off — send nothing',
+					'cloudflare' => 'Cloudflare',
+					'varnish'    => 'Varnish',
+					'nginx'      => 'nginx proxy cache',
+					'cloudfront' => 'Amazon CloudFront',
+					'google'     => 'Google Cloud CDN',
+					'keycdn'     => 'KeyCDN',
+					'bunny'      => 'Bunny',
+					// These four cannot be presented as supported on the same
+					// footing as the ones above. Vendor documentation either
+					// does not establish that they honour what we send, or
+					// establishes that they ignore origin cache headers until
+					// the property is configured to respect them — Akamai
+					// caches for a theoretically infinite time by default, and
+					// Sucuri's default caching level ignores the headers
+					// outright. Naming them without the caveat would promise a
+					// protection the CDN is not currently giving.
+					'fastly'     => 'Fastly (needs CDN configuration)',
+					'akamai'     => 'Akamai (needs CDN configuration)',
+					'sucuri'     => 'Sucuri (needs CDN configuration)',
+					'incapsula'  => 'Imperva / Incapsula (needs CDN configuration)',
+					'generic'    => 'Something else',
+					'custom'     => 'Custom headers',
+				),
+				'label'         => __( 'CDN or proxy in front', 'xspeed' ),
+				'description'   => __( 'Tells your CDN or proxy not to store pages xSpeed does not cache. Leave on Detect automatically unless you know your provider.', 'xspeed' ),
+				'advanced'      => true,
+				'info_title'    => __( 'Cache in front of this site', 'xspeed' ),
+				'info'          => __( 'Naming your provider narrows the headers to the one it reads. Detect automatically works it out per request and otherwise sends a set every cache ignores unless it understands it, so it is safe not to know. Run "wp xspeed cache edge" to see what was detected and what gets sent.', 'xspeed' )
+			),
+			'edge_custom_headers' => array(
+				'type'        => 'list',
+				'default'     => array(),
+				'item_type'   => 'string',
+				'label'       => __( 'Custom CDN headers', 'xspeed' ),
+				'advanced'    => true,
+				'dependsOn'   => array( 'field' => 'edge_provider', 'value' => 'custom' ),
+				'description' => __( 'One header per line, as Name: value, for example "Surrogate-Control: no-store". Lines starting with # are ignored.', 'xspeed' ),
+				'info_title'  => __( 'Custom edge headers', 'xspeed' ),
+				'info'        => __( 'These replace the headers xSpeed would have picked for your CDN. Two baselines are still added underneath: a Cache-Control, and "X-Accel-Expires: 0" for a page cache running in nginx on your own server. Name either one yourself and yours is used instead. Values containing $, % or a backslash are dropped — the same pairs go into nginx and Apache directives, where those cannot be escaped safely. Content-Length, Content-Encoding, Content-Type, Transfer-Encoding, Set-Cookie and Location are refused.', 'xspeed' )
+			),
+		);
+
+		// LiteSpeed-only opt-in (#509): meaningless on any other server, so
+		// the field only exists in the schema where it can act — elsewhere the
+		// stored value survives via preserved_keys(). Inserted right after
+		// mobile_separate, its sibling static-fast-path trade-off.
+		if ( \XSpeed\Server::LITESPEED === \XSpeed\Server::type() ) {
+			$litespeed = array(
+				'litespeed_static_rewrite' => array(
+					'type'        => 'bool',
+					'default'     => false,
+					'label'       => __( 'LiteSpeed static fast path', 'xspeed' ),
+					'advanced'    => true,
+					'description' => __( 'LiteSpeed serves cached pages without running PHP, which is faster on slow hosts. These visits are not counted in the dashboard hit ratio.', 'xspeed' ),
+				),
+			);
+			$pos    = (int) array_search( 'mobile_separate', array_keys( $schema ), true ) + 1;
+			$schema = array_slice( $schema, 0, $pos, true ) + $litespeed + array_slice( $schema, $pos, null, true );
+		}
+
+		return $schema;
+	}
+
+	/**
+	 * `mobile_separate_review` lives outside the schema: migration sets it
+	 * (bool) when a source plugin had "separate mobile cache" on, so the
+	 * dashboard can prompt the user to re-enable it deliberately instead of
+	 * silently importing it (which would kill the device-blind static fast
+	 * path). Without preserving it here, the first schema-driven cache save
+	 * would rebuild the option from the schema alone and drop the flag before
+	 * the user ever saw the prompt. (FBS-83145)
+	 *
+	 * @return string[]
+	 */
+	public function preserved_keys(): array {
+		$keys = array( 'mobile_separate_review' );
+		// On non-LiteSpeed servers the litespeed_static_rewrite field is not
+		// in the schema (see settings_schema()), so a schema-driven save
+		// would silently drop a value chosen while the site ran LiteSpeed.
+		// Preserve it so moving LiteSpeed → other → LiteSpeed keeps the
+		// user's choice. On LiteSpeed itself the schema owns the key.
+		if ( \XSpeed\Server::LITESPEED !== \XSpeed\Server::type() ) {
+			$keys[] = 'litespeed_static_rewrite';
+		}
+		return $keys;
+	}
+
+	/**
+	 * Seed per-module option from the legacy xspeed_options blob if we
+	 * haven't done so yet. Idempotent — once xspeed_module_cache exists
+	 * or the legacy keys are gone, this is a no-op. Runs on both boot
+	 * and activate so installs on every code path are covered.
+	 */
+	public function boot(): void {
+		$this->seed_from_legacy_if_needed();
+
+		// Keep every mobile_separate-dependent artifact (the drop-in's
+		// `.mobile-separate` flag, the device-blind server rewrite, and the
+		// device-keyed caches) in lockstep with the setting — on boot, and
+		// whenever the cache settings are saved. The drop-in can't read WP
+		// options, so it reads the sidecar marker Cache maintains here.
+		\XSpeed\Cache::reconcile_mobile_separate();
+		// Both write paths matter. On a fresh install `xspeed_module_cache`
+		// does not exist yet, so core's update_option() delegates to
+		// add_option() and fires `add_option_…` INSTEAD of
+		// `update_option_…`. Hooking only the latter meant the very first
+		// save of Cache Expiry never re-baked the drop-in: the panel and the
+		// DB read the new value while the drop-in kept enforcing the old
+		// one, and re-saving the same value could not recover it because
+		// update_option() short-circuits on an unchanged value (#251).
+		$xspeed_resync_cache_artifacts = static function () {
+			\XSpeed\Cache::reconcile_mobile_separate();
+			// Re-bake the cookie / user-agent exclusion rules into the
+			// drop-in. It runs before WordPress loads and so carries a
+			// COPY of those rules, substituted at install time — and
+			// auto_heal() deliberately only reinstalls when the file is
+			// missing, foreign, or an older version, none of which a
+			// settings change makes true. Without this, adding an
+			// excluded cookie left the drop-in serving the shared
+			// anonymous page to exactly the visitors it excluded, until
+			// the next plugin upgrade happened to reinstall it.
+			//
+			// ONLY when page caching is actually on, for the same reason
+			// refresh_rewrite_if_installed() below refuses to write a
+			// block that isn't there: re-baking is maintenance of an
+			// artifact the user opted into, never a way to acquire one.
+			// Re-baking unconditionally reached past our own module — a
+			// site that had declined our page cache got the drop-in
+			// installed anyway on the next Cache Expiry save, and the
+			// following toggle(false) then removed it. auto_heal() has
+			// always gated on this flag; this path simply never did.
+			// (#251)
+			//
+			// Through toggle() rather than install_dropin() so the re-bake
+			// gets the same ownership check, lock and rollback as every
+			// other page-cache write. A drop-in that turned out not to be
+			// ours between the save and now is refused here too.
+			$xspeed_options = get_option( 'xspeed_options', array() );
+			if ( ! empty( $xspeed_options['cache_enabled'] ) ) {
+				\XSpeed\Cache::toggle( true );
+			}
+			// Same staleness applies to the .htaccess block, which is
+			// written to disk from the same generator. Refresh it only
+			// when a block is already installed — writing one here would
+			// enable the static path on a site that never opted in.
+			\XSpeed\Cache::refresh_rewrite_if_installed();
+		};
+		add_action( 'update_option_xspeed_module_cache', $xspeed_resync_cache_artifacts );
+		add_action( 'add_option_xspeed_module_cache', $xspeed_resync_cache_artifacts );
+
+		// Time-driven collection of expired entries and superseded minified
+		// assets. Scheduled here as well as in activate() because a site that
+		// upgrades into this version never runs the activation hook again.
+		add_action( \XSpeed\Cache_GC::CRON_HOOK, array( \XSpeed\Cache_GC::class, 'run' ) );
+		\XSpeed\Cache_GC::ensure_scheduled();
+	}
+
+	public function activate(): void {
+		$this->seed_from_legacy_if_needed();
+		\XSpeed\Cache_GC::ensure_scheduled();
+	}
+
+	public function deactivate(): void {
+		\XSpeed\Cache_GC::unschedule();
+	}
+
+	private function seed_from_legacy_if_needed(): void {
+		if ( null !== get_option( 'xspeed_module_cache', null ) ) {
+			return;
+		}
+		$legacy = get_option( 'xspeed_options', array() );
+		if ( ! is_array( $legacy ) ) {
+			return;
+		}
+		$seed  = array( '_version' => self::VERSION );
+		$dirty = false;
+		if ( array_key_exists( 'cache_expiry', $legacy ) ) {
+			$seed['cache_expiry'] = max( 1, min( 720, (int) $legacy['cache_expiry'] ) );
+			unset( $legacy['cache_expiry'] );
+			$dirty                = true;
+		}
+		if ( array_key_exists( 'excluded_urls', $legacy ) ) {
+			$seed['excluded_urls'] = is_array( $legacy['excluded_urls'] ) ? array_values( array_filter( $legacy['excluded_urls'], 'is_string' ) ) : array();
+			unset( $legacy['excluded_urls'] );
+			$dirty                  = true;
+		}
+		if ( $dirty ) {
+			update_option( 'xspeed_module_cache', $seed );
+			update_option( 'xspeed_options', $legacy );
+		}
+	}
+
+	public function cli_commands(): array {
+		return array(
+			array(
+				'name'      => 'xspeed optimize',
+				'callback'  => array( $this, 'cli_optimize' ),
+				'shortdesc' => 'Measure, apply the recommended settings one at a time, verify the page still works after each, and report what changed. Use --dry-run to see the plan without touching anything.',
+				'synopsis'  => array(
+					array(
+						'type'        => 'assoc',
+						'name'        => 'aggressiveness',
+						'description' => 'safe (removals + server-side only), standard (default), or aggressive (includes settings known to break some themes).',
+						'optional'    => true,
+						'options'     => array( 'safe', 'standard', 'aggressive' ),
+					),
+					array(
+						'type'        => 'flag',
+						'name'        => 'dry-run',
+						'description' => 'Show the plan and stop. Changes nothing.',
+						'optional'    => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'budget',
+						'description' => 'Seconds to spend before stopping between steps. Default 120.',
+						'optional'    => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'measure-score',
+						'description' => 'auto (default) measures when the stored score is stale and after changes land; never reuses the stored score; always measures even for a dry run.',
+						'optional'    => true,
+						'options'     => array( 'auto', 'never', 'always' ),
+					),
+				),
+			),
+			array(
+				'name'      => 'xspeed purge',
+				'callback'  => array( $this, 'cli_purge' ),
+				'shortdesc' => 'Clear every cache xSpeed manages — page and static files, REST responses, minified assets, the object cache and the configured edge — and report per store what was cleared, what was skipped and why. Use --type to clear just one.',
+				'ai_hint'   => 'Clear the cache after a change is live on the server but visitors still see the old version. Purges everything by default; --type=page for the local HTML only, --type=cloudflare for the edge only. Exits non-zero if a store that IS configured refused to purge, so its output can be trusted rather than assumed.',
+				'synopsis'  => array(
+					array(
+						'type'        => 'assoc',
+						'name'        => 'type',
+						'description' => 'What to clear: all (default), page, object, cloudflare, cdn — or a group name (edge). Comma-separate to clear several.',
+						'optional'    => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'cause',
+						'description' => 'Label recorded in the purge log, so `wp xspeed cache purge-log` can tell this run apart from a click. Default "CLI".',
+						'optional'    => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'format',
+						'description' => 'table (default, one line per store) or json (the full report, for scripts).',
+						'optional'    => true,
+						'options'     => array( 'table', 'json' ),
+					),
+				),
+			),
+			array(
+				'name'      => 'xspeed cache',
+				'callback'  => array( $this, 'cli_handler' ),
+				'shortdesc' => 'Inspect the Cache module: `status` (settings), `inventory` (which pages are cached, and how old), `size` (where the disk usage goes), `purge-log` (what cleared the cache, when and why), `purge-url <url>` to clear one page, `recheck-rewrite` to re-run the static-rewrite probe, or `nginx-config` to print the unified nginx server-block for pasting into a vhost, or `edge` to show which cache is in front of the site and what xSpeed tells it. To clear the whole site use `wp xspeed purge`.',
+				'synopsis'  => array(
+					array(
+						'type'     => 'positional',
+						'name'     => 'action',
+						'options'  => array( 'status', 'inventory', 'size', 'purge-log', 'purge-url', 'recheck-rewrite', 'nginx-config', 'edge' ),
+						'optional' => true,
+					),
+					array(
+						'type'     => 'positional',
+						'name'     => 'url',
+						'optional' => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'limit',
+						'description' => 'Rows to print for inventory / purge-log. Default 20.',
+						'optional'    => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'cause',
+						'description' => 'Label recorded in the purge log for purge-url. Default "CLI".',
+						'optional'    => true,
+					),
+					array(
+						'type'        => 'assoc',
+						'name'        => 'server',
+						'description' => 'Server type to assume for nginx-config, skipping detection. Detection needs SERVER_SOFTWARE, which the command line does not have; an undetectable host is assumed to be nginx anyway, so this is for stating it outright — or for the case detection is positively wrong, such as nginx in front of Apache.',
+						'options'     => array( 'nginx', 'apache', 'litespeed' ),
+						'optional'    => true,
+					),
+				),
+			),
+		);
+	}
+
+	/**
+	 * `wp xspeed optimize` — run the autopilot.
+	 *
+	 * Prints what it DID, not what it hoped to do: applied steps, reverted
+	 * steps with the reason they were undone, and the problems it could not
+	 * touch. A run that changes nothing prints that plainly rather than a
+	 * success banner.
+	 *
+	 * @param array<int,string>    $args  Positional args (unused).
+	 * @param array<string,string> $assoc Flags.
+	 */
+	public function cli_optimize( array $args, array $assoc ): void {
+		$result = \XSpeed\Optimize_Runner::run(
+			array(
+				'aggressiveness' => (string) ( $assoc['aggressiveness'] ?? 'standard' ),
+				'dry_run'        => isset( $assoc['dry-run'] ),
+				'budget_seconds' => isset( $assoc['budget'] ) ? (int) $assoc['budget'] : 120,
+				'measure_score'  => (string) ( $assoc['measure-score'] ?? 'auto' ),
+			)
+		);
+
+		if ( is_wp_error( $result ) ) {
+			\WP_CLI::error( $result->get_error_message() );
+			return;
+		}
+
+		if ( ! empty( $result['dry_run'] ) ) {
+			// The summary carries the score AND its age. Printing the plan
+			// without it left the one number a reader wants off the only
+			// command they run before deciding to apply anything.
+			if ( isset( $result['message'] ) ) {
+				\WP_CLI::log( (string) $result['message'] );
+			}
+			\WP_CLI::log( 'Plan (' . count( $result['plan'] ) . ' steps, nothing applied):' );
+			foreach ( $result['plan'] as $step ) {
+				\WP_CLI::log( '  - ' . $step['change'] . ' [' . $step['tier'] . ']' );
+			}
+			foreach ( $result['skipped'] as $row ) {
+				\WP_CLI::log( '  skipped: ' . $row['id'] . ' — ' . $row['why'] );
+			}
+			return;
+		}
+
+		if ( isset( $result['message'] ) ) {
+			\WP_CLI::success( (string) $result['message'] );
+		}
+
+		foreach ( $result['applied'] as $row ) {
+			\WP_CLI::log( '  ✓ ' . $row['change'] );
+		}
+		foreach ( $result['reverted'] as $row ) {
+			\WP_CLI::warning( 'Undone: ' . $row['id'] . ' — ' . $row['why'] );
+		}
+		foreach ( $result['unfixable'] as $row ) {
+			\WP_CLI::log( '  ! ' . $row['issue'] . ( '' !== $row['fix'] ? ' — ' . $row['fix'] : '' ) );
+		}
+
+		if ( ! empty( $result['applied'] ) ) {
+			// "applied and verified" was more than the checks earn. They read
+			// HTML in PHP and cannot run JavaScript, so this line was telling
+			// someone the site was fine when the only honest claim is that
+			// nothing in the markup looked broken.
+			\WP_CLI::success( count( $result['applied'] ) . ' change(s) applied; HTML checks passed.' );
+
+			if ( ! empty( $result['verify_urls'] ) ) {
+				\WP_CLI::log( '' );
+				\WP_CLI::log( 'Now open these and check they render, with no console errors:' );
+				foreach ( $result['verify_urls'] as $u ) {
+					\WP_CLI::log( '  ' . $u );
+				}
+			}
+		}
+	}
+
+	/**
+	 * `wp xspeed purge` — clear every cache xSpeed owns, in one call.
+	 *
+	 * Reports per store rather than printing a success banner, because the
+	 * banner was the bug: a site whose Cloudflare token had lost its purge
+	 * permission saw "cache cleared" and kept serving stale HTML from the
+	 * edge. What is skipped is as much of the answer as what is cleared, so
+	 * every skip prints its reason.
+	 *
+	 * Exit code follows the same distinction. A store that is not configured
+	 * has nothing to clear and does not fail the run — otherwise every CI
+	 * pipeline on a site without Redis goes red for a purge that did exactly
+	 * what it should. A store that IS configured and refused is a failure.
+	 *
+	 * There is deliberately no `--url`: WP-CLI reserves that flag for
+	 * multisite site selection and consumes it before a handler ever sees it.
+	 * Clearing one page is `wp xspeed cache purge-url <url>`.
+	 *
+	 * @param array<int,string>    $args  Positional args (unused).
+	 * @param array<string,string> $assoc Flags.
+	 */
+	public function cli_purge( array $args, array $assoc ): void {
+		unset( $args );
+
+		$requested = array_values(
+			array_filter(
+				array_map( 'trim', explode( ',', (string) ( $assoc['type'] ?? 'all' ) ) )
+			)
+		);
+		if ( ! $requested ) {
+			$requested = array( 'all' );
+		}
+
+		$accepted = \XSpeed\Purge_Runner::accepted_types();
+		$unknown  = array_diff( $requested, $accepted );
+		if ( $unknown ) {
+			// Refuse before purging anything: a typo in --type must not
+			// quietly clear a DIFFERENT store than the one named.
+			\WP_CLI::error(
+				sprintf(
+					'Unknown purge type: %s. Expected one of: %s',
+					implode( ', ', $unknown ),
+					implode( ', ', $accepted )
+				)
+			);
+			return;
+		}
+
+		$cause  = isset( $assoc['cause'] ) && '' !== trim( (string) $assoc['cause'] ) ? trim( (string) $assoc['cause'] ) : 'CLI';
+		$report = \XSpeed\Purge_Runner::run( $requested, $cause );
+
+		if ( 'json' === ( $assoc['format'] ?? 'table' ) ) {
+			// The report goes to STDOUT alone so `... --format=json | jq` works;
+			// the failure message goes to STDERR via ::error, which is also
+			// what produces the non-zero exit.
+			\WP_CLI::line( (string) wp_json_encode( $report ) );
+			if ( ! $report['ok'] ) {
+				\WP_CLI::error( 'One or more cache stores failed to purge; see the report above.' );
+			}
+			return;
+		}
+
+		$cleared = 0;
+		$skipped = 0;
+		$failed  = 0;
+		foreach ( $report['types'] as $row ) {
+			switch ( $row['status'] ) {
+				case \XSpeed\Purge_Runner::CLEARED:
+					++$cleared;
+					\WP_CLI::log( sprintf( '  cleared  %s%s', $row['label'], self::purge_amount( $row ) ) );
+					break;
+				case \XSpeed\Purge_Runner::FAILED:
+					++$failed;
+					\WP_CLI::log( sprintf( '  FAILED   %s — %s', $row['label'], $row['reason'] ) );
+					break;
+				default:
+					++$skipped;
+					\WP_CLI::log( sprintf( '  skipped  %s — %s', $row['label'], $row['reason'] ) );
+			}
+		}
+
+		if ( $failed ) {
+			\WP_CLI::error(
+				sprintf(
+					'%d of %d cache store(s) failed to purge; %d cleared, %d skipped.',
+					$failed,
+					count( $report['types'] ),
+					$cleared,
+					$skipped
+				)
+			);
+			return;
+		}
+
+		if ( ! $cleared ) {
+			// Not a success banner: nothing was purged, and saying so is the
+			// honest answer for a --type nobody has configured.
+			\WP_CLI::log( sprintf( 'Nothing to purge — %d store(s) skipped.', $skipped ) );
+			return;
+		}
+
+		\WP_CLI::success( sprintf( 'Purged %d cache store(s); %d skipped.', $cleared, $skipped ) );
+	}
+
+	/**
+	 * The " — 42 entries (1.3 MB)" tail on a cleared line.
+	 *
+	 * Entries and bytes are both optional: a Redis FLUSHALL reports neither,
+	 * and printing "0 entries" for it would read as an empty cache rather
+	 * than an uncountable one.
+	 *
+	 * @param array{entries:int|null,bytes:int|null} $row Report row.
+	 */
+	private static function purge_amount( array $row ): string {
+		$parts = array();
+		if ( null !== $row['entries'] ) {
+			$parts[] = sprintf( '%d entr%s', $row['entries'], 1 === (int) $row['entries'] ? 'y' : 'ies' );
+		}
+		if ( null !== $row['bytes'] && $row['bytes'] > 0 ) {
+			$parts[] = size_format( $row['bytes'], 1 );
+		}
+
+		return $parts ? ' — ' . implode( ', ', $parts ) : '';
+	}
+
+	public function cli_handler( array $args, array $assoc ): void {
+		$action = isset( $args[0] ) ? (string) $args[0] : 'status';
+		$limit  = isset( $assoc['limit'] ) ? max( 1, (int) $assoc['limit'] ) : 20;
+
+		/*
+		 * Print the unified nginx server-block so an installer, provisioning
+		 * script, or another plugin can fetch it non-interactively and write
+		 * it into a vhost. Previously this was only reachable via
+		 * `wp eval 'echo \XSpeed\Cache::full_nginx_server_block();'`, which
+		 * is not a supported surface (and is unavailable over MCP, where
+		 * run_command dispatches these same callbacks).
+		 *
+		 * Output discipline matters here: the config goes to STDOUT with
+		 * nothing else, so `wp xspeed cache nginx-config > site.conf` yields a
+		 * pasteable file. Every diagnostic goes to STDERR via WP_CLI::warning
+		 * / ::error, and a non-nginx host or an empty block exits non-zero so
+		 * a script can branch on it rather than writing an empty file.
+		 *
+		 * --server exists because detection cannot work here. WP-CLI runs
+		 * without SERVER_SOFTWARE, so Server::type() falls back to the value
+		 * a previous web request cached — and on a site provisioned entirely
+		 * over WP-CLI there is no such value, leaving `unknown` on a genuine
+		 * nginx host. Rather than guess (a loopback request is the one thing
+		 * least likely to work mid-provisioning), let the caller state it:
+		 * the script writing to /etc/nginx/ already knows the answer.
+		 * Without the flag nothing changes, so a script sweeping a mixed
+		 * fleet still gets its non-zero exit on Apache.
+		 *
+		 * It pins Server::type() rather than being passed down, because the
+		 * decision is re-made at every level: full_nginx_server_block(),
+		 * Cache::nginx_snippet(), and each module's own nginx_directives()
+		 * all ask independently. Threading an argument through would leave
+		 * the deeper gates still detecting, and the command would emit a
+		 * config missing its cache rewrite — worse than refusing outright.
+		 */
+		if ( 'nginx-config' === $action ) {
+			/*
+			 * Scoped to this one generation pass, not the request. Under
+			 * real WP-CLI the process ends here either way, but the same
+			 * callback runs over MCP, where several commands share one PHP
+			 * request — a pin left in place made the NEXT command report
+			 * this host as nginx too.
+			 */
+			$pin    = null;
+			$assume = null;
+
+			if ( isset( $assoc['server'] ) ) {
+				$assume = strtolower( trim( (string) $assoc['server'] ) );
+			} elseif ( \XSpeed\Server::UNKNOWN === \XSpeed\Server::type() ) {
+				/*
+				 * Nothing to detect from, and the action names the server:
+				 * `nginx-config` is the request, so absence of evidence
+				 * defers to it. Positive evidence to the contrary still
+				 * wins — an Apache or LiteSpeed host is told it needs no
+				 * nginx block at all, which is the answer that helps.
+				 */
+				$assume = \XSpeed\Server::NGINX;
+
+				/*
+				 * Only where warnings have somewhere else to go. Real WP-CLI
+				 * sends them to STDERR, leaving the config clean on STDOUT.
+				 * The MCP shim has ONE buffer for both, so warning there
+				 * would prepend "Warning: …" to the config itself and hand
+				 * the caller a file nginx refuses. The constant is the
+				 * discriminator: real WP-CLI defines it, the shim defines
+				 * only the class.
+				 */
+				if ( defined( 'WP_CLI' ) && \WP_CLI ) {
+					\WP_CLI::warning(
+						'Could not detect the web server — no recognisable SERVER_SOFTWARE, and no web request has cached one yet. Assuming nginx, which is what this command generates. Pass --server= to state it explicitly, or load any page once to settle detection.'
+					);
+				}
+			}
+
+			if ( null !== $assume ) {
+				$pinned = $assume;
+				$pin    = static function () use ( $pinned ) {
+					return $pinned;
+				};
+				add_filter( 'xspeed_server_type', $pin );
+			}
+
+			$block  = \XSpeed\Cache::full_nginx_server_block();
+			$server = \XSpeed\Server::type();
+
+			if ( null !== $pin ) {
+				remove_filter( 'xspeed_server_type', $pin );
+			}
+
+			if ( ! is_string( $block ) || '' === trim( $block ) ) {
+				/*
+				 * $server cannot be UNKNOWN here: an undetectable host was
+				 * already assumed to be nginx above, so anything left is a
+				 * server we positively identified — and telling an Apache or
+				 * LiteSpeed operator that .htaccess already covers them is
+				 * more useful than handing them a block to paste nowhere.
+				 */
+				if ( \XSpeed\Server::NGINX !== $server ) {
+					\WP_CLI::error(
+						sprintf(
+							'No nginx server-block to print — this site is running on %s. On Apache and LiteSpeed xSpeed writes its rules to .htaccess automatically.',
+							$server
+						)
+					);
+					return;
+				}
+				\WP_CLI::error( 'No nginx directives to print — page caching and every module that contributes directives are currently disabled.' );
+				return;
+			}
+
+			// STDOUT only: no WP_CLI::log() prefixing, so redirection gives a
+			// clean file. WP_CLI::line() writes the raw string.
+			\WP_CLI::line( rtrim( $block, "\n" ) );
+			return;
+		}
+
+		/*
+		 * Force a fresh static-rewrite probe. The result is cached for five
+		 * minutes and nothing invalidated it, so after fixing an nginx config
+		 * there was no way to re-check — the "configure your server" banner
+		 * just stayed up. (FBS-84012)
+		 */
+		if ( 'recheck-rewrite' === $action ) {
+			// Qualify the raw probe against known config refusals before
+			// reporting. The probe fetches its OWN file from the static tree,
+			// which succeeds even when no real page is served that way — so
+			// an unqualified `active` reported "the web server is serving
+			// cache hits directly" on sites whose every page returned
+			// HIT (php). See Cache::qualify_rewrite_probe().
+			$probe    = \XSpeed\Cache::qualify_rewrite_probe( \XSpeed\Cache::recheck_static_rewrite() );
+			$blocked  = '' !== (string) $probe['block_reason'];
+
+			if ( $probe['active'] ) {
+				\WP_CLI::success( 'Static rewrite is active — the web server is serving cache hits directly.' );
+				return;
+			}
+			if ( $blocked ) {
+				\WP_CLI::warning( sprintf( 'Static rewrite is not active: %s', (string) $probe['reason'] ) );
+				return;
+			}
+			if ( $probe['inconclusive'] ) {
+				\WP_CLI::warning( sprintf( 'Could not verify the static rewrite: %s', (string) $probe['reason'] ) );
+				\WP_CLI::log( 'This is a probe failure, not proof that your server config is wrong.' );
+				return;
+			}
+			\WP_CLI::warning( sprintf( 'Static rewrite is not active: %s', (string) ( $probe['reason'] ?: 'unknown' ) ) );
+			return;
+		}
+
+		if ( 'purge-url' === $action ) {
+			$url = isset( $args[1] ) ? trim( (string) $args[1] ) : '';
+			if ( '' === $url ) {
+				\WP_CLI::error( 'Usage: wp xspeed cache purge-url <url-or-path>' );
+				return;
+			}
+			$cause   = isset( $assoc['cause'] ) && '' !== trim( (string) $assoc['cause'] ) ? trim( (string) $assoc['cause'] ) : 'CLI';
+			$removed = \XSpeed\Cache::purge_url( $url, $cause );
+			if ( $removed > 0 ) {
+				\WP_CLI::success( sprintf( 'Purged %d cache file(s) for %s', $removed, $url ) );
+			} else {
+				\WP_CLI::log( sprintf( 'No cache entries found for %s (already cold, or the URL never cached).', $url ) );
+			}
+			return;
+		}
+
+		if ( 'inventory' === $action ) {
+			$this->cli_inventory( $limit );
+			return;
+		}
+
+		if ( 'size' === $action ) {
+			$this->cli_size();
+			return;
+		}
+
+		if ( 'purge-log' === $action ) {
+			$this->cli_purge_log( $limit );
+			return;
+		}
+
+		if ( 'edge' === $action ) {
+			$this->cli_edge();
+			return;
+		}
+
+		$opts = Settings_Manager::get( self::SLUG );
+		\WP_CLI::log( 'cache_expiry  ' . $opts['cache_expiry'] . 'h' );
+		\WP_CLI::log( 'excluded_urls ' . count( $opts['excluded_urls'] ) . ' entries' );
+		foreach ( $opts['excluded_urls'] as $u ) {
+			\WP_CLI::log( '  - ' . $u );
+		}
+		$edge = \XSpeed\Edge_Provider::detect();
+		\WP_CLI::log( 'edge          ' . ( '' !== $edge['provider'] ? $edge['provider'] : $edge['confidence'] ) . ' (' . $edge['source'] . ')' );
+	}
+
+	/**
+	 * `wp xspeed cache edge` — what we think is in front, and what we say to it.
+	 *
+	 * Worth printing even when nothing is held back. "You are behind
+	 * Cloudflare, and a Cache Rule set to ignore origin headers overrides
+	 * anything xSpeed sends" is the answer to a support question that
+	 * otherwise costs someone a week, and it is true whether or not a hold
+	 * ever fires.
+	 */
+	private function cli_edge(): void {
+		$answer = \XSpeed\Edge_Provider::detect();
+
+		\WP_CLI::log( 'provider    ' . ( '' !== $answer['provider'] ? $answer['provider'] : '(none named)' ) );
+		\WP_CLI::log( 'confidence  ' . $answer['confidence'] );
+		\WP_CLI::log( 'source      ' . $answer['source'] );
+
+		// A pin outranks detection by design, so nothing re-checks it on the
+		// site's behalf. Saying the two disagree is the whole mechanism by
+		// which a site that changed CDN ever finds out.
+		$sniffed = \XSpeed\Edge_Provider::sniffed();
+		if ( in_array( $answer['source'], array( 'setting', 'constant', 'filter' ), true )
+			&& '' !== $sniffed['provider']
+			&& $sniffed['provider'] !== $answer['provider'] ) {
+			\WP_CLI::warning(
+				sprintf(
+					'This request looks like %s, but the provider is pinned to %s. If the site moved, change it — the pinned answer is also baked into the drop-in and the server rules.',
+					$sniffed['provider'],
+					'' !== $answer['provider'] ? $answer['provider'] : 'off'
+				)
+			);
+		}
+
+		if ( \XSpeed\Edge_Provider::is_off( $answer ) ) {
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'Nothing is sent: this is switched off.' );
+			return;
+		}
+
+		// Resolved through edge_headers_for() rather than straight off the
+		// provider, so this prints what the serve path would ACTUALLY send —
+		// including `X-XSpeed-Edge-Hold`, and including the evidence gate.
+		// Listing the provider's raw set ignored that gate and told operators
+		// a first render would be held on a site where it would not be.
+		//
+		// `bake`, not `request`. Two reasons, and the second one matters:
+		// this command answers for the site rather than for one response, and
+		// `request` fires `xspeed_edge_optimization_pending`, whose Pro
+		// listener resolves the CSS plan — which by its own description is
+		// what queues a build. A read-only command must not burn a build
+		// slot, quarantine an entry or purge a page just by being run, and
+		// under WP-CLI it would do all three against the home page.
+		$bypass = \XSpeed\Cache::edge_headers_for( 'BYPASS', 'bake', 'logged-in' );
+		$miss   = \XSpeed\Cache::edge_headers_for( 'MISS', 'bake' );
+
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'On a page xSpeed refuses to cache (a cart, a logged-in view):' );
+		foreach ( $bypass as $name => $value ) {
+			\WP_CLI::log( sprintf( '  %s: %s', $name, $value ) );
+		}
+
+		\WP_CLI::log( '' );
+		if ( array() === $miss ) {
+			\WP_CLI::log( 'On a first render: nothing. A MISS is a performance hedge, so it is held only where a cache in front was detected — and none was. Name the provider in Cache In Front Of This Site to cover first renders too.' );
+		} else {
+			\WP_CLI::log( 'On a first render:' );
+			foreach ( $miss as $name => $value ) {
+				\WP_CLI::log( sprintf( '  %s: %s', $name, $value ) );
+			}
+		}
+
+		\WP_CLI::log( '' );
+		\WP_CLI::log( 'X-XSpeed-Edge-Hold names why a response was held: bypass, bypass-shape, miss, mobile-split or pending. No header means nothing was held.' );
+
+		if ( 'cloudflare' === $answer['provider'] ) {
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'A Cloudflare Cache Rule whose Edge TTL is "Ignore cache-control header and use this TTL" overrides all of the above. Use "Respect origin TTL" on that rule if pages are still being stored.' );
+		}
+	}
+
+	/** `wp xspeed cache inventory [--limit=N]` — which pages are cached, and how old. */
+	private function cli_inventory( int $limit ): void {
+		$data = \XSpeed\Cache_Inventory::entries( $limit );
+
+		if ( empty( $data['entries'] ) ) {
+			\WP_CLI::log( 'Cache is empty — no cached pages on disk.' );
+			return;
+		}
+
+		\WP_CLI::log( sprintf( '%d cached page(s); showing %d.', $data['total'], count( $data['entries'] ) ) );
+		if ( ! empty( $data['capped'] ) ) {
+			\WP_CLI::warning( sprintf( 'Scan stopped at %d files — the list is a recent sample, not the whole cache.', \XSpeed\Cache_Inventory::SCAN_CAP ) );
+		}
+		foreach ( $data['entries'] as $entry ) {
+			\WP_CLI::log(
+				sprintf(
+					'  %-58s %8s  %s  [%s]',
+					null === $entry['url'] ? '(url unknown: ' . $entry['key'] . ')' : $entry['url'],
+					size_format( (int) $entry['bytes'] ),
+					$this->relative_age( (int) $entry['age'] ),
+					implode( '+', (array) $entry['stored_in'] )
+				)
+			);
+		}
+	}
+
+	/** `wp xspeed cache size` — where the cache's disk usage goes. */
+	private function cli_size(): void {
+		$data = \XSpeed\Cache_Inventory::size_breakdown();
+
+		\WP_CLI::log( sprintf( 'Total %s across %d file(s).', size_format( (int) $data['total_bytes'] ), (int) $data['total_files'] ) );
+		foreach ( $data['buckets'] as $bucket ) {
+			if ( 0 === (int) $bucket['files'] ) {
+				continue;
+			}
+			\WP_CLI::log( sprintf( '  %-32s %10s  %d file(s)', $bucket['label'], size_format( (int) $bucket['bytes'] ), (int) $bucket['files'] ) );
+		}
+		if ( (int) $data['compressed_bytes'] > 0 ) {
+			\WP_CLI::log( sprintf( 'Precompressed on disk: %s (pages without a precompressed copy are compressed by the web server at request time).', size_format( (int) $data['compressed_bytes'] ) ) );
+		}
+	}
+
+	/** `wp xspeed cache purge-log [--limit=N]` — what cleared the cache, when, and why. */
+	private function cli_purge_log( int $limit ): void {
+		$data = \XSpeed\Cache_Inventory::purge_log( $limit );
+
+		if ( empty( $data['events'] ) ) {
+			\WP_CLI::log( 'No purge events recorded yet.' );
+			return;
+		}
+		foreach ( $data['events'] as $event ) {
+			\WP_CLI::log( sprintf( '  %s  %s', $this->relative_age( max( 0, time() - (int) $event['ts'] ) ), $event['message'] ) );
+		}
+	}
+
+	/** Compact "4h ago" for CLI columns. */
+	private function relative_age( int $seconds ): string {
+		if ( $seconds < 60 ) {
+			return $seconds . 's ago';
+		}
+		if ( $seconds < 3600 ) {
+			return (int) floor( $seconds / 60 ) . 'm ago';
+		}
+		if ( $seconds < 86400 ) {
+			return (int) floor( $seconds / 3600 ) . 'h ago';
+		}
+		return (int) floor( $seconds / 86400 ) . 'd ago';
+	}
+
+	/**
+	 * Static-rewrite directives for the unified nginx server-block
+	 * snippet. Returns null when cache is disabled — there's no rewrite
+	 * to install in that state. Delegates to \XSpeed\Cache::nginx_snippet()
+	 * which already produces nginx-detection-gated output.
+	 */
+	public function nginx_directives(): ?string {
+		$opts = get_option( 'xspeed_options', array() );
+		if ( empty( $opts['cache_enabled'] ) ) {
+			return null;
+		}
+		return \XSpeed\Cache::nginx_snippet();
+	}
+
+	/**
+	 * Page caching's master switch is `cache_enabled` in the GLOBAL
+	 * `xspeed_options`, not a per-module `enabled` key -- Cache::toggle owns
+	 * it because flipping it rewrites .htaccess and wp-config.php. The base
+	 * implementation looks only at this module's own settings bag, so it
+	 * found nothing and reported null: the plugin's headline feature was
+	 * missing from its own "N on" count. (#363)
+	 */
+	public function is_active(): ?bool {
+		$opts = get_option( 'xspeed_options', array() );
+		return ! empty( $opts['cache_enabled'] );
+	}
+
+	/**
+	 * No reason shown: page caching has a single master switch, so the pill
+	 * already says everything an (i) would. The switch lives on the Overview
+	 * rather than on this page, but that is a "where is the control" question
+	 * the panel itself should answer, not a reason to explain the verdict.
+	 *
+	 * The (i) is reserved for modules whose on/off is genuinely non-obvious
+	 * -- counted from several flags, or from state outside the settings.
+	 */
+	public function active_reason(): ?string {
+		return null;
+	}
+}

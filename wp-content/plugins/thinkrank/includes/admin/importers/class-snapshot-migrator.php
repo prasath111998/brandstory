@@ -1,0 +1,3691 @@
+<?php
+
+/**
+ * Snapshot Migrator
+ *
+ * Plugin-agnostic migrator that reads normalized snapshot data from wp_options
+ * and writes _thinkrank_* post/term/user meta. Has no knowledge of source plugin
+ * formats.
+ *
+ * Rules:
+ * - Never overwrite existing ThinkRank data
+ * - Skip empty string values
+ * - Write _thinkrank_imported_from audit trail
+ * - Refuse to start if manifest status != 'complete'
+ * - Ignore record['extended'] (preserved in snapshot for future migration)
+ *
+ * @package ThinkRank\Admin\Importers
+ * @since 2.0.0
+ */
+
+declare(strict_types=1);
+
+namespace ThinkRank\Admin\Importers;
+
+use ThinkRank\SEO\Focus_Keywords;
+use ThinkRank\SEO\Metadata_Pending;
+use ThinkRank\SEO\Object_Redirect;
+use ThinkRank\SEO\Pattern_Resolver;
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+/**
+ * Snapshot Migrator Class
+ *
+ * @since 2.0.0
+ */
+class Snapshot_Migrator {
+
+    /**
+     * Canonical field → ThinkRank meta key mapping.
+     * This map grows as ThinkRank adds features.
+     */
+    private const META_MAP = [
+        'seo_title'           => '_thinkrank_seo_title',
+        'meta_description'    => '_thinkrank_meta_description',
+        'focus_keyword'       => '_thinkrank_focus_keyword',
+        'canonical_url'       => '_thinkrank_canonical_url',
+        'og_title'            => '_thinkrank_og_title',
+        'og_description'      => '_thinkrank_og_description',
+        'og_image'            => '_thinkrank_og_image',
+        'twitter_title'       => '_thinkrank_twitter_title',
+        'twitter_description' => '_thinkrank_twitter_description',
+        'twitter_image'       => '_thinkrank_twitter_image',
+        'primary_category'    => '_thinkrank_primary_category',
+        'schema_type'         => '_thinkrank_selected_schema_type',
+        // WooCommerce product identifier (GTIN/MPN/ISBN). Free does not read
+        // it; ThinkRank Pro's Product_Fields does, under this exact key, so
+        // importing it here means the identifier is already in place when Pro
+        // is activated. Without it Google reports "missing identifier" on every
+        // product after a switch, which is a rich-result warning the user did
+        // not have before they migrated (#715).
+        'product_identifier'  => '_thinkrank_product_gtin',
+    ];
+
+    /**
+     * Canonical robots meta fields. Composed into JSON-encoded
+     * `_thinkrank_robots_meta` / `_thinkrank_advanced_robots_meta`
+     * post meta by build_robots_payload().
+     */
+    private const ROBOTS_FIELDS = [
+        'noindex', 'nofollow', 'noarchive', 'noimageindex', 'nosnippet',
+    ];
+
+    private const ADVANCED_ROBOTS_FIELDS = [
+        'max_snippet', 'max_video_preview', 'max_image_preview',
+    ];
+
+    /**
+     * Data types that are migratable (have post/term/user meta mappings)
+     */
+    private const MIGRATABLE_TYPES = [
+        'postmeta',
+        'termmeta',
+        'usermeta',
+        'redirections',
+        '404_logs',
+        'settings',
+        Block_Converter::TYPE,
+    ];
+
+    /**
+     * Settings-record `extended` keys that either migrate today or are safe to
+     * discard on cleanup (raw_options is pure capture-all insurance; a fresh
+     * export recreates it, and analytics_connected is informational only).
+     * Anything OUTSIDE this list is treated as preserved-but-unapplied data by
+     * get_unmigrated_extended_buckets(), which gates /import/cleanup.
+     */
+    private const HANDLED_EXTENDED_SETTINGS = [
+        'breadcrumb_settings',
+        'local_seo',
+        'post_type_settings',
+        'title_formats',
+        'author_archives',
+        'instant_indexing_post_types',
+        'instant_indexing_log',
+        'publisher_sitemaps',
+        'email_reports',
+        'role_capabilities',
+        'image_seo',
+        'sitemap_settings',
+        'analytics_connected',
+        'focus_pages',
+        // Applied by migrate_site_identity() (#886).
+        'robots_txt',
+        'feed',
+        // Applied by migrate_markdown_for_ai() into ThinkRank Pro (#886).
+        // Without Pro it has no home, but neither is anything lost: cleanup
+        // removes a feature toggle, not content.
+        'markdown_for_ai',
+        // Capture-all raw buckets (whole source option sets stored verbatim).
+        // They live in the SNAPSHOT — cleanup never touches the snapshot — and
+        // a re-export recreates them, so they never block cleanup.
+        'raw_options',
+        'search_appearance',
+        'social_settings',
+        'advanced',
+        'sitemap_settings_raw',
+    ];
+
+    /**
+     * Conflict strategies for a chunk that targets data ThinkRank already holds.
+     *
+     * SKIP is right for an import: another plugin's value must never clobber
+     * something the user has already set here. OVERWRITE is right for a
+     * restore: the whole point of restoring a backup is to get the saved values
+     * back, and a "successful" restore that silently kept the current values
+     * would be the opposite of what was asked for.
+     */
+    public const CONFLICT_SKIP = 'skip';
+    public const CONFLICT_OVERWRITE = 'overwrite';
+
+    /**
+     * Migrate one chunk of snapshot data to ThinkRank meta
+     *
+     * @param string $plugin Plugin slug
+     * @param string $type Data type (postmeta, termmeta, usermeta, settings)
+     * @param int $page Chunk/page number
+     * @param string $conflict How to treat data ThinkRank already holds
+     * @return array Result with status, has_more, processed, skipped
+     */
+    public function migrate_chunk(string $plugin, string $type, int $page, string $conflict = self::CONFLICT_SKIP): array {
+        // Validate manifest status
+        $manifest = Snapshot_Store::get_manifest($plugin);
+        if (!$manifest || ($manifest['status'] ?? '') !== 'complete') {
+            return [
+                'status'  => 'error',
+                'message' => 'Snapshot is not complete. Run export first.',
+                'has_more' => false,
+                'processed' => 0,
+                'skipped' => 0,
+            ];
+        }
+
+        // ThinkRank's own export is not normalized into the canonical fields
+        // META_MAP translates; it carries raw _thinkrank_* meta, so it takes a
+        // restore path that writes those back untouched.
+        if ($plugin === Thinkrank_Exporter::SLUG) {
+            return $this->restore_native_chunk($manifest, $type, $page, $conflict);
+        }
+
+        if ($type === 'settings') {
+            return $this->migrate_settings($plugin);
+        }
+
+        if ($type === 'redirections') {
+            return $this->migrate_redirections($plugin, $page);
+        }
+
+        if ($type === '404_logs') {
+            return $this->migrate_404_logs($plugin, $page);
+        }
+
+        if ($type === Block_Converter::TYPE) {
+            return $this->migrate_content_blocks($plugin, $page);
+        }
+
+        $chunk = Snapshot_Store::read_chunk($plugin, $type, $page);
+        if ($chunk === null || empty($chunk)) {
+            // An empty chunk is not the end of the type. An exporter that pages
+            // one shared table and then splits the rows by kind writes nothing
+            // for a page whose rows all belonged to another kind — Squirrly
+            // reads the whole `qss` table that way, so a site whose terms and
+            // authors sit past the first page of posts has an empty chunk 1 and
+            // its real records in chunk 2. Ending the loop here dropped them
+            // silently, under a `complete` status, and cleanup then removed the
+            // source copy. Keep asking while the manifest says there are more
+            // chunks, exactly as the non-empty path below does.
+            $total_chunks = (int) ($manifest['types'][$type]['total_chunks'] ?? 0);
+            $has_more = $page < $total_chunks;
+
+            // The last chunk of a sparse export can legitimately be the empty
+            // one — Squirrly's tail page holds only term rows — and it still
+            // ends the migration, so release the editors that mark_bulk() set
+            // polling. Without this they poll until the marker's own expiry.
+            if ($type === 'postmeta' && !$has_more) {
+                Metadata_Pending::clear_bulk();
+            }
+
+            return [
+                'status'       => $has_more ? 'processing' : 'complete',
+                'message'      => sprintf('No data in chunk %d', $page),
+                'has_more'     => $has_more,
+                'page'         => $page,
+                'total_chunks' => $total_chunks,
+                'processed'    => 0,
+                'skipped'      => 0,
+            ];
+        }
+
+        // Tell an open editor that SEO meta is being written right now, so its
+        // panel adopts the imported title / description instead of showing the
+        // pre-import values until a reload. Re-marked on every chunk, which is
+        // what holds the window open for a long migration (#329).
+        if ($type === 'postmeta') {
+            Metadata_Pending::mark_bulk();
+        }
+
+        $processed = 0;
+        $skipped = 0;
+        $keywords = [];
+        $post_ids = [];
+        // Post IDs the source excluded from its sitemap.
+        $sitemap_excluded = [];
+        // Focus keyword overflow: posts whose source had more than MAX keywords.
+        $truncations = [];
+
+        foreach ($chunk as $record) {
+            $object_id = (int) ($record['object_id'] ?? 0);
+            $object_type = $record['object_type'] ?? '';
+            $source_plugin = $record['source_plugin'] ?? $plugin;
+            $data = $record['data'] ?? [];
+
+            if (!$object_id || empty($data)) {
+                $skipped++;
+                continue;
+            }
+
+            // The object has to still exist. A source that keys its SEO by URL
+            // rather than by a foreign key keeps rows for content that was
+            // deleted years ago — Squirrly's `qss` table is keyed on a URL hash
+            // — and writing their meta creates orphan rows no screen can reach
+            // and no uninstall sweeps, while reporting them as migrated.
+            if (!$this->object_exists($object_type, $object_id)) {
+                $skipped++;
+                continue;
+            }
+
+            // Track migrated posts so their SEO score can be computed once the
+            // chunk's meta has landed (terms are not scored).
+            if ($object_type === 'post') {
+                $post_ids[$object_id] = true;
+            }
+
+            $record_had_writes = false;
+
+            // Collect focus keywords (primary + secondary) to seed the Pro
+            // Rank Tracker watch-list once the chunk is processed.
+            $this->collect_keywords($record, $data, $keywords);
+
+            // Term social fields travel in `extended`, not `data`: only the
+            // AIOSEO exporter puts them in the canonical bucket, the other four
+            // put the identical values one level out. The loop below walks
+            // `data`, so every term OG image and Twitter title/description was
+            // exported and then dropped. Fold them in for terms, without
+            // letting them win over a value the record already carries.
+            if ($object_type === 'term') {
+                $extended = is_array($record['extended'] ?? null) ? $record['extended'] : [];
+                foreach (['og_title', 'og_description', 'og_image', 'twitter_title', 'twitter_description', 'twitter_image'] as $social_key) {
+                    if (!isset($data[$social_key]) || $data[$social_key] === '') {
+                        if (isset($extended[$social_key]) && $extended[$social_key] !== '') {
+                            $data[$social_key] = $extended[$social_key];
+                        }
+                    }
+                }
+            }
+
+            foreach ($data as $canonical_key => $value) {
+                if (!isset(self::META_MAP[$canonical_key])) {
+                    continue;
+                }
+
+                // Focus keywords are migrated as an array via the dedicated
+                // migrate_focus_keywords() below (which also keeps the legacy
+                // single-value meta in sync), so skip the scalar write here —
+                // but that writer only runs for posts, so skipping it for a
+                // term meant nobody wrote the term's focus keyword at all,
+                // even though get-term-seo reads `_thinkrank_focus_keyword`.
+                if ($canonical_key === 'focus_keyword' && $object_type === 'post') {
+                    continue;
+                }
+
+                $thinkrank_key = self::META_MAP[$canonical_key];
+
+                // Skip empty string values
+                if ($value === '' || $value === null) {
+                    continue;
+                }
+
+                // Skip zero values for integer fields that are "not set"
+                if ($value === 0 && in_array($canonical_key, ['primary_category'], true)) {
+                    continue;
+                }
+
+                // The meta writers unslash their value, so every write below
+                // slashes first. Unslashed, a title or description with a
+                // backslash in it lost it on the way in, and a JSON value lost
+                // the backslash of every `\"` and `\uXXXX` escape.
+                if ($object_type === 'post') {
+                    // Never overwrite existing ThinkRank data
+                    $existing = get_post_meta($object_id, $thinkrank_key, true);
+                    if ($existing !== '' && $existing !== false && $existing !== null) {
+                        continue;
+                    }
+
+                    update_post_meta($object_id, $thinkrank_key, wp_slash($value));
+                    $record_had_writes = true;
+                } elseif ($object_type === 'term') {
+                    $existing = get_term_meta($object_id, $thinkrank_key, true);
+                    if ($existing !== '' && $existing !== false && $existing !== null) {
+                        continue;
+                    }
+
+                    update_term_meta($object_id, $thinkrank_key, wp_slash($value));
+                    $record_had_writes = true;
+                } elseif ($object_type === 'user') {
+                    $existing = get_user_meta($object_id, $thinkrank_key, true);
+                    if ($existing !== '' && $existing !== false && $existing !== null) {
+                        continue;
+                    }
+
+                    update_user_meta($object_id, $thinkrank_key, wp_slash($value));
+                    $record_had_writes = true;
+                }
+            }
+
+            // Focus keywords (post meta only). Migrates the full deduped,
+            // capped keyword array and keeps the legacy single value in sync.
+            if ($object_type === 'post' && $this->migrate_focus_keywords($object_id, $data, $truncations)) {
+                $record_had_writes = true;
+            }
+
+            // Compose the per-post robots JSON payload (post meta only).
+            if ($object_type === 'post' && $this->migrate_robots_payload($object_id, $data)) {
+                $record_had_writes = true;
+            }
+
+            // The same directives for a term. Every exporter emits term
+            // noindex/nofollow and ThinkRank stores them, but nothing wrote
+            // them — so a category the owner had deliberately kept out of the
+            // index came back indexable after the switch, which is the worst
+            // way for an import to be wrong.
+            if ($object_type === 'term' && $this->migrate_term_robots_payload($object_id, $data)) {
+                $record_had_writes = true;
+            }
+
+            // Pillar / cornerstone content flag (post meta only).
+            if ($object_type === 'post' && $this->migrate_pillar_content($object_id, $data)) {
+                $record_had_writes = true;
+            }
+
+            // Review schema form data (post meta only). Seeds the metabox Review
+            // form so an imported review renders once deployed.
+            if ($object_type === 'post' && $this->migrate_review_schema($object_id, $data, $record)) {
+                $record_had_writes = true;
+            }
+
+            // VideoObject schema form data (post meta only). Seeds the metabox
+            // Video form so an imported video schema renders once deployed.
+            if ($object_type === 'post' && $this->migrate_video_schema($object_id, $data, $record)) {
+                $record_had_writes = true;
+            }
+
+            // The post's own schemas as ThinkRank Pro Custom Schema entries
+            // scoped to it (extended.custom_schemas, #886).
+            if ($object_type === 'post' && !empty($record['extended']['custom_schemas']) && is_array($record['extended']['custom_schemas'])
+                && $this->migrate_custom_schemas($source_plugin, $record['extended']['custom_schemas']) > 0) {
+                $record_had_writes = true;
+            }
+
+            // Per-object redirect. SEOPress is the one source that stores a
+            // redirect as object meta rather than in a rules table, so its
+            // per-post redirects were exported into extended.redirect_* and
+            // then dropped for want of anywhere to put them. They have a home
+            // now: Object_Redirect writes through to Pro's rules table, and
+            // returns a WP_Error (which we skip) when Pro is inactive, leaving
+            // the value in the snapshot for a later run.
+            if (in_array($object_type, ['post', 'term'], true)
+                && $this->migrate_object_redirect($object_type, $object_id, $record)) {
+                $record_had_writes = true;
+            }
+
+            // Per-post "exclude from sitemap" flags. ThinkRank models sitemap
+            // exclusion as one comma-separated ID list on the sitemap settings
+            // rather than per-post meta, so collect the IDs and apply them once
+            // after the chunk (a settings write per post would be wasteful).
+            // Two spellings reach here: Rank Math's exporter emits
+            // `exclude_sitemap`, Squirrly's `exclude_from_sitemap`. Only the
+            // first was read, so every Squirrly `nositemap` flag was dropped
+            // and posts the owner had hidden reappeared in the sitemap. Accept
+            // both rather than renaming one, because snapshots already exported
+            // carry whichever spelling their exporter used at the time.
+            $excluded_from_sitemap = !empty($record['extended']['exclude_sitemap'])
+                || !empty($record['extended']['exclude_from_sitemap']);
+
+            if ($object_type === 'post' && $excluded_from_sitemap) {
+                $sitemap_excluded[] = $object_id;
+            }
+
+            if ($record_had_writes) {
+                // Write audit trail
+                if ($object_type === 'post') {
+                    update_post_meta($object_id, '_thinkrank_imported_from', $source_plugin);
+                } elseif ($object_type === 'term') {
+                    update_term_meta($object_id, '_thinkrank_imported_from', $source_plugin);
+                } elseif ($object_type === 'user') {
+                    update_user_meta($object_id, '_thinkrank_imported_from', $source_plugin);
+                }
+                $processed++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        // Seed the Pro Rank Tracker watch-list from the collected keywords.
+        // No-op when Pro is inactive.
+        $keywords_seeded = $this->seed_rank_tracker($keywords);
+
+        // Fold this chunk's sitemap-excluded posts into the sitemap settings.
+        $sitemap_excluded_count = $this->migrate_sitemap_exclusions($sitemap_excluded);
+
+        // Compute + persist SEO scores for the migrated posts so the SEO
+        // Overview reflects accurate data without a manual re-analyze. The
+        // snapshot's chunk pagination bounds this to <=100 posts per request,
+        // which keeps each pass well within PHP execution limits.
+        $analyzed = $this->analyze_posts(array_keys($post_ids));
+
+        // Check if there are more chunks
+        $type_info = $manifest['types'][$type] ?? [];
+        $total_chunks = $type_info['total_chunks'] ?? 0;
+        $has_more = $page < $total_chunks;
+
+        // Last chunk: no more writes are coming, so stop every open editor
+        // polling for one. The marker's own expiry covers a migration that is
+        // abandoned part-way and never reaches this line.
+        if ($type === 'postmeta' && !$has_more) {
+            Metadata_Pending::clear_bulk();
+        }
+
+        return [
+            'status'          => $has_more ? 'processing' : 'complete',
+            'message'         => sprintf('Migrated %d records, skipped %d (page %d)', $processed, $skipped, $page),
+            'has_more'        => $has_more,
+            'page'            => $page,
+            'total_chunks'    => $total_chunks,
+            'processed'       => $processed,
+            'skipped'         => $skipped,
+            'keywords_seeded' => $keywords_seeded,
+            'sitemap_excluded' => $sitemap_excluded_count,
+            'analyzed'        => $analyzed,
+            // Posts whose source had more than the max focus keywords; the
+            // excess was capped but preserved in the overflow meta.
+            'keywords_truncated' => count($truncations),
+            'keywords_truncated_sample' => array_slice($truncations, 0, 10),
+        ];
+    }
+
+
+    /**
+     * Restore one chunk of ThinkRank's own export.
+     *
+     * Deliberately does NOT reuse the canonical loop above. That loop maps
+     * through META_MAP, rebuilds the robots payload from canonical flags and
+     * drops every key it does not know — correct when translating another
+     * plugin's data, lossy when the data is already ours. Here the record holds
+     * raw `_thinkrank_*` meta and the job is to put it back exactly as it was.
+     *
+     * @param array  $manifest Snapshot manifest
+     * @param string $type     Data type
+     * @param int    $page     Chunk page
+     * @param string $conflict CONFLICT_SKIP | CONFLICT_OVERWRITE
+     * @return array Result
+     */
+    private function restore_native_chunk(array $manifest, string $type, int $page, string $conflict): array {
+        if ($type === 'settings') {
+            return $this->restore_native_settings($conflict);
+        }
+
+        // Pro's own tables (redirections, 404 logs, rank tracker, Brand
+        // Visibility) are exported through a filter and come back through one:
+        // the free plugin holds the records but has nowhere to put them.
+        if (!in_array($type, ['postmeta', 'termmeta', 'usermeta'], true)) {
+            return $this->restore_extension_chunk($manifest, $type, $page, $conflict);
+        }
+
+        $chunk = Snapshot_Store::read_chunk(Thinkrank_Exporter::SLUG, $type, $page);
+        if (empty($chunk)) {
+            return [
+                'status'    => 'complete',
+                'message'   => 'No data in chunk',
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => 0,
+                'missing'   => 0,
+            ];
+        }
+
+        // Hold open the editor's "SEO meta is being written" window for as long
+        // as the restore runs, exactly as the import path does.
+        if ($type === 'postmeta') {
+            Metadata_Pending::mark_bulk();
+        }
+
+        $processed = 0;
+        $skipped   = 0;
+        $missing   = 0;
+
+        foreach ($chunk as $record) {
+            $object_id   = (int) ($record['object_id'] ?? 0);
+            $object_type = (string) ($record['object_type'] ?? '');
+            $data        = $record['data'] ?? [];
+
+            if (!$object_id || !is_array($data) || empty($data)) {
+                $skipped++;
+                continue;
+            }
+
+            // A file from another site (or one taken before a post was deleted)
+            // references IDs that are not here. Counted separately from
+            // `skipped` so the UI can say "12 posts no longer exist" rather
+            // than reporting a silent no-op.
+            if (!$this->object_exists($object_type, $object_id)) {
+                $missing++;
+                continue;
+            }
+
+            $wrote = false;
+            foreach ($data as $meta_key => $value) {
+                // Only ThinkRank's own meta, whatever the file claims: a
+                // hand-edited export must not become a way to write arbitrary
+                // meta onto any post.
+                if (strpos((string) $meta_key, Thinkrank_Exporter::META_PREFIX) !== 0) {
+                    continue;
+                }
+
+                if ($conflict === self::CONFLICT_SKIP) {
+                    $existing = $this->get_object_meta($object_type, $object_id, (string) $meta_key);
+                    if ($existing !== '' && $existing !== false && $existing !== null) {
+                        continue;
+                    }
+                }
+
+                // No skip-empty rule here, unlike the import path. An empty
+                // string is a real stored value for some fields (the author
+                // archive templates, where "" means render no template), and
+                // dropping it would restore the default instead.
+                if ($this->write_object_meta($object_type, $object_id, (string) $meta_key, $value)) {
+                    $wrote = true;
+                }
+            }
+
+            if ($wrote) {
+                $processed++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        $total_chunks = (int) ($manifest['types'][$type]['total_chunks'] ?? 0);
+        $has_more     = $page < $total_chunks;
+
+        if ($type === 'postmeta' && !$has_more) {
+            Metadata_Pending::clear_bulk();
+        }
+
+        return [
+            'status'       => $has_more ? 'processing' : 'complete',
+            'message'      => sprintf(
+                'Restored %d records, skipped %d, %d no longer exist (page %d)',
+                $processed,
+                $skipped,
+                $missing,
+                $page
+            ),
+            'has_more'     => $has_more,
+            'page'         => $page,
+            'total_chunks' => $total_chunks,
+            'processed'    => $processed,
+            'skipped'      => $skipped,
+            'missing'      => $missing,
+        ];
+    }
+
+    /**
+     * Hand a non-core type's records to whoever registered it.
+     *
+     * With no handler the records stay in the snapshot rather than being
+     * dropped: reporting "0 restored" is honest, and a later Pro activation can
+     * still drain the same snapshot.
+     *
+     * @param array  $manifest Snapshot manifest
+     * @param string $type     Data type
+     * @param int    $page     Chunk page
+     * @param string $conflict CONFLICT_SKIP | CONFLICT_OVERWRITE
+     * @return array Result
+     */
+    private function restore_extension_chunk(array $manifest, string $type, int $page, string $conflict): array {
+        $chunk        = Snapshot_Store::read_chunk(Thinkrank_Exporter::SLUG, $type, $page) ?? [];
+        $total_chunks = (int) ($manifest['types'][$type]['total_chunks'] ?? 0);
+        $has_more     = $page < $total_chunks;
+
+        /**
+         * Filters the number of records a non-core restore type applied.
+         *
+         * Handlers should write the records and return how many they wrote.
+         * Anything not written stays in the snapshot.
+         *
+         * @since 2.2.0
+         *
+         * @param int    $processed Records applied (0 by default).
+         * @param array  $records   Records from this chunk.
+         * @param string $type      Data type being restored.
+         * @param string $conflict  'skip' or 'overwrite'.
+         */
+        $processed = (int) apply_filters('thinkrank_restore_records', 0, $chunk, $type, $conflict);
+        $skipped   = max(0, count($chunk) - $processed);
+
+        return [
+            'status'       => $has_more ? 'processing' : 'complete',
+            'message'      => sprintf('Restored %d %s records, skipped %d (page %d)', $processed, $type, $skipped, $page),
+            'has_more'     => $has_more,
+            'page'         => $page,
+            'total_chunks' => $total_chunks,
+            'processed'    => $processed,
+            'skipped'      => $skipped,
+            'missing'      => 0,
+        ];
+    }
+
+    /**
+     * Write a single meta value for post|term|user.
+     *
+     * @param string $object_type One of post|term|user
+     * @param int    $object_id   Object id
+     * @param string $key         Meta key
+     * @param mixed  $value       Meta value
+     * @return bool Whether the value was written
+     */
+    private function write_object_meta(string $object_type, int $object_id, string $key, $value): bool {
+        // Registered meta can carry a typed sanitize_callback, and some of ours
+        // declare `string` — `_thinkrank_robots_meta` and
+        // `_thinkrank_advanced_robots_meta` both run through
+        // Metabox_Manager::sanitize_json_meta_field(string $value). Everything
+        // writing those today stores JSON, so an export carries them back as
+        // strings; but the restore's whole policy is to write the file's value
+        // verbatim, and a file holding one as an array would otherwise raise a
+        // TypeError that takes down the rest of the chunk with it. One bad key
+        // is worth skipping, not the records behind it.
+        //
+        // wp_slash() because the meta writers unslash: a restored JSON value
+        // (schema form data, robots) would otherwise lose the backslash of
+        // every escaped quote and come back as invalid JSON.
+        try {
+            switch ($object_type) {
+                case 'post':
+                    update_post_meta($object_id, $key, wp_slash($value));
+                    return true;
+                case 'term':
+                    update_term_meta($object_id, $key, wp_slash($value));
+                    return true;
+                case 'user':
+                    update_user_meta($object_id, $key, wp_slash($value));
+                    return true;
+            }
+        } catch (\Throwable $e) {
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- debug-only diagnostic; a skipped key is otherwise invisible.
+                error_log(sprintf('ThinkRank restore: skipped %s meta "%s" on %d — %s', $object_type, $key, $object_id, $e->getMessage()));
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Restore ThinkRank's own settings from a native snapshot.
+     *
+     * Bypasses migrate_settings() entirely: that method is Yoast/Rank Math
+     * shaped — separator code maps, knowledge graph assembly, webmaster tools —
+     * and none of it applies to data already in our own format.
+     *
+     * @param string $conflict CONFLICT_SKIP | CONFLICT_OVERWRITE
+     * @return array Result
+     */
+    private function restore_native_settings(string $conflict): array {
+        $chunk = Snapshot_Store::read_chunk(Thinkrank_Exporter::SLUG, 'settings', 1);
+        $data  = $chunk[0]['data'] ?? [];
+
+        if (!is_array($data) || empty($data)) {
+            return [
+                'status'    => 'complete',
+                'message'   => 'No settings in snapshot',
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => 0,
+            ];
+        }
+
+        $overwrite = $conflict === self::CONFLICT_OVERWRITE;
+
+        $processed = $this->restore_settings_options((array) ($data['options'] ?? []), $overwrite);
+        $processed += $this->restore_settings_table((array) ($data['seo_table'] ?? []), $overwrite);
+        $processed += $this->restore_aggregate_options((array) ($data['aggregate'] ?? []), $overwrite);
+
+        return [
+            'status'    => 'complete',
+            'message'   => sprintf('Restored %d settings', $processed),
+            'has_more'  => false,
+            'page'      => 1,
+            'processed' => $processed,
+            'skipped'   => 0,
+        ];
+    }
+
+    /**
+     * Restore the `thinkrank_{key}` options behind Settings.
+     *
+     * Written through Settings::set() rather than update_option() so the class's
+     * own key validation, encryption and cache invalidation all run.
+     *
+     * @param array $options   Setting key => value
+     * @param bool  $overwrite Whether to replace values already stored here
+     * @return int Number of settings written
+     */
+    private function restore_settings_options(array $options, bool $overwrite): int {
+        if (empty($options) || !class_exists('ThinkRank\\Core\\Settings')) {
+            return 0;
+        }
+
+        $settings = \ThinkRank\Core\Settings::instance();
+        $written  = 0;
+
+        foreach ($options as $key => $value) {
+            $key = (string) $key;
+
+            if (!$overwrite) {
+                // A distinctive sentinel, because `false` and `''` are both
+                // legitimate stored values here.
+                if (get_option('thinkrank_' . $key, '__tr_not_set__') !== '__tr_not_set__') {
+                    continue;
+                }
+            }
+
+            if ($settings->set($key, $value)) {
+                $written++;
+            }
+        }
+
+        return $written;
+    }
+
+    /**
+     * Restore the thinkrank_seo_settings table, one category/context at a time.
+     *
+     * @param array $categories Category => context type => context id => key => row
+     * @param bool  $overwrite  Whether to replace rows already stored here
+     * @return int Number of settings written
+     */
+    private function restore_settings_table(array $categories, bool $overwrite): int {
+        $written = 0;
+
+        foreach ($categories as $category => $contexts) {
+            $manager = $this->create_settings_restorer((string) $category);
+            if ($manager === null) {
+                continue;
+            }
+
+            foreach ((array) $contexts as $context_type => $context_ids) {
+                foreach ((array) $context_ids as $context_id => $rows) {
+                    $existing = $overwrite ? [] : $manager->get_settings((string) $context_type, (int) $context_id);
+                    $payload  = [];
+
+                    foreach ((array) $rows as $key => $row) {
+                        if (!$overwrite && array_key_exists($key, $existing)) {
+                            continue;
+                        }
+
+                        // Rows are exported as ['value' => …, 'type' => …,
+                        // 'priority' => …]; older files may carry the bare value.
+                        $payload[$key] = is_array($row) && array_key_exists('value', $row)
+                            ? $row['value']
+                            : $row;
+                    }
+
+                    if (empty($payload)) {
+                        continue;
+                    }
+
+                    // Declare the keys before saving. sanitize_settings() drops
+                    // any key the manager does not claim, and save_settings()
+                    // still returns true when it dropped every one of them — so
+                    // without this the restore reports success and writes
+                    // nothing. The rows came out of this table to begin with,
+                    // which is the strongest claim to being real settings that
+                    // exists.
+                    $manager->set_restorable_keys(array_keys($payload));
+
+                    if ($manager->save_settings((string) $context_type, (int) $context_id, $payload)) {
+                        $written += count($payload);
+                    }
+                }
+            }
+        }
+
+        return $written;
+    }
+
+    /**
+     * A minimal Abstract_SEO_Manager for one settings category.
+     *
+     * Going through a manager (rather than writing rows directly) buys the
+     * upsert, the shared sanitizer that knows which keys are multiline or
+     * template strings, the cache invalidation, and the
+     * `thinkrank_seo_settings_saved` action other managers listen for.
+     *
+     * Validation is deliberately permissive: this is the site's own data coming
+     * back, and a validator that has tightened since the export was taken would
+     * silently drop rows mid-restore. Reaching here already requires
+     * manage_options, so the file is not a privilege boundary.
+     *
+     * @param string $category Settings category (the manager_type column)
+     * @return \ThinkRank\SEO\Abstract_SEO_Manager|null
+     */
+    protected function create_settings_restorer(string $category) {
+        if ($category === '' || !class_exists('ThinkRank\\SEO\\Abstract_SEO_Manager')) {
+            return null;
+        }
+
+        return new class($category) extends \ThinkRank\SEO\Abstract_SEO_Manager {
+
+            /** @var string[] Keys this restore pass is allowed to write. */
+            private array $restorable_keys = [];
+
+            /**
+             * @param string[] $keys Setting keys about to be restored.
+             * @return void
+             */
+            public function set_restorable_keys(array $keys): void {
+                $this->restorable_keys = array_values(array_filter($keys, 'is_string'));
+            }
+
+            public function validate_settings(array $settings): array {
+                return ['valid' => true, 'errors' => []];
+            }
+
+            public function get_output_data(string $context_type, ?int $context_id): array {
+                return [];
+            }
+
+            /**
+             * Backs the allow-list sanitize_settings() checks against. Empty
+             * until set_restorable_keys() names the keys of the batch being
+             * written, so the restorer can never write a key that was not in
+             * the file.
+             */
+            public function get_default_settings(string $context_type): array {
+                return array_fill_keys($this->restorable_keys, '');
+            }
+
+            public function get_settings_schema(string $context_type): array {
+                return [];
+            }
+        };
+    }
+
+    /**
+     * Restore the standalone aggregate settings options.
+     *
+     * @param array $options   Option name => value
+     * @param bool  $overwrite Whether to replace options already stored here
+     * @return int Number of options written
+     */
+    private function restore_aggregate_options(array $options, bool $overwrite): int {
+        $written = 0;
+
+        foreach ($options as $option_name => $value) {
+            $option_name = (string) $option_name;
+
+            // Only the options the exporter actually emits, whatever the file
+            // claims. A plain `thinkrank_` prefix check would not be enough:
+            // the snapshot chunks themselves live under that prefix, so a
+            // hand-edited export could rewrite the snapshot it is restoring from.
+            if (!in_array($option_name, Thinkrank_Exporter::AGGREGATE_OPTIONS, true)) {
+                continue;
+            }
+
+            $existing = get_option($option_name, '__tr_not_set__');
+
+            if (!$overwrite && $existing !== '__tr_not_set__') {
+                continue;
+            }
+
+            // An aggregate option is written whole, so a key the exporter
+            // stripped would be DELETED here rather than just left alone — an
+            // overwrite-restore would wipe this site's Google OAuth tokens and
+            // platform verification codes on the way to restoring everything
+            // around them. Carry the local values forward for exactly the keys
+            // export redacts, matching that redaction key for key and depth for
+            // depth.
+            if (is_array($value) && is_array($existing)) {
+                $value = $this->carry_forward_redacted(
+                    $value,
+                    $existing,
+                    array_merge(
+                        Thinkrank_Exporter::secret_setting_keys(),
+                        Thinkrank_Exporter::SECRET_OPTION_KEYS[$option_name] ?? []
+                    )
+                );
+            }
+
+            update_option($option_name, $value);
+            $written++;
+        }
+
+        return $written;
+    }
+
+    /**
+     * Put back the secrets the export stripped, from what this site already has.
+     *
+     * The mirror image of Thinkrank_Exporter::strip_secret_keys(): that walks
+     * the payload to any depth removing keys named as secrets, so this walks it
+     * to the same depth restoring them. A key the export DID carry is left
+     * alone — the carry-forward only fills a hole, so a deliberate change still
+     * lands.
+     *
+     * @since 2.3.1
+     *
+     * @param array    $incoming    The option value from the snapshot.
+     * @param array    $existing    The option value this site already holds.
+     * @param string[] $secret_keys Key names redaction removes.
+     * @return array
+     */
+    private function carry_forward_redacted(array $incoming, array $existing, array $secret_keys): array {
+        foreach ($existing as $key => $existing_value) {
+            if (is_string($key) && in_array($key, $secret_keys, true)) {
+                if (!array_key_exists($key, $incoming)) {
+                    $incoming[$key] = $existing_value;
+                }
+                continue;
+            }
+
+            if (is_array($existing_value) && isset($incoming[$key]) && is_array($incoming[$key])) {
+                $incoming[$key] = $this->carry_forward_redacted($incoming[$key], $existing_value, $secret_keys);
+            }
+        }
+
+        return $incoming;
+    }
+
+    /**
+     * Dry-run a snapshot chunk: classify what a migrate WOULD do without
+     * writing anything. Mirrors migrate_chunk()'s per-field decision (skip
+     * empty values, never overwrite existing ThinkRank data) so the counts
+     * match what a real migrate would produce.
+     *
+     * Each object-meta record lands in exactly one bucket:
+     * - `unmatched`   — the referenced post/term/user no longer exists here.
+     * - `would_write` — at least one field would be written (target empty).
+     * - `conflicts`   — no writes, but the source differs from an existing
+     *                   ThinkRank value that migrate would NOT overwrite.
+     * - `skipped`     — matched, but nothing to write and nothing conflicting
+     *                   (empty data, or values already identical).
+     *
+     * Only object-meta types (postmeta/termmeta/usermeta) are previewed;
+     * settings/redirections/404 logs are migrated wholesale and return zeros.
+     *
+     * @param string $plugin Source plugin slug.
+     * @param string $type   Snapshot data type.
+     * @param int    $page   1-based chunk page.
+     * @return array<string,mixed>
+     */
+    public function preview_chunk(string $plugin, string $type, int $page): array {
+        $summary = [
+            'type'        => $type,
+            'page'        => $page,
+            'records'     => 0,
+            'unmatched'   => 0,
+            'would_write' => 0,
+            'conflicts'   => 0,
+            'skipped'     => 0,
+            'has_more'    => false,
+            'samples'     => ['unmatched' => [], 'would_write' => [], 'conflicts' => []],
+        ];
+
+        $manifest = Snapshot_Store::get_manifest($plugin);
+        if (!$manifest || ($manifest['status'] ?? '') !== 'complete') {
+            $summary['error'] = 'Snapshot is not complete. Run export first.';
+            return $summary;
+        }
+
+        if (!in_array($type, ['postmeta', 'termmeta', 'usermeta'], true)) {
+            return $summary;
+        }
+
+        $chunk = Snapshot_Store::read_chunk($plugin, $type, $page);
+        if ($chunk === null || empty($chunk)) {
+            return $summary;
+        }
+
+        foreach ($chunk as $record) {
+            $summary['records']++;
+
+            $object_id = (int) ($record['object_id'] ?? 0);
+            $object_type = $record['object_type'] ?? '';
+            $data = $record['data'] ?? [];
+
+            if (!$object_id || empty($data)) {
+                $summary['skipped']++;
+                continue;
+            }
+
+            if (!$this->object_exists($object_type, $object_id)) {
+                $summary['unmatched']++;
+                if (count($summary['samples']['unmatched']) < 10) {
+                    $summary['samples']['unmatched'][] = ['object_id' => $object_id, 'object_type' => $object_type];
+                }
+                continue;
+            }
+
+            $writes = [];
+            $conflicts = [];
+
+            foreach ($data as $canonical_key => $value) {
+                if (!isset(self::META_MAP[$canonical_key])) {
+                    continue;
+                }
+                if ($value === '' || $value === null) {
+                    continue;
+                }
+                if ($value === 0 && in_array($canonical_key, ['primary_category'], true)) {
+                    continue;
+                }
+
+                $existing = $this->get_object_meta($object_type, $object_id, self::META_MAP[$canonical_key]);
+                if ($existing === '' || $existing === false || $existing === null) {
+                    $writes[] = $canonical_key;
+                } else {
+                    $source = is_scalar($value) ? (string) $value : (string) wp_json_encode($value);
+                    if ((string) $existing !== $source) {
+                        $conflicts[] = $canonical_key;
+                    }
+                }
+            }
+
+            if (!empty($writes)) {
+                $summary['would_write']++;
+                if (count($summary['samples']['would_write']) < 10) {
+                    $summary['samples']['would_write'][] = ['object_id' => $object_id, 'fields' => $writes];
+                }
+            } elseif (!empty($conflicts)) {
+                $summary['conflicts']++;
+                if (count($summary['samples']['conflicts']) < 10) {
+                    $summary['samples']['conflicts'][] = ['object_id' => $object_id, 'fields' => $conflicts];
+                }
+            } else {
+                $summary['skipped']++;
+            }
+        }
+
+        $type_info = $manifest['types'][$type] ?? [];
+        $total_chunks = $type_info['total_chunks'] ?? 0;
+        $summary['has_more'] = $page < $total_chunks;
+
+        return $summary;
+    }
+
+    /**
+     * Whether the referenced object still exists on this site.
+     *
+     * @param string $object_type One of post|term|user.
+     * @param int    $object_id   Object id.
+     * @return bool
+     */
+    private function object_exists(string $object_type, int $object_id): bool {
+        switch ($object_type) {
+            case 'post':
+                return (bool) get_post($object_id);
+            case 'term':
+                return (bool) get_term($object_id);
+            case 'user':
+                return (bool) get_userdata($object_id);
+        }
+        return false;
+    }
+
+    /**
+     * Read a single meta value for post|term|user.
+     *
+     * @param string $object_type One of post|term|user.
+     * @param int    $object_id   Object id.
+     * @param string $key         Meta key.
+     * @return mixed
+     */
+    private function get_object_meta(string $object_type, int $object_id, string $key) {
+        switch ($object_type) {
+            case 'post':
+                return get_post_meta($object_id, $key, true);
+            case 'term':
+                return get_term_meta($object_id, $key, true);
+            case 'user':
+                return get_user_meta($object_id, $key, true);
+        }
+        return '';
+    }
+
+    /**
+     * Lazily instantiated SEO score calculator.
+     *
+     * @var \ThinkRank\AI\SEOScoreCalculator|null
+     */
+    private ?\ThinkRank\AI\SEOScoreCalculator $score_calculator = null;
+
+    /**
+     * Calculate and store SEO scores for freshly migrated posts.
+     *
+     * The scorer is purely local/algorithmic (no external AI calls), so it is
+     * safe to run synchronously in bulk. Posts that already carry a score are
+     * skipped, keeping the pass idempotent across re-runs. A per-post failure
+     * is swallowed so one bad post never aborts the whole chunk.
+     *
+     * Fires `thinkrank_seo_score_updated` once when any score was written so the
+     * cached SEO Overview / usage-analytics responses are invalidated.
+     *
+     * @param int[] $post_ids Migrated post IDs (de-duplicated)
+     * @return int Number of posts scored this pass
+     */
+    private function analyze_posts(array $post_ids): int {
+        if (empty($post_ids)) {
+            return 0;
+        }
+
+        // Delegate to the shared scoring loop (also used by the
+        // bulk-analyze-and-save ability); migration only needs the count.
+        $summary = $this->score_posts($post_ids);
+
+        return $summary['scored'];
+    }
+
+    /**
+     * Score and persist SEO scores for a set of posts, returning per-post
+     * results plus totals. This is the shared bulk-scoring loop used both by
+     * migration (via analyze_posts()) and the bulk-analyze-and-save ability.
+     *
+     * The scorer is purely local/algorithmic (no external AI calls), so it is
+     * safe to run synchronously in bulk. A per-post failure is captured, never
+     * thrown, so one bad post cannot abort the batch. Fires
+     * `thinkrank_seo_score_updated` once when any score was written so cached
+     * SEO Overview / usage-analytics responses are invalidated.
+     *
+     * @param int[] $post_ids Post IDs to score (de-duplicated internally).
+     * @param bool  $rescore  When false (default), posts that already carry a
+     *                        stored score are left untouched (idempotent). When
+     *                        true, every post is re-scored and re-saved.
+     * @return array{results:array<int,array<string,mixed>>,scored:int,skipped:int,failed:int,total:int}
+     */
+    public function score_posts(array $post_ids, bool $rescore = false): array {
+        $post_ids = array_values(array_unique(array_map('intval', $post_ids)));
+
+        $calculator = $this->get_score_calculator();
+        $user_id = get_current_user_id();
+
+        $results = [];
+        $scored = 0;
+        $skipped = 0;
+        $failed = 0;
+
+        foreach ($post_ids as $post_id) {
+            $result = $this->score_single_post($calculator, $user_id, $post_id, $rescore);
+            $results[] = $result;
+
+            if ($result['status'] === 'scored') {
+                $scored++;
+            } elseif ($result['status'] === 'error') {
+                $failed++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        if ($scored > 0) {
+            // Invalidate cached analytics / SEO Overview responses.
+            do_action('thinkrank_seo_score_updated');
+        }
+
+        return [
+            'results' => $results,
+            'scored'  => $scored,
+            'skipped' => $skipped,
+            'failed'  => $failed,
+            'total'   => count($results),
+        ];
+    }
+
+    /**
+     * Score and persist a single post. Returns a structured per-post result:
+     * status is one of `scored`, `skipped_existing`, `not_found`,
+     * `no_content`, or `error`.
+     *
+     * @param \ThinkRank\AI\SEOScoreCalculator $calculator Shared calculator.
+     * @param int                              $user_id    Acting user id.
+     * @param int                              $post_id    Post to score.
+     * @param bool                             $rescore    Re-score even if scored.
+     * @return array<string,mixed>
+     */
+    private function score_single_post(\ThinkRank\AI\SEOScoreCalculator $calculator, int $user_id, int $post_id, bool $rescore): array {
+        $base = ['post_id' => $post_id, 'status' => '', 'score' => null, 'score_id' => null];
+
+        if (!$rescore && $calculator->get_latest_score($post_id) !== null) {
+            return array_merge($base, ['status' => 'skipped_existing']);
+        }
+
+        if (!get_post($post_id)) {
+            return array_merge($base, ['status' => 'not_found']);
+        }
+
+        try {
+            $content_data = $calculator->analyze_post_content($post_id);
+            if (empty($content_data)) {
+                return array_merge($base, ['status' => 'no_content']);
+            }
+
+            // Score against the effective title/description (custom value, else
+            // the resolved Global pattern) so posts that inherit their title or
+            // description from a global pattern are scored the same as in the
+            // editor and on the frontend, instead of as if those fields were
+            // empty. Pattern_Resolver::title() already falls back through the
+            // WordPress post title, so the previous post_title fallback is covered.
+            $metadata = [
+                'title'       => Pattern_Resolver::effective_title($post_id),
+                'description' => Pattern_Resolver::effective_description($post_id),
+            ];
+
+            // Score against all focus keywords; the calculator uses the
+            // highest-scoring keyword as the final score.
+            $target_keywords = Focus_Keywords::get($post_id);
+
+            $score_data = $calculator->calculate_score(
+                $content_data,
+                $metadata,
+                ['target_keywords' => $target_keywords]
+            );
+
+            $score_id = $calculator->save_score($post_id, $user_id, $score_data);
+            if ($score_id === false) {
+                return array_merge($base, ['status' => 'error']);
+            }
+
+            return [
+                'post_id'  => $post_id,
+                'status'   => 'scored',
+                'score'    => isset($score_data['overall_score']) ? (int) $score_data['overall_score'] : null,
+                'score_id' => (int) $score_id,
+            ];
+        } catch (\Throwable $e) {
+            // Never let a single post abort the batch.
+            return array_merge($base, ['status' => 'error']);
+        }
+    }
+
+    /**
+     * Get (and lazily build) the shared SEO score calculator instance.
+     *
+     * @return \ThinkRank\AI\SEOScoreCalculator
+     */
+    private function get_score_calculator(): \ThinkRank\AI\SEOScoreCalculator {
+        if ($this->score_calculator === null) {
+            $this->score_calculator = new \ThinkRank\AI\SEOScoreCalculator(new \ThinkRank\Core\Database());
+        }
+
+        return $this->score_calculator;
+    }
+
+    /**
+     * Collect a record's focus keywords (primary + secondary) into an
+     * accumulator keyed by a normalized form to avoid duplicate inserts.
+     *
+     * Primary lives in the canonical `data['focus_keyword']`; secondary
+     * keyphrases are preserved in `extended['focus_keywords_additional']`.
+     *
+     * @param array $record   Full snapshot record
+     * @param array $data     Canonical record data
+     * @param array $keywords Accumulator (passed by reference): normalized => raw
+     * @return void
+     */
+    private function collect_keywords(array $record, array $data, array &$keywords): void {
+        $candidates = [];
+
+        $primary = (string) ($data['focus_keyword'] ?? '');
+        if ($primary !== '') {
+            $candidates[] = $primary;
+        }
+
+        $additional = $record['extended']['focus_keywords_additional'] ?? [];
+        if (is_array($additional)) {
+            foreach ($additional as $keyword) {
+                $candidates[] = (string) $keyword;
+            }
+        }
+
+        foreach ($candidates as $keyword) {
+            $key = strtolower(trim($keyword));
+            if ($key !== '') {
+                $keywords[$key] = $keyword;
+            }
+        }
+    }
+
+    /**
+     * Seed the Pro Rank Tracker watch-list with the collected keywords.
+     *
+     * Gated on Pro being active (classes present). The Free plugin never
+     * hard-depends on Pro — the fully-qualified references only resolve when
+     * Pro's autoloader is registered. Pro lazily creates its tables via
+     * Schema::ensure() and add_keyword() is idempotent (INSERT IGNORE).
+     *
+     * @param array $keywords Map of normalized => raw keyword
+     * @return int Number of keywords handed to the watch-list
+     */
+    private function seed_rank_tracker(array $keywords): int {
+        if (empty($keywords)) {
+            return 0;
+        }
+
+        if (
+            !class_exists('ThinkRank\\Pro\\Rank_Tracker\\Schema')
+            || !class_exists('ThinkRank\\Pro\\Rank_Tracker\\Repository')
+        ) {
+            return 0;
+        }
+
+        \ThinkRank\Pro\Rank_Tracker\Schema::ensure();
+        $repository = new \ThinkRank\Pro\Rank_Tracker\Repository();
+
+        $seeded = 0;
+        foreach ($keywords as $keyword) {
+            if ($repository->add_keyword($keyword)) {
+                $seeded++;
+            }
+        }
+
+        return $seeded;
+    }
+
+    /**
+     * Migrate a source plugin's per-object redirect into ThinkRank.
+     *
+     * The destination is Pro's redirections table, not object meta, so this
+     * goes through Object_Redirect rather than writing a key: that keeps the
+     * imported rule subject to the same guards as one typed into the edit
+     * screen (no self-referential rule, no query-string source) and puts it in
+     * the Redirections manager where the user can see and edit it.
+     *
+     * An existing redirect on the object is left alone — the import rule is
+     * SKIP on conflict, and a redirect the user already set here outranks one
+     * carried over from the plugin being replaced.
+     *
+     * @param string $object_type 'post' or 'term'.
+     * @param int    $object_id   Object ID.
+     * @param array  $record      Full snapshot record.
+     * @return bool Whether a redirect was written.
+     */
+    private function migrate_object_redirect(string $object_type, int $object_id, array $record): bool {
+        $extended = $record['extended'] ?? [];
+
+        if (!is_array($extended) || empty($extended['redirect_url'])) {
+            return false;
+        }
+
+        // A source that models the redirect as a toggle plus a URL can carry a
+        // URL the site is not actually serving. Honour the toggle when present.
+        if (array_key_exists('redirect_enabled', $extended) && empty($extended['redirect_enabled'])) {
+            return false;
+        }
+
+        if ('' !== Object_Redirect::get($object_type, $object_id)['url']) {
+            return false;
+        }
+
+        $result = Object_Redirect::save(
+            $object_type,
+            $object_id,
+            (string) $extended['redirect_url'],
+            $extended['redirect_type'] ?? Object_Redirect::DEFAULT_TYPE
+        );
+
+        return !is_wp_error($result);
+    }
+
+    /**
+     * The robots directives for a term.
+     *
+     * Deliberately narrower than migrate_robots_payload(): update-term-seo
+     * writes `_thinkrank_robots_meta` and `_thinkrank_robots_meta_enabled` and
+     * nothing else for a term, so the advanced directives a post supports have
+     * nowhere to go here and are left in the snapshot rather than written to a
+     * key no reader looks at.
+     *
+     * Same two rules as the post path — never overwrite an existing payload,
+     * and never turn the override on for an all-false set, which is just
+     * ThinkRank's default index/follow spelled out.
+     *
+     * @param int   $term_id Target term ID.
+     * @param array $data    Canonical record data.
+     * @return bool True when a payload was written.
+     */
+    private function migrate_term_robots_payload(int $term_id, array $data): bool {
+        $existing = get_term_meta($term_id, '_thinkrank_robots_meta', true);
+        if (is_string($existing) && $existing !== '') {
+            return false;
+        }
+
+        $robots = [];
+        $has_active_directive = false;
+
+        foreach (self::ROBOTS_FIELDS as $field) {
+            if (!array_key_exists($field, $data)) {
+                continue;
+            }
+
+            $value = $data[$field];
+            if ($value === '' || $value === null) {
+                continue;
+            }
+
+            $robots[$field] = (bool) (int) $value;
+            if ($robots[$field]) {
+                $has_active_directive = true;
+            }
+        }
+
+        if (!$has_active_directive) {
+            return false;
+        }
+
+        $robots['index'] = empty($robots['noindex']);
+
+        update_term_meta($term_id, '_thinkrank_robots_meta', wp_slash(wp_json_encode($robots)));
+        update_term_meta($term_id, '_thinkrank_robots_meta_enabled', 1);
+
+        return true;
+    }
+
+    /**
+     * Carry the source's watched pages into ThinkRank Pro's Focus Pages.
+     *
+     * Squirrly keeps this list on its own servers, so the exporter reads it
+     * live while the source plugin is still installed and connected — after
+     * the switch there is nowhere left to read it from. See
+     * Squirrly_Exporter::fetch_focus_pages().
+     *
+     * Focus Pages is a Pro feature and a deliberately small, hand-picked list
+     * (Settings::MAX_PAGES). Two rules follow from that: never touch a
+     * selection the user has already made here, and never import more than
+     * the cap. Without Pro the ids stay in the snapshot for a later run, the
+     * same way per-object redirects wait for Pro's rules table.
+     *
+     * @param array $extended Extended settings payload.
+     * @return bool True when at least one page was added.
+     */
+    private function migrate_focus_pages(array $extended): bool {
+        $ids = $extended['focus_pages'] ?? [];
+        if (!is_array($ids) || $ids === []) {
+            return false;
+        }
+
+        if (!class_exists('ThinkRank\\Pro\\Focus_Pages\\Settings')) {
+            return false;
+        }
+
+        $settings = new \ThinkRank\Pro\Focus_Pages\Settings();
+
+        // A choice already made here outranks one carried over, exactly as
+        // every other field in this class treats an existing value.
+        if ($settings->get() !== []) {
+            return false;
+        }
+
+        $added = false;
+        foreach ($ids as $id) {
+            $post_id = (int) $id;
+            if ($post_id <= 0 || get_post($post_id) === null) {
+                continue;
+            }
+
+            if (method_exists($settings, 'is_full') && $settings->is_full()) {
+                break;
+            }
+
+            $settings->add($post_id);
+            $added = true;
+        }
+
+        return $added;
+    }
+
+    /**
+     * Migrate the pillar / cornerstone content flag to ThinkRank post meta.
+     *
+     * ThinkRank stores an enabled flag as the string '1'; the reader
+     * (Pillar_Content endpoint) matches meta_value = '1'. Never overwrites an
+     * existing ThinkRank value.
+     *
+     * @param int   $post_id Target post ID
+     * @param array $data    Canonical record data
+     * @return bool True when the flag was written
+     */
+    private function migrate_pillar_content(int $post_id, array $data): bool {
+        if (empty($data['pillar_content'])) {
+            return false;
+        }
+
+        $existing = get_post_meta($post_id, '_thinkrank_pillar_content', true);
+        if ($existing !== '' && $existing !== false && $existing !== null) {
+            return false;
+        }
+
+        update_post_meta($post_id, '_thinkrank_pillar_content', '1');
+
+        return true;
+    }
+
+    /**
+     * Migrate the post's focus keywords.
+     *
+     * Reads the full list from the snapshot's `focus_keywords` (falling back to
+     * the single `focus_keyword`) and persists via Focus_Keywords::save(). Never
+     * overwrites existing ThinkRank focus keywords.
+     *
+     * Posts whose source had more keywords than were stored are recorded in
+     * `$truncations` so the import summary can report them.
+     *
+     * @param int        $post_id      Target post ID.
+     * @param array      $data         Canonical record data.
+     * @param array|null $truncations  Accumulator: appended with what was dropped.
+     * @return bool True when keywords were written.
+     */
+    private function migrate_focus_keywords(int $post_id, array $data, ?array &$truncations = null): bool {
+        $keywords = [];
+        if (!empty($data['focus_keywords']) && is_array($data['focus_keywords'])) {
+            $keywords = $data['focus_keywords'];
+        } elseif (!empty($data['focus_keyword'])) {
+            $keywords = [$data['focus_keyword']];
+        }
+
+        $all = Focus_Keywords::normalize($keywords, 0);
+        if (empty($all)) {
+            return false;
+        }
+
+        // Never overwrite existing ThinkRank focus keywords.
+        if (!empty(Focus_Keywords::get($post_id))) {
+            return false;
+        }
+
+        $saved = Focus_Keywords::save($post_id, $all);
+
+        if (count($saved) < count($all) && is_array($truncations)) {
+            $truncations[] = [
+                'post_id' => $post_id,
+                'kept'    => count($saved),
+                'dropped' => array_slice($all, count($saved)),
+            ];
+        }
+
+        return !empty($saved);
+    }
+
+    /**
+     * Seed the metabox Review schema form data for an imported review post.
+     *
+     * Only runs when the record's schema type resolved to 'Review'. Writes the
+     * carried `review_*` fields (from the snapshot's extended.review_schema) as
+     * the JSON `_thinkrank_schema_form_data` the metabox Review form reads, so
+     * the rating survives the import and renders once the user deploys it.
+     * Never overwrites existing ThinkRank schema form data.
+     *
+     * @param int   $post_id Target post ID
+     * @param array $data    Canonical record data
+     * @param array $record  Full snapshot record (for the extended payload)
+     * @return bool True when form data was written
+     */
+    private function migrate_review_schema(int $post_id, array $data, array $record): bool {
+        if (($data['schema_type'] ?? '') !== 'Review') {
+            return false;
+        }
+
+        $review = $record['extended']['review_schema'] ?? [];
+        if (empty($review) || !is_array($review)) {
+            return false;
+        }
+
+        // Never overwrite existing ThinkRank schema form data.
+        $existing = get_post_meta($post_id, '_thinkrank_schema_form_data', true);
+        if (is_string($existing) && $existing !== '') {
+            return false;
+        }
+
+        update_post_meta($post_id, '_thinkrank_schema_form_data', wp_slash(wp_json_encode($review)));
+
+        return true;
+    }
+
+    /**
+     * Seed the metabox Video schema form data for an imported VideoObject post.
+     *
+     * Only runs when the record's schema type resolved to 'VideoObject'. Writes
+     * the carried `video_*` fields (from the snapshot's extended.video_schema) as
+     * the JSON `_thinkrank_schema_form_data` the metabox Video form reads, so the
+     * video details survive the import. Never overwrites existing schema form data.
+     *
+     * @param int   $post_id Target post ID
+     * @param array $data    Canonical record data
+     * @param array $record  Full snapshot record (for the extended payload)
+     * @return bool True when form data was written
+     */
+    private function migrate_video_schema(int $post_id, array $data, array $record): bool {
+        if (($data['schema_type'] ?? '') !== 'VideoObject') {
+            return false;
+        }
+
+        $video = $record['extended']['video_schema'] ?? [];
+        if (empty($video) || !is_array($video)) {
+            return false;
+        }
+
+        // Never overwrite existing ThinkRank schema form data.
+        $existing = get_post_meta($post_id, '_thinkrank_schema_form_data', true);
+        if (is_string($existing) && $existing !== '') {
+            return false;
+        }
+
+        update_post_meta($post_id, '_thinkrank_schema_form_data', wp_slash(wp_json_encode($video)));
+
+        return true;
+    }
+
+    /**
+     * Compose and persist the per-post robots payload.
+     *
+     * Folds the canonical robots flags into JSON-encoded
+     * `_thinkrank_robots_meta` and `_thinkrank_advanced_robots_meta`
+     * post meta and flips the override toggle when at least one
+     * directive is present. Never overwrites existing ThinkRank data.
+     *
+     * @param int   $post_id Target post ID
+     * @param array $data    Canonical record data
+     * @return bool True when at least one robots field was written
+     */
+    private function migrate_robots_payload(int $post_id, array $data): bool {
+        $existing_payload = get_post_meta($post_id, '_thinkrank_robots_meta', true);
+        if (is_string($existing_payload) && $existing_payload !== '') {
+            return false;
+        }
+
+        $robots = [];
+        foreach (self::ROBOTS_FIELDS as $field) {
+            if (!array_key_exists($field, $data)) {
+                continue;
+            }
+            $value = $data[$field];
+            if ($value === '' || $value === null) {
+                continue;
+            }
+            $robots[$field] = (bool) (int) $value;
+        }
+
+        $advanced = [];
+        foreach (self::ADVANCED_ROBOTS_FIELDS as $field) {
+            if (!array_key_exists($field, $data)) {
+                continue;
+            }
+            $value = $data[$field];
+            if ($value === '' || $value === null) {
+                continue;
+            }
+            if ($field === 'max_image_preview') {
+                $allowed = ['none', 'standard', 'large'];
+                $value = in_array($value, $allowed, true) ? $value : 'large';
+                $advanced[$field] = $value;
+                $advanced['image_preview_enabled'] = $value !== 'none';
+                continue;
+            }
+            $advanced[$field] = (int) $value;
+            if ($field === 'max_snippet') {
+                $advanced['snippet_enabled'] = (int) $value !== 0;
+            } elseif ($field === 'max_video_preview') {
+                $advanced['video_preview_enabled'] = (int) $value !== 0;
+            }
+        }
+
+        // The source exporter emits every robots flag (0/1) for every post, so
+        // $robots is rarely empty. Only persist a robots override when at least
+        // one directive is actually active (or an advanced directive exists);
+        // an all-false array equals ThinkRank's default index/follow and must
+        // not flip robots_meta_enabled on for posts that had no directive.
+        $has_active_directive = false;
+        foreach ($robots as $flag) {
+            if ($flag) {
+                $has_active_directive = true;
+                break;
+            }
+        }
+        if (!$has_active_directive && empty($advanced)) {
+            return false;
+        }
+
+        // Default index=true unless noindex was explicitly imported.
+        if (!isset($robots['index'])) {
+            $robots['index'] = empty($robots['noindex']);
+        }
+
+        $wrote = false;
+        if (!empty($robots)) {
+            update_post_meta($post_id, '_thinkrank_robots_meta', wp_slash(wp_json_encode($robots)));
+            $wrote = true;
+        }
+        if (!empty($advanced)) {
+            update_post_meta($post_id, '_thinkrank_advanced_robots_meta', wp_slash(wp_json_encode($advanced)));
+            $wrote = true;
+        }
+        if ($wrote) {
+            update_post_meta($post_id, '_thinkrank_robots_meta_enabled', 1);
+        }
+
+        return $wrote;
+    }
+
+    /**
+     * Migrate settings from snapshot
+     *
+     * @param string $plugin Plugin slug
+     * @return array Result
+     */
+    private function migrate_settings(string $plugin): array {
+        $chunk = Snapshot_Store::read_chunk($plugin, 'settings', 1);
+        if ($chunk === null || empty($chunk)) {
+            return [
+                'status'    => 'complete',
+                'message'   => 'No settings to migrate',
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => 0,
+            ];
+        }
+
+        $settings_record = $chunk[0] ?? [];
+        $data = $settings_record['data'] ?? [];
+        $extended = $settings_record['extended'] ?? [];
+        $processed = 0;
+
+        // Map settings to ThinkRank options
+        if (!empty($data['separator'])) {
+            $global_seo = get_option('thinkrank_global_seo_settings', []);
+            if (empty($global_seo['separator'])) {
+                $global_seo['separator'] = $data['separator'];
+                update_option('thinkrank_global_seo_settings', $global_seo);
+                $processed++;
+            }
+        }
+
+        if (!empty($data['homepage_title']) || !empty($data['organization_name']) || !empty($data['organization_logo'])) {
+            $site_identity = get_option('thinkrank_site_identity_settings', []);
+            $updated = false;
+
+            if (!empty($data['homepage_title']) && empty($site_identity['homepage_title'])) {
+                $site_identity['homepage_title'] = $data['homepage_title'];
+                $updated = true;
+            }
+            if (!empty($data['organization_name']) && empty($site_identity['organization_name'])) {
+                $site_identity['organization_name'] = $data['organization_name'];
+                $updated = true;
+            }
+            if (!empty($data['organization_logo']) && empty($site_identity['organization_logo'])) {
+                $site_identity['organization_logo'] = $data['organization_logo'];
+                $updated = true;
+            }
+
+            if ($updated) {
+                update_option('thinkrank_site_identity_settings', $site_identity);
+                $processed++;
+            }
+        }
+
+        if (!empty($data['social_profiles']) && is_array($data['social_profiles'])) {
+            if ($this->migrate_social_profiles($data['social_profiles'])) {
+                $processed++;
+            }
+        }
+
+        if (!empty($data['noindex_archives'])) {
+            $robot_meta = get_option('thinkrank_global_robot_meta_settings', []);
+            $updated = false;
+
+            if (!empty($data['noindex_archives']['date']) && empty($robot_meta['noindex_date_archives'])) {
+                $robot_meta['noindex_date_archives'] = true;
+                $updated = true;
+            }
+            if (!empty($data['noindex_archives']['author']) && empty($robot_meta['noindex_author_archives'])) {
+                $robot_meta['noindex_author_archives'] = true;
+                $updated = true;
+            }
+
+            if ($updated) {
+                update_option('thinkrank_global_robot_meta_settings', $robot_meta);
+                $processed++;
+            }
+
+            // Author-archive noindex has an effective home in ThinkRank: the core
+            // author_archives_index setting the Author Archives feature consults
+            // (the global_robot_meta keys above are not read for archives).
+            if (!empty($data['noindex_archives']['author']) && class_exists('ThinkRank\\Core\\Settings')) {
+                $settings = \ThinkRank\Core\Settings::instance();
+                if ($settings->get('author_archives_index', true)) {
+                    $settings->set('author_archives_index', false);
+                    $processed++;
+                }
+            }
+        }
+
+        // Twitter card default.
+        if ($this->migrate_twitter_card($data)) {
+            $processed++;
+        }
+
+        // Site-wide social defaults (Facebook App ID, default OG image).
+        if ($this->migrate_social_defaults($data)) {
+            $processed++;
+        }
+
+        // Pinterest site verification — the only webmaster-tools code
+        // ThinkRank renders today. The rest of extended.webmaster_tools stays
+        // preserved in the snapshot (and gates cleanup).
+        if ($this->migrate_pinterest_verification($extended)) {
+            $processed++;
+        }
+
+        // Per-post-type title/description templates and (active) robots defaults.
+        if (!empty($extended['post_type_settings']) && is_array($extended['post_type_settings'])) {
+            if ($this->migrate_post_type_settings($extended['post_type_settings'])) {
+                $processed++;
+            }
+        }
+
+        // Per-taxonomy and blog-index noindex, into the Content Type Matrix.
+        // The templates beside them have no ThinkRank store and stay preserved.
+        if ($this->migrate_archive_noindex($extended)) {
+            $processed++;
+        }
+
+        // Site-wide custom schemas and Markdown for AI, both ThinkRank Pro.
+        $global_schemas = $extended['custom_schemas']['entries'] ?? [];
+        if (is_array($global_schemas) && $this->migrate_custom_schemas($plugin, $global_schemas) > 0) {
+            $processed++;
+        }
+        if ($this->migrate_markdown_for_ai($extended)) {
+            $processed++;
+        }
+
+        // Site-identity settings (homepage/org/breadcrumbs/local SEO) are served to
+        // the frontend from the wp_thinkrank_seo_settings table via the manager, not
+        // from the option written above — route them through the manager so they
+        // actually take effect.
+        if ($this->migrate_site_identity($data, $extended)) {
+            $processed++;
+        }
+
+        // Image SEO auto alt/title generation settings.
+        if ($this->migrate_image_seo($extended)) {
+            $processed++;
+        }
+
+        // The pages the source had under active watch.
+        if ($this->migrate_focus_pages($extended)) {
+            $processed++;
+        }
+
+        // Sitemap inclusion settings.
+        if ($this->migrate_sitemap($extended)) {
+            $processed++;
+        }
+
+        // Knowledge Graph entity (organization/person name) into schema settings.
+        if ($this->migrate_knowledge_graph($data)) {
+            $processed++;
+        }
+
+        // IndexNow API key + auto-submit post types into Instant Indexing.
+        if ($this->migrate_instant_indexing($data, $extended)) {
+            $processed++;
+        }
+
+        // Author archive behaviour (enabled / title / meta description).
+        if ($this->migrate_author_archives($extended)) {
+            $processed++;
+        }
+
+        // Scheduled SEO email report cadence.
+        if ($this->migrate_email_reports($extended)) {
+            $processed++;
+        }
+
+        // Role Manager: per-role access to ThinkRank's admin areas.
+        if ($this->migrate_role_capabilities($extended)) {
+            $processed++;
+        }
+
+        // Past IndexNow submissions into the Instant Indexing history table.
+        if ($this->migrate_instant_indexing_log($extended) > 0) {
+            $processed++;
+        }
+
+        // News/Video sitemap post types into Pro's Publisher Sitemaps.
+        if ($this->migrate_publisher_sitemaps($extended)) {
+            $processed++;
+        }
+
+        return [
+            'status'    => 'complete',
+            'message'   => sprintf('Migrated %d settings groups', $processed),
+            'has_more'  => false,
+            'processed' => $processed,
+            'skipped'   => 0,
+        ];
+    }
+
+    /**
+     * Migrate site-identity settings (homepage title, organization, breadcrumbs,
+     * local SEO) into the wp_thinkrank_seo_settings table via Site_Identity_Manager,
+     * which is what the frontend actually reads. Non-destructive: a value is only
+     * written when ThinkRank still holds its default seed (or is empty), so user
+     * customizations are preserved.
+     *
+     * @param array $data     Canonical settings `data` payload
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any value was written
+     */
+    private function migrate_site_identity(array $data, array $extended): bool {
+        if (!class_exists('ThinkRank\\SEO\\Site_Identity_Manager')) {
+            return false;
+        }
+
+        $manager = new \ThinkRank\SEO\Site_Identity_Manager();
+        $current = $manager->get_settings('site');
+
+        // ThinkRank default seeds — only overwrite a value the user has not changed.
+        //
+        // The title formats come from Site_Identity_Manager rather than being
+        // restated here. They were restated once, drifted (the homepage seed
+        // still used a literal '|' after the shipped default moved to %sep%),
+        // and the six per-context formats below were never listed at all — so
+        // every shipped default read as "the user chose this" and no imported
+        // title format was ever written.
+        $seeds = array_merge(
+            \ThinkRank\SEO\Site_Identity_Manager::TITLE_FORMAT_DEFAULTS,
+            [
+                'site_name'            => get_bloginfo('name'),
+                'logo_url'             => '',
+                'breadcrumb_home_text' => 'Home',
+                // Two shipped values, both untouched. get_default_settings()
+                // says '>' and the admin screen seeds '›' (as does the
+                // breadcrumb renderer's own fallback), so which one a site
+                // holds depends only on whether that screen has ever been
+                // saved. Recognising one and not the other would skip the
+                // imported separator on half of all installs.
+                'breadcrumb_separator' => ['>', '›'],
+                'business_type'        => '',
+                'business_name'        => '',
+                'business_phone'       => '',
+            ]
+        );
+
+        $updates = [];
+        $set = static function (string $key, $value) use (&$updates, $current, $seeds): void {
+            if ($value === '' || $value === null) {
+                return;
+            }
+            $cur = $current[$key] ?? null;
+            // A seed may list several values when more than one shipped default
+            // is in circulation for the same field.
+            $shipped = array_key_exists($key, $seeds) ? (array) $seeds[$key] : [];
+            $is_default = !array_key_exists($key, $current)
+                || $cur === ''
+                || in_array($cur, $shipped, true);
+            if ($is_default) {
+                $updates[$key] = $value;
+            }
+        };
+
+        // Homepage title + organization (organization maps onto site identity's
+        // site_name / logo_url, which schema output uses as its fallback source).
+        // A per-context title format (extended.title_formats.homepage_title) is a
+        // real template and beats the literal-resolved data.homepage_title, so it
+        // wins when the source provided one.
+        $title_formats = is_array($extended['title_formats'] ?? null) ? $extended['title_formats'] : [];
+        $set('homepage_title', $title_formats['homepage_title'] ?? ($data['homepage_title'] ?? ''));
+        // The homepage meta description. It used to go to the legacy
+        // thinkrank_site_identity_settings option, which nothing reads, so the
+        // homepage fell back to the tagline (#897).
+        $set('homepage_description', trim((string) ($data['homepage_description'] ?? '')));
+        $set('site_name', $data['organization_name'] ?? '');
+        $set('alternate_name', $data['alternate_name'] ?? '');
+        $set('logo_url', $data['organization_logo'] ?? '');
+
+        // Title separator. ThinkRank stores a KEY ('dash'), not the symbol Rank
+        // Math stores ('-'), and every migrated %sep% template renders through it
+        // — so an unmapped separator silently changes every title.
+        $separator_key = $this->map_separator_symbol((string) ($data['separator'] ?? ''));
+        if ($separator_key !== '' && ($current['title_separator'] ?? 'pipe') === 'pipe') {
+            $updates['title_separator'] = $separator_key;
+        }
+
+        // Knowledge Graph entity → what this site "represents" (wizard field).
+        $kg_type = (string) ($data['knowledge_graph']['type'] ?? '');
+        if ($kg_type !== '' && empty($current['represents'])) {
+            $updates['represents'] = $kg_type === 'person' ? 'person' : 'organization';
+        }
+
+        // Per-context title formats (Post/Page/Category/Tag/Search/Archive).
+        foreach (['post_title', 'page_title', 'category_title', 'tag_title', 'search_title', 'archive_title'] as $key) {
+            $set($key, $title_formats[$key] ?? '');
+        }
+
+        // The author-archive title has two readers: site identity's `author_title`
+        // (the front-end title renderer's 'author' context) and the Author Archives
+        // feature's own `author_archives_title`, written by migrate_author_archives().
+        $set('author_title', $extended['author_archives']['title'] ?? '');
+
+        // Breadcrumbs (extended.breadcrumb_settings) — replicate Rank Math's
+        // enabled state when ThinkRank breadcrumbs are still at their default.
+        $breadcrumbs = $extended['breadcrumb_settings'] ?? [];
+        if (!empty($breadcrumbs)) {
+            // Replicate Rank Math's on/off state while ThinkRank breadcrumbs are
+            // still at their default (enabled). Cast loosely — the stored value may
+            // be '1'/'' rather than a real boolean.
+            if (filter_var($current['breadcrumbs_enabled'] ?? true, FILTER_VALIDATE_BOOLEAN)) {
+                $updates['breadcrumbs_enabled'] = !empty($breadcrumbs['enabled']);
+            }
+            $set('breadcrumb_home_text', $breadcrumbs['home_label'] ?? '');
+            $set('breadcrumb_separator', $breadcrumbs['separator'] ?? '');
+            $set('breadcrumb_prefix', $breadcrumbs['prefix'] ?? '');
+        }
+
+        // A hand-written robots.txt (extended.robots_txt.content) goes into
+        // ThinkRank's Robots.txt textarea only while that is still empty:
+        // a file the user already wrote here is never replaced (#886).
+        $robots_txt = $extended['robots_txt'] ?? [];
+        if (is_array($robots_txt)) {
+            $set('robots_txt_content', trim((string) ($robots_txt['content'] ?? '')));
+        }
+
+        // The "appeared first on" feed backlink (extended.feed.source_link).
+        // Only switches it on: a source that had it off is no reason to turn
+        // off a signature ThinkRank seeds for new installs.
+        if (!empty($extended['feed']['source_link']) && empty($current['feed_source_link'])) {
+            $updates['feed_source_link'] = true;
+        }
+
+        // Local SEO (extended.local_seo) — migrate the full NAP + geo when there
+        // is any meaningful business data (name, phone, address or coordinates),
+        // and enable the feature alongside it. Each field is written only while
+        // ThinkRank's Business Info still holds its default (non-destructive).
+        $local = $extended['local_seo'] ?? [];
+        $address = is_array($local['address'] ?? null) ? $local['address'] : [];
+        $geo     = is_array($local['geo'] ?? null) ? $local['geo'] : [];
+        $hours   = is_array($local['opening_hours'] ?? null) ? $local['opening_hours'] : [];
+        $has_local = !empty($local['business_name']) || !empty($local['phone'])
+            || !empty($address) || !empty($geo) || !empty($hours)
+            || !empty($local['price_range']);
+
+        // Local SEO lands in its own $local_updates batch, saved separately from
+        // the identity batch. Site_Identity_Manager::save_settings() validates the
+        // whole payload and aborts ALL writes when any field is invalid — and
+        // `local_seo_enabled` makes `business_name` mandatory. Mixing the two
+        // batches meant a source with opening hours but no business name (Rank
+        // Math's default Local SEO state) failed validation and silently
+        // discarded the homepage title, logo, breadcrumbs and separator too.
+        $local_updates = [];
+        if ($has_local) {
+            $set_local = static function (string $key, $value) use (&$local_updates, $current, $seeds): void {
+                if ($value === '' || $value === null) {
+                    return;
+                }
+                $cur = $current[$key] ?? null;
+                $is_default = !array_key_exists($key, $current) || $cur === '' || $cur === ($seeds[$key] ?? null);
+                if ($is_default) {
+                    $local_updates[$key] = $value;
+                }
+            };
+
+            $set_local('business_type', $local['business_type'] ?? '');
+            $set_local('business_name', $local['business_name'] ?? '');
+            $set_local('business_phone', $local['phone'] ?? '');
+
+            // Postal address (schema.org PostalAddress → ThinkRank Business Info).
+            $set_local('business_address', $address['street'] ?? '');
+            $set_local('business_city', $address['city'] ?? '');
+            $set_local('business_state', $address['state'] ?? '');
+            $set_local('business_postal_code', $address['postal_code'] ?? '');
+            $set_local('business_country', $address['country'] ?? '');
+
+            // Geo coordinates.
+            $set_local('business_latitude', $geo['latitude'] ?? '');
+            $set_local('business_longitude', $geo['longitude'] ?? '');
+
+            // Price range (scalar, e.g. "$$").
+            $set_local('business_price_range', $local['price_range'] ?? '');
+
+            // Opening hours are a per-day array, so the scalar-tuned helper
+            // doesn't apply — write directly while ThinkRank still holds no hours.
+            if (!empty($hours) && empty($current['business_hours'])) {
+                $local_updates['business_hours'] = $hours;
+            }
+
+            // Only turn the feature ON when the business name it requires is
+            // actually present (either carried over now or already stored).
+            $has_name = !empty($local_updates['business_name']) || !empty($current['business_name']);
+            if ($has_name && empty($current['local_seo_enabled'])) {
+                $local_updates['local_seo_enabled'] = true;
+            }
+        }
+
+        $wrote = false;
+
+        if (!empty($updates) && $manager->save_settings('site', null, $updates)) {
+            $wrote = true;
+        }
+
+        if (!empty($local_updates) && $manager->save_settings('site', null, $local_updates)) {
+            $wrote = true;
+        }
+
+        return $wrote;
+    }
+
+    /**
+     * Map a title-separator SYMBOL (what source plugins store) to ThinkRank's
+     * separator KEY (what Site_Identity_Manager stores and renders %sep% from).
+     *
+     * @param string $symbol Raw separator symbol, e.g. '-'
+     * @return string ThinkRank separator key, or '' when unmapped
+     */
+    private function map_separator_symbol(string $symbol): string {
+        $symbol = trim(html_entity_decode($symbol, ENT_QUOTES, 'UTF-8'));
+        if ($symbol === '') {
+            return '';
+        }
+
+        $map = [
+            '|' => 'pipe',
+            '-' => 'dash',
+            '–' => 'dash',
+            '—' => 'dash',
+            '•' => 'bullet',
+            ':' => 'colon',
+            '>' => 'greater',
+            '~' => 'tilde',
+        ];
+
+        return $map[$symbol] ?? '';
+    }
+
+    /**
+     * Migrate Rank Math's global Twitter card type into ThinkRank's Social Meta
+     * settings (wp_thinkrank_seo_settings via Social_Meta_Manager). Non-destructive:
+     * only written while ThinkRank still holds its default card type.
+     *
+     * @param array $data Canonical settings `data` payload
+     * @return bool True if written
+     */
+    private function migrate_twitter_card(array $data): bool {
+        $card_type = $data['twitter_card_type'] ?? '';
+        if ($card_type === '' || !class_exists('ThinkRank\\SEO\\Social_Meta_Manager')) {
+            return false;
+        }
+
+        $manager = new \ThinkRank\SEO\Social_Meta_Manager();
+        $current = $manager->get_settings('site');
+
+        // ThinkRank default card type — only overwrite while unchanged.
+        if (($current['twitter_card_type'] ?? 'summary_large_image') !== 'summary_large_image') {
+            return false;
+        }
+        if ($card_type === 'summary_large_image') {
+            return false; // Identical to ThinkRank's default — nothing to change.
+        }
+
+        return $manager->save_settings('site', null, ['twitter_card_type' => $card_type]);
+    }
+
+    /**
+     * Migrate site-wide social defaults (Facebook App ID, default OG image)
+     * into ThinkRank's Social Meta settings. Non-destructive: each value is
+     * written only while ThinkRank still holds none.
+     *
+     * @param array $data Canonical settings `data` payload
+     * @return bool True if anything was written
+     */
+    private function migrate_social_defaults(array $data): bool {
+        $defaults = $data['social_defaults'] ?? [];
+        if (!is_array($defaults) || !class_exists('ThinkRank\\SEO\\Social_Meta_Manager')) {
+            return false;
+        }
+
+        $app_id = trim((string) ($defaults['facebook_app_id'] ?? ''));
+        $og_image = trim((string) ($defaults['og_default_image'] ?? ''));
+        $twitter_image = trim((string) ($defaults['twitter_default_image'] ?? ''));
+        if ($app_id === '' && $og_image === '' && $twitter_image === '') {
+            return false;
+        }
+
+        $manager = new \ThinkRank\SEO\Social_Meta_Manager();
+        $current = $manager->get_settings('site');
+
+        $updates = [];
+        if ($app_id !== '' && empty($current['facebook_app_id'])) {
+            $updates['facebook_app_id'] = $app_id;
+        }
+        // `default_og_image` is the key Social_Meta_Manager declares for the
+        // site context. `default_image` is only a legacy alias the front-end
+        // readers still honour — saving under it is discarded, because a key
+        // outside the allow-list never reaches the database.
+        if ($og_image !== '' && empty($current['default_og_image'])) {
+            $updates['default_og_image'] = $og_image;
+        }
+        // The Twitter card fallback image (Slim SEO's default_twitter_image).
+        if ($twitter_image !== '' && empty($current['default_twitter_image'])) {
+            $updates['default_twitter_image'] = $twitter_image;
+        }
+
+        if (empty($updates)) {
+            return false;
+        }
+
+        return (bool) $manager->save_settings('site', null, $updates);
+    }
+
+    /**
+     * Social profile URLs (data.social_profiles, platform => URL) into the
+     * stores that are read (#898).
+     *
+     * They used to be written as `thinkrank_social_media_settings[<platform>]`,
+     * a key nothing reads: the consumer looks for `<platform>_url`, the
+     * Organization graph reads the Schema Manager's
+     * `organization_social_<platform>`, and `twitter:site` comes from the
+     * Social Meta `twitter_username`. So the profiles never reached `sameAs`
+     * and the X handle stopped printing once the source plugin was off. Each
+     * store is filled only where it is still empty.
+     *
+     * @param array $profiles platform => profile URL
+     * @return bool True if anything was written
+     */
+    private function migrate_social_profiles(array $profiles): bool {
+        $profiles = array_filter(array_map(
+            static fn($url): string => is_scalar($url) ? trim((string) $url) : '',
+            $profiles
+        ));
+        if (empty($profiles)) {
+            return false;
+        }
+
+        $written = false;
+
+        $social = get_option('thinkrank_social_media_settings', []);
+        $social = is_array($social) ? $social : [];
+        $social_updated = false;
+        foreach ($profiles as $platform => $url) {
+            $key = sanitize_key((string) $platform) . '_url';
+            if (empty($social[$key])) {
+                $social[$key] = esc_url_raw($url);
+                $social_updated = true;
+            }
+        }
+        if ($social_updated) {
+            update_option('thinkrank_social_media_settings', $social);
+            $written = true;
+        }
+
+        // The Organization node's sameAs.
+        $schema_platforms = ['facebook', 'twitter', 'linkedin', 'instagram', 'youtube', 'pinterest', 'whatsapp', 'telegram'];
+        $manager = $this->create_schema_manager();
+        if ($manager !== null) {
+            $current = $manager->get_settings('site');
+            $updates = [];
+            foreach ($profiles as $platform => $url) {
+                $field = 'organization_social_' . $platform;
+                if (in_array($platform, $schema_platforms, true) && filter_var($url, FILTER_VALIDATE_URL) && empty($current[$field])) {
+                    $updates[$field] = esc_url_raw($url);
+                }
+            }
+            if (!empty($updates) && $manager->save_settings('site', null, $updates)) {
+                $written = true;
+            }
+        }
+
+        // twitter:site, from an X/Twitter profile URL.
+        $handle = self::twitter_handle_from_url((string) ($profiles['twitter'] ?? ''));
+        if ($handle !== '' && class_exists('ThinkRank\\SEO\\Social_Meta_Manager')) {
+            $social_meta = new \ThinkRank\SEO\Social_Meta_Manager();
+            $current = $social_meta->get_settings('site');
+            if (empty($current['twitter_username']) && $social_meta->save_settings('site', null, ['twitter_username' => $handle])) {
+                $written = true;
+            }
+        }
+
+        return $written;
+    }
+
+    /**
+     * The handle in an x.com / twitter.com profile URL, or '' when the URL is
+     * not one (`https://x.com/arsenal` → `arsenal`). Handles are 1-15 letters,
+     * digits or underscores, which is also what Social Meta accepts.
+     *
+     * @param string $url Profile URL
+     */
+    public static function twitter_handle_from_url(string $url): string {
+        $host = strtolower((string) wp_parse_url($url, PHP_URL_HOST));
+        if (!in_array(preg_replace('/^(www\.|mobile\.)/', '', $host), ['x.com', 'twitter.com'], true)) {
+            return '';
+        }
+        $segment = explode('/', trim((string) wp_parse_url($url, PHP_URL_PATH), '/'))[0] ?? '';
+        $segment = ltrim(rawurldecode($segment), '@');
+
+        return preg_match('/^[A-Za-z0-9_]{1,15}$/', $segment) ? $segment : '';
+    }
+
+    /**
+     * Migrate the source plugin's Pinterest site-verification code into
+     * ThinkRank's core `pinterest_site_verification` setting. Never overwrites
+     * a configured code.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if written
+     */
+    private function migrate_pinterest_verification(array $extended): bool {
+        $code = trim((string) ($extended['webmaster_tools']['pinterest'] ?? ''));
+        if ($code === '' || !class_exists('ThinkRank\\Core\\Settings')) {
+            return false;
+        }
+
+        $settings = \ThinkRank\Core\Settings::instance();
+        if ((string) $settings->get('pinterest_site_verification', '') !== '') {
+            return false;
+        }
+
+        $settings->set('pinterest_site_verification', $code);
+
+        return true;
+    }
+
+    /**
+     * Build the schema settings manager, when available.
+     *
+     * Split out (and protected) so the shim-based unit tests can substitute a
+     * fake manager — the real one persists to the wp_thinkrank_seo_settings
+     * table, which needs a live database.
+     *
+     * @return object|null Schema_Management_System instance, or null when unavailable
+     */
+    protected function create_schema_manager(): ?object {
+        if (!class_exists('ThinkRank\\SEO\\Schema_Management_System')) {
+            return null;
+        }
+
+        return new \ThinkRank\SEO\Schema_Management_System();
+    }
+
+    /**
+     * Migrate the source plugin's Knowledge Graph entity into ThinkRank's schema
+     * settings (wp_thinkrank_seo_settings via Schema_Management_System).
+     *
+     * Rank Math's knowledgegraph_type is 'company' or 'person' (normalized to
+     * 'organization'/'person' by the exporter). ThinkRank's schema settings model
+     * the same split: organization_* fields (organization_type already defaults
+     * to 'Organization', matching 'company') and person_* fields. The entity
+     * name lands in organization_name or person_name accordingly. Non-destructive:
+     * a value is only written while ThinkRank still holds no value for it.
+     *
+     * @param array $data Canonical settings `data` payload
+     * @return bool True if any value was written
+     */
+    private function migrate_knowledge_graph(array $data): bool {
+        $kg = $data['knowledge_graph'] ?? [];
+        if (!is_array($kg)) {
+            return false;
+        }
+
+        $type = (string) ($kg['type'] ?? '');
+        $name = trim((string) ($kg['name'] ?? ''));
+        if ($type === '' || $name === '') {
+            return false;
+        }
+
+        $manager = $this->create_schema_manager();
+        if ($manager === null) {
+            return false;
+        }
+
+        $current = $manager->get_settings('site');
+        $updates = [];
+
+        if ($type === 'person') {
+            if (empty($current['person_name'])) {
+                $updates['person_name'] = $name;
+            }
+        } else {
+            // 'organization' — organization_type's default ('Organization')
+            // already matches Rank Math's 'company', so only the name needs
+            // a home. Fill it while ThinkRank still holds none.
+            if (empty($current['organization_name'])) {
+                $updates['organization_name'] = $name;
+            }
+        }
+
+        if (empty($updates)) {
+            return false;
+        }
+
+        return (bool) $manager->save_settings('site', null, $updates);
+    }
+
+    /**
+     * Migrate the source plugin's IndexNow API key into ThinkRank's Instant
+     * Indexing settings (thinkrank_instant_indexing_settings['api_key'], read by
+     * Instant_Indexing_Manager). Carrying the key over avoids re-verifying the
+     * site with IndexNow ({key}.txt is already served for it).
+     *
+     * Never clobbers a configured key: ThinkRank generates its own key on
+     * activation, so this only fills the slot when it is genuinely empty/unset.
+     *
+     * Also carries the source's auto-submit post types
+     * (extended.instant_indexing_post_types) so publishing keeps pinging the
+     * same content types it did before the switch.
+     *
+     * @param array $data     Canonical settings `data` payload
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if anything was written
+     */
+    private function migrate_instant_indexing(array $data, array $extended = []): bool {
+        $api_key = trim((string) ($data['instant_indexing']['api_key'] ?? ''));
+        $source_types = $extended['instant_indexing_post_types'] ?? [];
+        $source_types = is_array($source_types) ? $source_types : [];
+
+        if ($api_key === '' && empty($source_types)) {
+            return false;
+        }
+
+        $settings = get_option('thinkrank_instant_indexing_settings', []);
+        if (!is_array($settings)) {
+            $settings = [];
+        }
+
+        $wrote = false;
+
+        // Auto-submit post types. ThinkRank seeds ['post','page'] on activation,
+        // so only replace that untouched seed — never a user's own selection.
+        if (!empty($source_types)) {
+            $types = [];
+            foreach ($source_types as $type) {
+                $type = sanitize_key((string) $type);
+                if ($type !== '' && post_type_exists($type)) {
+                    $types[] = $type;
+                }
+            }
+            $types = array_values(array_unique($types));
+
+            $current_types = $settings['auto_submit_post_types'] ?? null;
+            $is_seed = $current_types === null
+                || (is_array($current_types) && array_diff($current_types, ['post', 'page']) === []
+                    && array_diff(['post', 'page'], $current_types) === []);
+
+            if (!empty($types) && $is_seed && $types !== $current_types) {
+                $settings['auto_submit_post_types'] = $types;
+                $wrote = true;
+            }
+        }
+
+        if ($api_key === '') {
+            if ($wrote) {
+                update_option('thinkrank_instant_indexing_settings', $settings);
+            }
+
+            return $wrote;
+        }
+
+        // Only migrate the key when the target is empty/unset — never overwrite.
+        if (empty($settings['api_key'])) {
+            $settings['api_key'] = $api_key;
+            $wrote = true;
+        }
+
+        if ($wrote) {
+            update_option('thinkrank_instant_indexing_settings', $settings);
+        }
+
+        return $wrote;
+    }
+
+    /**
+     * Migrate a chunk of redirection rules into ThinkRank Pro's Redirections.
+     *
+     * Pro-gated: the redirect table belongs to ThinkRank Pro, so this is a no-op
+     * (reported as skipped, never as an error) when Pro is inactive. The snapshot
+     * keeps the records either way, so activating Pro and re-running the
+     * migration picks them up. Referenced only through string class names so the
+     * free plugin never hard-depends on Pro.
+     *
+     * @param string $plugin Plugin slug
+     * @param int    $page   Chunk number
+     * @return array Migration result
+     */
+    private function migrate_redirections(string $plugin, int $page): array {
+        $chunk = Snapshot_Store::read_chunk($plugin, 'redirections', $page);
+        if ($chunk === null || empty($chunk)) {
+            return [
+                'status'    => 'complete',
+                'message'   => 'No redirections in chunk',
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => 0,
+            ];
+        }
+
+        $store = $this->create_redirections_store();
+        if ($store === null || !method_exists($store, 'import_redirect')) {
+            return [
+                'status'    => 'complete',
+                'message'   => sprintf(
+                    'Skipped %d redirections — ThinkRank Pro (Redirections) is not active. They stay in the snapshot.',
+                    count($chunk)
+                ),
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => count($chunk),
+            ];
+        }
+
+        $processed = 0;
+        $skipped = 0;
+
+        foreach ($chunk as $record) {
+            $r = $record['extended'] ?? [];
+            $source = trim((string) ($r['source_url'] ?? ''));
+            if ($source === '') {
+                $skipped++;
+                continue;
+            }
+
+            // Pre-`match_type` snapshots only carried the `is_regex` boolean.
+            $match_type = (string) ($r['match_type'] ?? (!empty($r['is_regex']) ? 'regex' : 'exact'));
+
+            $id = $store->import_redirect([
+                'source_url'    => $source,
+                'match_type'    => $match_type,
+                'target_url'    => (string) ($r['target_url'] ?? ''),
+                'http_code'     => (int) ($r['http_code'] ?? 301),
+                'status'        => !empty($r['enabled']) ? 'active' : 'inactive',
+                'hits'          => (int) ($r['hits'] ?? 0),
+                'created_at'    => (string) ($r['created_at'] ?? ''),
+                'last_accessed' => (string) ($r['last_accessed'] ?? ''),
+            ]);
+
+            if ($id > 0) {
+                $processed++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        // Report the same has_more every other type does. Hardcoding false
+        // here was invisible in the admin, which iterates 1..total_chunks, and
+        // silently truncated the MCP/ability import, which loops on has_more
+        // alone: a site with more than one chunk of rules got its first
+        // hundred and a clean `complete`.
+        $has_more = $page < (int) ($this->chunk_total($plugin, 'redirections'));
+
+        return [
+            'status'       => $has_more ? 'processing' : 'complete',
+            'message'      => sprintf('Migrated %d redirections, skipped %d (page %d)', $processed, $skipped, $page),
+            'has_more'     => $has_more,
+            'page'         => $page,
+            'total_chunks' => $this->chunk_total($plugin, 'redirections'),
+            'processed'    => $processed,
+            'skipped'      => $skipped,
+        ];
+    }
+
+    /**
+     * How many chunks the manifest declares for a type, or 0 when unknown.
+     *
+     * @param string $plugin Source slug.
+     * @param string $type   Snapshot type.
+     * @return int
+     */
+    private function chunk_total(string $plugin, string $type): int {
+        $manifest = Snapshot_Store::get_manifest($plugin);
+
+        return (int) ($manifest['types'][$type]['total_chunks'] ?? 0);
+    }
+
+    /**
+     * Migrate a chunk of logged 404 hits into ThinkRank Pro's 404 Monitor.
+     * Pro-gated exactly like migrate_redirections().
+     *
+     * @param string $plugin Plugin slug
+     * @param int    $page   Chunk number
+     * @return array Migration result
+     */
+    private function migrate_404_logs(string $plugin, int $page): array {
+        $chunk = Snapshot_Store::read_chunk($plugin, '404_logs', $page);
+        if ($chunk === null || empty($chunk)) {
+            return [
+                'status'    => 'complete',
+                'message'   => 'No 404 logs in chunk',
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => 0,
+            ];
+        }
+
+        $store = $this->create_redirections_store();
+        if ($store === null || !method_exists($store, 'import_404_log')) {
+            return [
+                'status'    => 'complete',
+                'message'   => sprintf(
+                    'Skipped %d 404 logs — ThinkRank Pro (404 Monitor) is not active. They stay in the snapshot.',
+                    count($chunk)
+                ),
+                'has_more'  => false,
+                'processed' => 0,
+                'skipped'   => count($chunk),
+            ];
+        }
+
+        $processed = 0;
+        $skipped = 0;
+
+        foreach ($chunk as $record) {
+            $log = $record['extended'] ?? [];
+            if ($store->import_404_log([
+                'uri'            => (string) ($log['uri'] ?? ''),
+                'times_accessed' => (int) ($log['times_accessed'] ?? 1),
+                'referer'        => (string) ($log['referer'] ?? ''),
+                'user_agent'     => (string) ($log['user_agent'] ?? ''),
+                'last_accessed'  => (string) ($log['last_accessed'] ?? ''),
+            ])) {
+                $processed++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        $has_more = $page < $this->chunk_total($plugin, '404_logs');
+
+        return [
+            'status'       => $has_more ? 'processing' : 'complete',
+            'message'      => sprintf('Migrated %d 404 logs, skipped %d (page %d)', $processed, $skipped, $page),
+            'has_more'     => $has_more,
+            'page'         => $page,
+            'total_chunks' => $this->chunk_total($plugin, '404_logs'),
+            'processed'    => $processed,
+            'skipped'      => $skipped,
+        ];
+    }
+
+    /**
+     * Rewrite a chunk of posts' Rank Math FAQ / HowTo blocks into ThinkRank's
+     * own blocks.
+     *
+     * Unlike every other type here this does not write meta — it edits
+     * `post_content` in place, because that is where the blocks live. The
+     * snapshot chunk carries post ids only, so the conversion always runs
+     * against the post as it stands now rather than a stale copy.
+     *
+     * The conflict strategy is deliberately ignored. A Rank Math block and a
+     * ThinkRank block are not two values competing for one field: the Rank Math
+     * one is broken markup that needs replacing, and any ThinkRank block
+     * already in the post is simply left alone by the converter.
+     *
+     * @param string $plugin Plugin slug
+     * @param int    $page   Chunk number
+     * @return array Migration result
+     */
+    private function migrate_content_blocks(string $plugin, int $page): array {
+        $chunk = Snapshot_Store::read_chunk($plugin, Block_Converter::TYPE, $page);
+        $total_chunks = $this->chunk_total($plugin, Block_Converter::TYPE);
+
+        if ($chunk === null || empty($chunk)) {
+            $has_more = $page < $total_chunks;
+
+            return [
+                'status'    => $has_more ? 'processing' : 'complete',
+                'message'   => 'No content blocks in chunk',
+                'has_more'  => $has_more,
+                'page'      => $page,
+                'processed' => 0,
+                'skipped'   => 0,
+                'failed'    => 0,
+                'failures'  => [],
+            ];
+        }
+
+        // Rewriting a few hundred posts is well past the default execution
+        // window on shared hosting, and a timeout mid-chunk would leave the
+        // migration looking stalled.
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(300); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+        }
+
+        $processed = 0;
+        $skipped   = 0;
+        $failed    = 0;
+        $failures  = [];
+        $blocks    = 0;
+
+        foreach ($chunk as $record) {
+            $post_id = (int) ($record['object_id'] ?? ($record['data']['post_id'] ?? 0));
+            if ($post_id < 1) {
+                $skipped++;
+                continue;
+            }
+
+            $result = Block_Converter::convert_post($post_id);
+
+            if ('converted' === $result['status']) {
+                $processed++;
+                $blocks += $result['converted'];
+                continue;
+            }
+
+            // A post the converter refused (broken block markup, a PCRE
+            // failure) was left untouched and still holds its Rank Math
+            // blocks. Folding it into `skipped` made it indistinguishable from
+            // a post that was simply already converted, so it is counted and
+            // named on its own.
+            if ('error' === $result['status']) {
+                $failed++;
+                $failures[] = ['post_id' => $post_id, 'message' => $result['message']];
+                continue;
+            }
+
+            // `unchanged` is the normal outcome of a re-run, not a failure.
+            $skipped++;
+        }
+
+        $has_more = $page < $total_chunks;
+
+        if (!$has_more) {
+            // The detector caches its scan for an hour; without clearing it the
+            // Migration screen keeps offering blocks that are no longer there.
+            (new Import_Detector())->clear_cache();
+        }
+
+        return [
+            'status'       => $has_more ? 'processing' : 'complete',
+            'message'      => sprintf(
+                'Converted %d FAQ/HowTo blocks in %d posts, skipped %d, failed %d (page %d)',
+                $blocks,
+                $processed,
+                $skipped,
+                $failed,
+                $page
+            ),
+            'has_more'     => $has_more,
+            'page'         => $page,
+            'total_chunks' => $total_chunks,
+            'processed'    => $processed,
+            'skipped'      => $skipped,
+            'failed'       => $failed,
+            'failures'     => $failures,
+        ];
+    }
+
+    /**
+     * Build ThinkRank Pro's Redirections store, when Pro is active.
+     *
+     * Split out (and protected) so tests can substitute a fake — the real store
+     * writes to Pro's tables. Pro lazily creates them via Schema::ensure().
+     *
+     * @return object|null Store instance, or null when Pro is unavailable
+     */
+    protected function create_redirections_store(): ?object {
+        if (
+            !class_exists('ThinkRank\\Pro\\Redirections\\Schema')
+            || !class_exists('ThinkRank\\Pro\\Redirections\\Store')
+        ) {
+            return null;
+        }
+
+        \ThinkRank\Pro\Redirections\Schema::ensure();
+
+        return new \ThinkRank\Pro\Redirections\Store();
+    }
+
+    /**
+     * Migrate the source plugin's author-archive behaviour into ThinkRank's
+     * Author Archives settings (core Settings keys read by
+     * Author_Archives_Manager).
+     *
+     * The noindex flag is handled separately in migrate_settings() via
+     * `data.noindex_archives.author`; this covers whether archives exist at all
+     * and the title / meta-description templates they render with.
+     * Non-destructive: each key is written only while ThinkRank still holds its
+     * default.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any value was written
+     */
+    private function migrate_author_archives(array $extended): bool {
+        $author = $extended['author_archives'] ?? [];
+        if (!is_array($author) || empty($author) || !class_exists('ThinkRank\\Core\\Settings')) {
+            return false;
+        }
+
+        $settings = \ThinkRank\Core\Settings::instance();
+        $wrote = false;
+
+        // Rank Math's "disable author archives" → ThinkRank's positive `enabled`.
+        // Only act on a disable; leaving them on is already ThinkRank's default.
+        if (array_key_exists('enabled', $author) && !$author['enabled']
+            && $settings->get('author_archives_enabled', true)) {
+            $settings->set('author_archives_enabled', false);
+            $wrote = true;
+        }
+
+        $title = trim((string) ($author['title'] ?? ''));
+        if ($title !== '' && $settings->get('author_archives_title', '') === '') {
+            $settings->set('author_archives_title', $title);
+            $wrote = true;
+        }
+
+        $description = trim((string) ($author['description'] ?? ''));
+        if ($description !== '' && $settings->get('author_archives_meta_desc', '') === '') {
+            $settings->set('author_archives_meta_desc', $description);
+            $wrote = true;
+        }
+
+        return $wrote;
+    }
+
+    /**
+     * Migrate the source plugin's IndexNow submission history into ThinkRank's
+     * `thinkrank_instant_indexing_logs` table, so the Instant Indexing history
+     * screen is not blank after switching.
+     *
+     * Idempotent: an entry is skipped when a row with the same URL and
+     * timestamp already exists, so re-running never double-counts.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return int Number of entries written
+     */
+    private function migrate_instant_indexing_log(array $extended): int {
+        global $wpdb;
+
+        $log = $extended['instant_indexing_log'] ?? [];
+        $entries = is_array($log['entries'] ?? null) ? $log['entries'] : [];
+        if (empty($entries)) {
+            return 0;
+        }
+
+        $table = $wpdb->prefix . 'thinkrank_instant_indexing_logs';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+        if (!$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table))) {
+            return 0;
+        }
+
+        $written = 0;
+        foreach ($entries as $entry) {
+            $url = trim((string) ($entry['url'] ?? ''));
+            if ($url === '') {
+                continue;
+            }
+
+            $created_at = (string) ($entry['submitted_at'] ?? '');
+            if ($created_at === '') {
+                $created_at = current_time('mysql');
+            }
+
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+            $exists = $wpdb->get_var(
+                // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name is $wpdb->prefix plus a literal, and every value is passed as a placeholder replacement.
+                $wpdb->prepare("SELECT id FROM {$table} WHERE url = %s AND created_at = %s LIMIT 1", $url, $created_at)
+            );
+                // phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+            if ($exists) {
+                continue;
+            }
+
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+            $inserted = $wpdb->insert(
+                $table,
+                [
+                    'url'              => $url,
+                    'status'           => (string) ($entry['status'] ?? 'failed'),
+                    'response_code'    => (int) ($entry['response_code'] ?? 0),
+                    'response_message' => (string) ($entry['response_message'] ?? ''),
+                    'created_at'       => $created_at,
+                ],
+                ['%s', '%s', '%d', '%s', '%s']
+            );
+
+            if ($inserted) {
+                $written++;
+            }
+        }
+
+        return $written;
+    }
+
+    /**
+     * Migrate the source plugin's News/Video sitemap post types into ThinkRank
+     * Pro's Publisher Sitemaps settings.
+     *
+     * Pro-gated via string class names so the free plugin never hard-depends on
+     * Pro, and non-destructive: a list is written only while Pro still holds its
+     * default for it.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any list was written
+     */
+    private function migrate_publisher_sitemaps(array $extended): bool {
+        $source = $extended['publisher_sitemaps'] ?? [];
+        if (!is_array($source) || empty($source)
+            || !class_exists('ThinkRank\\Pro\\Sitemaps\\Settings')) {
+            return false;
+        }
+
+        $settings = new \ThinkRank\Pro\Sitemaps\Settings();
+        $current = $settings->get();
+        $defaults = \ThinkRank\Pro\Sitemaps\Settings::defaults();
+
+        $updates = [];
+        foreach (['video_post_types', 'news_post_types'] as $key) {
+            if (empty($source[$key]) || !is_array($source[$key])) {
+                continue;
+            }
+
+            // Only replace Pro's untouched default — never a user's selection.
+            if (($current[$key] ?? null) !== ($defaults[$key] ?? null)) {
+                continue;
+            }
+
+            $types = [];
+            foreach ($source[$key] as $type) {
+                $type = sanitize_key((string) $type);
+                if ($type !== '' && post_type_exists($type)) {
+                    $types[] = $type;
+                }
+            }
+            $types = array_values(array_unique($types));
+
+            if (!empty($types) && $types !== ($current[$key] ?? null)) {
+                $updates[$key] = $types;
+            }
+        }
+
+        if (empty($updates)) {
+            return false;
+        }
+
+        $settings->save($updates);
+
+        return true;
+    }
+
+    /**
+     * Source-plugin capability => the ThinkRank capabilities it corresponds to.
+     *
+     * Deliberately conservative: a role only gains an area when the source
+     * plainly granted the equivalent one. Over-granting here is a privilege
+     * escalation, while under-granting is a re-tick in the Role Manager UI, so
+     * ambiguous cases are left out and reported instead.
+     *
+     * Notably absent:
+     * - `thinkrank_settings` (Settings & API Keys) — it exposes AI provider keys
+     *   and the Google connection, a class of secret neither source plugin ever
+     *   held. Rank Math's nearest cap (`rank_math_general`) is a grab-bag and
+     *   Yoast's (`wpseo_manage_options`) is plugin-wide, so neither is specific
+     *   enough to justify handing over credentials: this stays administrator-only
+     *   after an import and must be granted by hand.
+     * - Redirections / 404 Monitor — ThinkRank models no capability for them, so
+     *   `rank_math_redirections`, `rank_math_404_monitor` and Yoast Premium's
+     *   `wpseo_manage_redirects` have nowhere to land.
+     * - `rank_math_admin_bar`, `rank_math_edit_htaccess` — no equivalent.
+     */
+    private const ROLE_CAPABILITY_MAP = [
+        // Titles & Meta / Search Appearance.
+        'rank_math_titles'           => ['thinkrank_site_identity', 'thinkrank_global_seo', 'thinkrank_author_archives'],
+        // General Settings holds Rank Math's Images and Instant Indexing panels.
+        'rank_math_general'          => ['thinkrank_image_seo', 'thinkrank_instant_indexing'],
+        'rank_math_sitemap'          => ['thinkrank_crawling'],
+        'rank_math_analytics'        => ['thinkrank_analytics', 'thinkrank_performance'],
+        'rank_math_site_analysis'    => ['thinkrank_analytics'],
+        'rank_math_content_ai'       => ['thinkrank_content_tools'],
+        'rank_math_link_builder'     => ['thinkrank_internal_links'],
+        // Per-post metabox tabs.
+        'rank_math_onpage_analysis'  => ['thinkrank_content_tools'],
+        'rank_math_onpage_snippet'   => ['thinkrank_schema'],
+        'rank_math_onpage_social'    => ['thinkrank_social_media'],
+        'rank_math_onpage_advanced'  => ['thinkrank_crawling'],
+        'rank_math_role_manager'     => ['thinkrank_manage_roles'],
+
+        // Yoast. Its capability set is much coarser — three caps cover the whole
+        // plugin — so `wpseo_manage_options` fans out to the areas it genuinely
+        // controlled in Yoast (titles, social, schema, crawl, sitemaps). It does
+        // NOT imply `thinkrank_manage_roles`: Yoast has no role-manager screen,
+        // so nothing in the source says that role was trusted to grant access to
+        // others.
+        'wpseo_manage_options'         => [
+            'thinkrank_site_identity', 'thinkrank_global_seo', 'thinkrank_social_media',
+            'thinkrank_schema', 'thinkrank_crawling', 'thinkrank_analytics',
+            'thinkrank_image_seo', 'thinkrank_instant_indexing', 'thinkrank_author_archives',
+        ],
+        // Yoast's bulk title/description editor.
+        'wpseo_bulk_edit'              => ['thinkrank_global_seo'],
+        // The metabox "Advanced" tab: robots directives, canonical, breadcrumb title.
+        'wpseo_edit_advanced_metadata' => ['thinkrank_crawling'],
+    ];
+
+    /**
+     * Migrate the source plugin's Role Manager assignments into ThinkRank's
+     * per-role capabilities (Capability_Manager).
+     *
+     * Without this, every non-administrator role loses its SEO access the
+     * moment the source plugin is deactivated: ThinkRank grants its caps to the
+     * administrator only, so an editor who could edit titles and social meta
+     * simply stops seeing ThinkRank.
+     *
+     * Non-destructive: a role is only filled while it holds NO ThinkRank
+     * capability yet, so a matrix the user has already configured is never
+     * rewritten. `save_matrix()` grants the base ACCESS cap implicitly.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any role was granted capabilities
+     */
+    private function migrate_role_capabilities(array $extended): bool {
+        $source_roles = $extended['role_capabilities'] ?? [];
+        if (!is_array($source_roles) || empty($source_roles)
+            || !class_exists('ThinkRank\\Core\\Capability_Manager')) {
+            return false;
+        }
+
+        $manager = '\\ThinkRank\\Core\\Capability_Manager';
+        $matrix = $manager::get_matrix();
+        $editable = $manager::editable_roles();
+        $updated = false;
+
+        foreach ($source_roles as $role_slug => $source_caps) {
+            $role_slug = sanitize_key((string) $role_slug);
+
+            // editable_roles() already excludes the administrator.
+            if (!isset($editable[$role_slug]) || !is_array($source_caps)) {
+                continue;
+            }
+
+            // Never rewrite a role the user has already given ThinkRank access.
+            if (!empty($matrix[$role_slug])) {
+                continue;
+            }
+
+            $granted = [];
+            foreach ($source_caps as $source_cap) {
+                foreach (self::ROLE_CAPABILITY_MAP[(string) $source_cap] ?? [] as $thinkrank_cap) {
+                    $granted[$thinkrank_cap] = true;
+                }
+            }
+
+            if (empty($granted)) {
+                continue;
+            }
+
+            $matrix[$role_slug] = array_keys($granted);
+            $updated = true;
+        }
+
+        if (!$updated) {
+            return false;
+        }
+
+        $manager::save_matrix($matrix);
+
+        return true;
+    }
+
+    /**
+     * Carry the source plugin's scheduled SEO email report over as ThinkRank's
+     * Email Reporting switch.
+     *
+     * Only touches a config the user has not enabled yet, and never turns
+     * reports ON unless the source had them on — an unexpected recurring email
+     * after an import would be worse than a missing one. The source cadence is
+     * not carried: the report's schedule is not a setting this plugin stores.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if the config was written
+     */
+    private function migrate_email_reports(array $extended): bool {
+        $reports = $extended['email_reports'] ?? [];
+        if (!is_array($reports) || empty($reports['enabled'])
+            || !class_exists('ThinkRank\\SEO\\Email_Report_Config')) {
+            return false;
+        }
+
+        $config_manager = new \ThinkRank\SEO\Email_Report_Config();
+        $current = $config_manager->get();
+
+        // Never re-enable over a deliberate opt-out or clobber a live schedule.
+        if (!empty($current['enabled'])) {
+            return false;
+        }
+
+        $config_manager->save(['enabled' => true]);
+
+        return true;
+    }
+
+    /**
+     * Inspect a plugin's snapshot for extended data that has NO migration path
+     * yet — data that is preserved in the snapshot but would become the only
+     * copy once /import/cleanup deletes the source plugin's rows.
+     *
+     * Covers: redirection records (exported, but the migrator has no redirect
+     * target yet — owed to the Pro Redirections feature) and any settings
+     * `extended` bucket outside HANDLED_EXTENDED_SETTINGS. The raw_options
+     * capture-all bucket is deliberately NOT counted (a fresh export recreates
+     * it; it exists precisely to survive cleanup inside the snapshot).
+     *
+     * Used by Import_Controller::cleanup() to require force=true before
+     * deleting source data while such buckets exist.
+     *
+     * @param string $plugin Plugin slug
+     * @return array List of ['key' => ..., 'label' => ..., 'count' => ...]
+     */
+    public function get_unmigrated_extended_buckets(string $plugin): array {
+        $buckets = [];
+
+        $manifest = Snapshot_Store::get_manifest($plugin);
+        if (!$manifest) {
+            return $buckets;
+        }
+
+        // Redirections and 404 logs migrate into ThinkRank Pro. With Pro active
+        // they have a real home and never block cleanup; without it they are
+        // preserved-but-unapplied, so cleanup must warn before the source rows
+        // (the only other copy) go away.
+        $store = $this->create_redirections_store();
+        $pro_can_take_redirects = $store !== null && method_exists($store, 'import_redirect');
+
+        if (!$pro_can_take_redirects) {
+            $redirection_count = (int) ($manifest['types']['redirections']['total_records'] ?? 0);
+            if ($redirection_count > 0) {
+                $buckets[] = [
+                    'key'   => 'redirections',
+                    'label' => __('Redirections', 'thinkrank'),
+                    'count' => $redirection_count,
+                ];
+            }
+
+            $log_count = (int) ($manifest['types']['404_logs']['total_records'] ?? 0);
+            if ($log_count > 0) {
+                $buckets[] = [
+                    'key'   => '404_logs',
+                    'label' => __('404 Logs', 'thinkrank'),
+                    'count' => $log_count,
+                ];
+            }
+        }
+
+        $chunk = Snapshot_Store::read_chunk($plugin, 'settings', 1);
+        $extended = $chunk[0]['extended'] ?? [];
+        if (is_array($extended)) {
+            foreach ($extended as $key => $value) {
+                if (in_array($key, self::HANDLED_EXTENDED_SETTINGS, true) || empty($value)) {
+                    continue;
+                }
+                // A bucket the migrator applies part of blocks cleanup only for
+                // the part it does not.
+                if (is_array($value) && empty($this->unapplied_remainder((string) $key, $value))) {
+                    continue;
+                }
+                // Custom schemas have a home only in ThinkRank Pro. Without it
+                // they are preserved, and cleanup would delete the source's
+                // copy, including every post's own schemas.
+                if ($key === 'custom_schemas') {
+                    if ($this->create_custom_schema_repository() !== null) {
+                        continue;
+                    }
+                    $count = count(is_array($value['entries'] ?? null) ? $value['entries'] : []) + (int) ($value['post_count'] ?? 0);
+                    $buckets[] = [
+                        'key'   => 'settings.custom_schemas',
+                        'label' => (string) self::extended_bucket_label('custom_schemas'),
+                        'count' => max(1, $count),
+                    ];
+                    continue;
+                }
+                if ($key === 'schema_templates' && is_array($value)) {
+                    $buckets[] = [
+                        'key'   => 'settings.schema_templates',
+                        'label' => (string) self::extended_bucket_label('schema_templates'),
+                        'count' => count($value),
+                    ];
+                    continue;
+                }
+                $buckets[] = [
+                    'key'   => 'settings.' . $key,
+                    'label' => self::extended_bucket_label((string) $key) ?? ucfirst(str_replace('_', ' ', (string) $key)),
+                    'count' => 1,
+                ];
+            }
+        }
+
+        return $buckets;
+    }
+
+    /**
+     * Save canonical custom schema entries into ThinkRank Pro's Custom Schema.
+     *
+     * Each entry's id is derived from the source and its `key`, so running
+     * the migration again finds the entry it wrote and leaves it — including
+     * any edit made since. An entry the Repository refuses (an invalid
+     * condition, an oversized document) is skipped; the source still holds
+     * it, and the snapshot keeps the rendered JSON.
+     *
+     * @param string $plugin  Source plugin slug
+     * @param array  $entries Canonical entries {key, title, enabled, json, conditions}
+     * @return int Entries written
+     */
+    private function migrate_custom_schemas(string $plugin, array $entries): int {
+        $repository = $this->create_custom_schema_repository();
+        if ($repository === null) {
+            return 0;
+        }
+
+        $written = 0;
+        foreach ($entries as $entry) {
+            if (!is_array($entry) || trim((string) ($entry['json'] ?? '')) === '') {
+                continue;
+            }
+            $id = 'cs_' . substr(md5($plugin . '|' . (string) ($entry['key'] ?? wp_json_encode($entry))), 0, 12);
+            if ($repository->get($id) !== null) {
+                continue;
+            }
+
+            try {
+                $repository->save([
+                    'id'         => $id,
+                    'title'      => (string) ($entry['title'] ?? ''),
+                    'enabled'    => !empty($entry['enabled']),
+                    'json'       => (string) $entry['json'],
+                    'conditions' => is_array($entry['conditions'] ?? null) ? $entry['conditions'] : ['include' => [], 'exclude' => []],
+                ]);
+                $written++;
+            } catch (\Throwable $e) {
+                continue;
+            }
+        }
+
+        return $written;
+    }
+
+    /**
+     * ThinkRank Pro's Custom Schema repository, when Pro is active.
+     *
+     * @return object|null
+     */
+    protected function create_custom_schema_repository(): ?object {
+        return class_exists('ThinkRank\\Pro\\Schema\\Repository') ? new \ThinkRank\Pro\Schema\Repository() : null;
+    }
+
+    /**
+     * Turn on ThinkRank Pro's Markdown for AI with the source's post types
+     * (extended.markdown_for_ai), while its settings were never saved.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if written
+     */
+    private function migrate_markdown_for_ai(array $extended): bool {
+        $markdown = $extended['markdown_for_ai'] ?? [];
+        if (!is_array($markdown) || empty($markdown['enabled']) || !class_exists('ThinkRank\\Pro\\Markdown_For_AI\\Settings')) {
+            return false;
+        }
+        if (get_option('thinkrank_pro_markdown_for_ai', null) !== null) {
+            return false;
+        }
+
+        $types = array_values(array_filter(
+            array_map('strval', is_array($markdown['post_types'] ?? null) ? $markdown['post_types'] : ['post']),
+            'post_type_exists'
+        ));
+
+        return (bool) (new \ThinkRank\Pro\Markdown_For_AI\Settings())->save([
+            'enabled'    => true,
+            'post_types' => !empty($types) ? $types : ['post'],
+        ]);
+    }
+
+    /**
+     * What a preserved settings bucket holds, as the cleanup warning names it.
+     *
+     * The warning exists so someone can decide whether to delete their old
+     * plugin's data; printing `code_injection` does not help them decide
+     * (#900). Every bucket an exporter can leave unapplied has an entry here,
+     * and a test fails when one is added without.
+     *
+     * @param string $key Extended bucket key
+     * @return string|null Label, or null when the bucket has none
+     */
+    public static function extended_bucket_label(string $key): ?string {
+        $labels = [
+            'code_injection'             => __('Header, body and footer code', 'thinkrank'),
+            'redirect_settings'          => __('Redirect behaviour settings', 'thinkrank'),
+            'taxonomy_settings'          => __('Taxonomy templates and images', 'thinkrank'),
+            'post_type_archive_settings' => __('Post type archive templates and images', 'thinkrank'),
+            'no_category_base'           => __('Removing /category/ from category URLs', 'thinkrank'),
+            'webmaster_tools'            => __('Webmaster tools verification codes', 'thinkrank'),
+            'access_control'             => __('Role access settings', 'thinkrank'),
+            'og_frontpage_title'         => __('Homepage social title', 'thinkrank'),
+            'og_frontpage_desc'          => __('Homepage social description', 'thinkrank'),
+            'og_frontpage_image'         => __('Homepage social image', 'thinkrank'),
+            'custom_schemas'             => __('Custom schemas (need ThinkRank Pro)', 'thinkrank'),
+            'schema_templates'           => __('Schema templates with no ThinkRank equivalent', 'thinkrank'),
+        ];
+
+        return $labels[$key] ?? null;
+    }
+
+    /**
+     * What is left of a partially-applied extended bucket once the keys
+     * migrate_archive_noindex() consumes are removed.
+     *
+     * `taxonomy_settings` and `post_type_archive_settings` carry a `noindex`
+     * per context that is applied, beside templates and images that are not.
+     * Any other bucket is returned whole.
+     *
+     * @param string $key   Extended bucket key
+     * @param array  $value Bucket contents
+     * @return array The unapplied part
+     */
+    private function unapplied_remainder(string $key, array $value): array {
+        if ($key !== 'taxonomy_settings' && $key !== 'post_type_archive_settings') {
+            return $value;
+        }
+
+        $remainder = [];
+        foreach ($value as $context => $settings) {
+            if (!is_array($settings)) {
+                continue;
+            }
+            // Only the blog index has an archive entity to receive a noindex.
+            $applied = $key === 'taxonomy_settings' || (string) $context === 'post';
+            $rest = $applied ? array_diff_key($settings, ['noindex' => true]) : $settings;
+            if (!empty($rest)) {
+                $remainder[$context] = $rest;
+            }
+        }
+
+        return $remainder;
+    }
+
+    /**
+     * Apply per-taxonomy and blog-index noindex through the Content Type
+     * Matrix (`taxonomy:<slug>` / `archive:blog`), the entities the front end
+     * reads robots directives for on those archives.
+     *
+     * Reads `extended.taxonomy_settings[<taxonomy>].noindex` (Yoast's and
+     * Slim SEO's shape) and `extended.post_type_archive_settings.post.noindex`.
+     * An entity whose robots were already customised in ThinkRank is left
+     * alone, and a source that did NOT noindex an archive writes nothing —
+     * "indexed" is the default and restating it would pin the entity.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any entity was written
+     */
+    private function migrate_archive_noindex(array $extended): bool {
+        if (!class_exists('ThinkRank\\SEO\\Content_Type_Settings')) {
+            return false;
+        }
+
+        // Only public taxonomies are matrix entities (Content_Type_Settings::get_entities()).
+        $entities = [];
+        $taxonomies = is_array($extended['taxonomy_settings'] ?? null) ? $extended['taxonomy_settings'] : [];
+        foreach ($taxonomies as $taxonomy => $settings) {
+            if (!is_array($settings) || empty($settings['noindex']) || !taxonomy_exists((string) $taxonomy)) {
+                continue;
+            }
+            $object = get_taxonomy((string) $taxonomy);
+            if (is_object($object) && !empty($object->public)) {
+                $entities[] = \ThinkRank\SEO\Content_Type_Settings::PREFIX_TAXONOMY . $taxonomy;
+            }
+        }
+        $archives = is_array($extended['post_type_archive_settings'] ?? null) ? $extended['post_type_archive_settings'] : [];
+        if (!empty($archives['post']['noindex'])) {
+            $entities[] = \ThinkRank\SEO\Content_Type_Settings::ENTITY_BLOG_INDEX;
+        }
+
+        $written = false;
+        foreach ($entities as $entity_key) {
+            $existing = \ThinkRank\SEO\Content_Type_Settings::get_entity_settings($entity_key);
+            if (!empty($existing['robots_meta_enabled'])) {
+                continue;
+            }
+            $robots = \ThinkRank\SEO\Content_Type_Settings::default_robots_meta($entity_key);
+            $robots['index'] = false;
+            $robots['noindex'] = true;
+            if (\ThinkRank\SEO\Content_Type_Settings::update_entity_settings($entity_key, [
+                'robots_meta_enabled' => true,
+                'robots_meta'         => $robots,
+            ])) {
+                $written = true;
+            }
+        }
+
+        return $written;
+    }
+
+    /**
+     * Fold post IDs the source excluded from its sitemap into ThinkRank's
+     * sitemap `exclude_posts` list (a comma-separated ID string — ThinkRank has
+     * no per-post exclusion meta).
+     *
+     * Additive and idempotent: IDs already listed are left in place and never
+     * duplicated, so re-running a migration converges.
+     *
+     * @param int[] $post_ids Post IDs to exclude
+     * @return int Number of IDs newly added
+     */
+    private function migrate_sitemap_exclusions(array $post_ids): int {
+        $post_ids = array_values(array_unique(array_filter(array_map('intval', $post_ids))));
+        if (empty($post_ids) || !class_exists('ThinkRank\\SEO\\Sitemap_Generator')) {
+            return 0;
+        }
+
+        $manager = new \ThinkRank\SEO\Sitemap_Generator();
+        $current = $manager->get_settings('site');
+
+        $existing = array_filter(array_map(
+            'intval',
+            array_map('trim', explode(',', (string) ($current['exclude_posts'] ?? '')))
+        ));
+
+        $merged = array_values(array_unique(array_merge($existing, $post_ids)));
+        $added = count($merged) - count($existing);
+        if ($added <= 0) {
+            return 0;
+        }
+
+        sort($merged);
+        $manager->save_settings('site', null, ['exclude_posts' => implode(',', $merged)]);
+
+        return $added;
+    }
+
+    /**
+     * Migrate a source plugin's sitemap inclusion settings into ThinkRank's
+     * sitemap settings (wp_thinkrank_seo_settings via Sitemap_Generator). ThinkRank only
+     * models the global enable toggle, posts/pages/categories/tags inclusion,
+     * images, links-per-file, the ping-search-engines toggle and the sitemap-index
+     * toggle (Rank Math is always index-based; AIOSEO exposes it explicitly);
+     * source plugins' per-CPT / per-taxonomy toggles beyond these are not
+     * represented. Shared by all source exporters (Rank Math, AIOSEO, SEOPress,
+     * Yoast), which each emit this canonical shape.
+     * Non-destructive: a value is written only while ThinkRank still holds its
+     * default for that key.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any value was written
+     */
+    private function migrate_sitemap(array $extended): bool {
+        $sitemap = $extended['sitemap_settings'] ?? [];
+        if (empty($sitemap['has_data']) || !class_exists('ThinkRank\\SEO\\Sitemap_Generator')) {
+            return false;
+        }
+
+        $manager = new \ThinkRank\SEO\Sitemap_Generator();
+        $current = $manager->get_settings('site');
+        $defaults = $manager->get_default_settings('site');
+
+        $keys = ['enabled', 'include_posts', 'include_pages', 'include_categories', 'include_tags', 'include_images', 'include_featured_images', 'links_per_sitemap', 'ping_search_engines', 'exclude_posts', 'exclude_terms'];
+        $updates = [];
+        foreach ($keys as $key) {
+            if (!array_key_exists($key, $sitemap)) {
+                continue;
+            }
+            // Only write while ThinkRank still holds its default for this key.
+            $current_val = $current[$key] ?? null;
+            $default_val = $defaults[$key] ?? null;
+            if ($current_val === $default_val && $sitemap[$key] !== $default_val) {
+                $updates[$key] = $sitemap[$key];
+            }
+        }
+
+        // Sitemap index toggle is COUPLED to sitemap_urls in ThinkRank: the UI
+        // rewrites the URL list when the toggle flips, and generation keys off
+        // sitemap_urls[].type ('index' vs 'general'). So the flag and its matching
+        // URL entry must be written together — mirror the frontend's rewrite
+        // (SitemapGeneration.js). Only AIOSEO exposes a source equivalent. Guard on
+        // ThinkRank still being at its default (index off) so a user's customized
+        // URL list is never clobbered.
+        if (!empty($sitemap['use_sitemap_index']) && empty($current['use_sitemap_index'])) {
+            $updates['use_sitemap_index'] = true;
+            // Populate the full segmented list (index + one child per enabled type
+            // and per public CPT) so the index has real children — not just the
+            // bare index entry, which would generate an empty index.
+            $updates['sitemap_urls'] = $manager->build_segmented_sitemap_urls(array_merge($current, $sitemap));
+        }
+
+        $saved = empty($updates) ? false : $manager->save_settings('site', null, $updates);
+
+        // Generate the physical sitemap files now so the sitemap is live
+        // immediately after import. ThinkRank serves static files that otherwise
+        // only appear on the next content change or a manual "Generate", whereas
+        // Rank Math served a ready sitemap — this closes that gap. Runs off the
+        // migrated settings whatever they are (an import that matched ThinkRank's
+        // defaults writes no updates but still needs its files), and never fails
+        // the migration.
+        try {
+            $fresh = $manager->get_settings('site');
+            if (!empty($fresh['enabled'])) {
+                $manager->generate_and_save($fresh);
+            }
+        } catch (\Throwable $e) {
+            // Non-fatal: settings persisted; files will be built on next trigger.
+        }
+
+        return $saved;
+    }
+
+    /**
+     * Migrate Rank Math image auto alt/title settings into ThinkRank's Image SEO
+     * settings (wp_thinkrank_seo_settings table via Image_SEO_Manager). Enables
+     * auto-generation only when Rank Math had it on and ThinkRank is still at its
+     * default; formats are filled only when ThinkRank still holds its default.
+     *
+     * @param array $extended Canonical settings `extended` payload
+     * @return bool True if any value was written
+     */
+    private function migrate_image_seo(array $extended): bool {
+        if (empty($extended['image_seo']) || !class_exists('ThinkRank\\SEO\\Image_SEO_Manager')) {
+            return false;
+        }
+
+        $img = $extended['image_seo'];
+        $manager = new \ThinkRank\SEO\Image_SEO_Manager();
+        $current = $manager->get_settings('site');
+
+        // ThinkRank Image SEO default seeds.
+        $default_alt_format   = '%filename%';
+        $default_title_format = '%title% %separator% %sitename%';
+
+        $updates = [];
+        if (!empty($img['add_missing_alt']) && empty($current['add_missing_alt'])) {
+            $updates['add_missing_alt'] = true;
+        }
+        if (!empty($img['add_missing_title']) && empty($current['add_missing_title'])) {
+            $updates['add_missing_title'] = true;
+        }
+        if (!empty($img['alt_format']) && ($current['alt_format'] ?? '') === $default_alt_format) {
+            $updates['alt_format'] = $img['alt_format'];
+        }
+        if (!empty($img['title_format']) && ($current['title_format'] ?? '') === $default_title_format) {
+            $updates['title_format'] = $img['title_format'];
+        }
+
+        if (empty($updates)) {
+            return false;
+        }
+
+        return $manager->save_settings('site', null, $updates);
+    }
+
+    /**
+     * Migrate Rank Math per-post-type title/description templates and robots
+     * defaults into ThinkRank's Global SEO option (thinkrank_global_seo_settings),
+     * which is keyed by post type. Non-destructive: only fills values ThinkRank
+     * has not already customized.
+     *
+     * @param array $post_type_settings Map of post_type => {title_template, description_template, robots, custom_robots}
+     * @return bool True if any value was written
+     */
+    private function migrate_post_type_settings(array $post_type_settings): bool {
+        $global_seo = get_option('thinkrank_global_seo_settings', []);
+        $updated = false;
+
+        foreach ($post_type_settings as $post_type => $pt) {
+            if (!post_type_exists((string) $post_type)) {
+                continue;
+            }
+
+            $existing = $global_seo[$post_type] ?? [];
+
+            if (!empty($pt['title_template']) && empty($existing['title'])) {
+                $existing['title'] = $pt['title_template'];
+                $updated = true;
+            }
+            if (!empty($pt['description_template']) && empty($existing['description'])) {
+                $existing['description'] = $pt['description_template'];
+                $updated = true;
+            }
+
+            // Link Suggestions. ThinkRank's default is ON, so only a source that
+            // turned it OFF carries information — writing an "on" would just
+            // restate the default. Never overrides an explicit ThinkRank value.
+            if (array_key_exists('link_suggestions', $pt) && !$pt['link_suggestions']
+                && !array_key_exists('link_suggestions', $existing)) {
+                $existing['link_suggestions'] = false;
+                $updated = true;
+            }
+
+            // Only migrate robots when Rank Math actually applied custom robots for
+            // this type; otherwise the array is Rank Math's inert default.
+            if (!empty($pt['custom_robots']) && !empty($pt['robots']) && is_array($pt['robots'])
+                && empty($existing['robots_meta_enabled'])) {
+                $robots = $pt['robots'];
+                $existing['robots_meta'] = [
+                    'index'        => !in_array('noindex', $robots, true),
+                    'noindex'      => in_array('noindex', $robots, true),
+                    'nofollow'     => in_array('nofollow', $robots, true),
+                    'noarchive'    => in_array('noarchive', $robots, true),
+                    'noimageindex' => in_array('noimageindex', $robots, true),
+                    'nosnippet'    => in_array('nosnippet', $robots, true),
+                ];
+                $existing['robots_meta_enabled'] = true;
+                $updated = true;
+            }
+
+            if (!empty($existing)) {
+                $global_seo[$post_type] = $existing;
+            }
+        }
+
+        if ($updated) {
+            update_option('thinkrank_global_seo_settings', $global_seo);
+        }
+
+        return $updated;
+    }
+
+    /**
+     * Update manifest with migration info after all chunks are migrated
+     *
+     * @param string $plugin Plugin slug
+     * @return void
+     */
+    public function update_manifest_migration_info(string $plugin): void {
+        $manifest = Snapshot_Store::get_manifest($plugin);
+        if ($manifest) {
+            $manifest['last_migrated'] = gmdate('c');
+            $manifest['migration_version'] = defined('THINKRANK_VERSION') ? THINKRANK_VERSION : '2.0.0';
+            Snapshot_Store::write_manifest($plugin, $manifest);
+        }
+    }
+
+    /**
+     * Get migratable types from a manifest
+     *
+     * @param array $manifest Snapshot manifest
+     * @return array Types that can be migrated
+     */
+    public function get_migratable_types(array $manifest): array {
+        $types = [];
+
+        foreach ($manifest['types'] ?? [] as $type => $info) {
+            if (in_array($type, self::MIGRATABLE_TYPES, true)) {
+                $types[$type] = $info;
+            }
+        }
+
+        return $types;
+    }
+}

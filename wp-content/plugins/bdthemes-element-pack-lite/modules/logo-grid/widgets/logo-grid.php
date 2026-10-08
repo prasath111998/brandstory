@@ -1,0 +1,773 @@
+<?php
+
+namespace ElementPack\Modules\LogoGrid\Widgets;
+
+use ElementPack\Base\Module_Base;
+use Elementor\Group_Control_Css_Filter;
+use Elementor\Repeater;
+use Elementor\Controls_Manager;
+use Elementor\Group_Control_Box_Shadow;
+use Elementor\Group_Control_Image_Size;
+use Elementor\Group_Control_Typography;
+use Elementor\Group_Control_Background;
+use Elementor\Group_Control_Border;
+use Elementor\Utils;
+
+use ElementPack\Traits\Global_Controls_Functions;
+use ElementPack\Traits\Global_Mask_Controls;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+} // Exit if accessed directly
+
+class Logo_Grid extends Module_Base {
+
+	use Global_Controls_Functions;
+	use Global_Mask_Controls;
+
+	public function get_name() {
+		return 'bdt-logo-grid';
+	}
+
+	public function get_title() {
+		return BDTEP . esc_html__( 'Logo Grid', 'bdthemes-element-pack-lite' );
+	}
+
+	public function get_icon() {
+		return 'bdt-wi-logo-grid';
+	}
+
+	public function get_categories() {
+		return [ 'element-pack' ];
+	}
+
+	public function get_keywords() {
+		return [ 'logo', 'grid', 'client', 'brand', 'showcase' ];
+	}
+
+	public function get_style_depends() {
+		return $this->ep_is_edit_mode() ? [ 'ep-styles' ] : [ 'ep-logo-grid', 'tippy' ];
+	}
+
+	public function get_script_depends() {
+		return $this->ep_is_edit_mode() ? [ 'popper', 'tippyjs', 'ep-scripts' ] : [ 'popper', 'tippyjs', 'ep-logo-grid' ];
+	}
+
+	public function get_custom_help_url() {
+		return 'https://youtu.be/Go1YE3O23J4';
+	}
+
+	public function has_widget_inner_wrapper(): bool {
+        return ! \Elementor\Plugin::$instance->experiments->is_feature_active( 'e_optimized_markup' );
+    }
+	protected function is_dynamic_content(): bool {
+		return false;
+	}
+
+	protected function register_controls() {
+
+		$this->register_logo_items_controls(
+			[
+				'section_label'    => __( 'Logo Grid Items', 'bdthemes-element-pack-lite' ),
+				'tooltip_frontend' => true,
+			]
+		);
+
+		$this->start_controls_section(
+			'ep_section_layout',
+			[ 
+				'label' => __( 'Additional Settings', 'bdthemes-element-pack-lite' ),
+				'tab'   => Controls_Manager::TAB_CONTENT,
+			]
+		);
+
+		$this->add_control(
+			'layout',
+			[ 
+				'label'          => __( 'Grid Layout', 'bdthemes-element-pack-lite' ),
+				'type'           => Controls_Manager::SELECT,
+				'options'        => [ 
+					'box'       => __( 'Box', 'bdthemes-element-pack-lite' ),
+					'border'    => __( 'Border', 'bdthemes-element-pack-lite' ),
+					'tictactoe' => __( 'Plus', 'bdthemes-element-pack-lite' ),
+				],
+				'default'        => 'box',
+				'prefix_class'   => 'bdt-logo-grid--',
+				'style_transfer' => true,
+				'render_type'    => 'template',
+			]
+		);
+
+		$this->add_responsive_control(
+			'columns',
+			[ 
+				'label'           => __( 'Columns', 'bdthemes-element-pack-lite' ),
+				'type'            => Controls_Manager::SELECT,
+				'options'         => [ 
+					1 => '1',
+					2 => '2',
+					3 => '3',
+					4 => '4',
+					5 => '5',
+					6 => '6',
+				],
+				'desktop_default' => 4,
+				'tablet_default'  => 2,
+				'mobile_default'  => 2,
+				'prefix_class'    => 'bdt-lg-col-%s',
+				'style_transfer'  => true,
+				'render_type'     => 'template',
+				'selectors'       => [ 
+					'{{WRAPPER}} .bdt-logo-grid-wrapper' => 'grid-template-columns: repeat({{SIZE}}, 1fr); display: grid;',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'column_gap',
+			[ 
+				'label'     => esc_html__( 'Grid Gap', 'bdthemes-element-pack-lite' ) . BDTEP_NC,
+				'type'      => Controls_Manager::SLIDER,
+				'default'   => [ 
+					'size' => 15,
+				],
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-logo-grid-wrapper' => 'grid-gap: {{SIZE}}{{UNIT}};',
+				],
+				'condition' => [ 
+					'layout' => 'box'
+				]
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Image_Size::get_type(),
+			[ 
+				'name'      => 'thumbnail',
+				'default'   => 'large',
+				'separator' => 'before',
+				'exclude'   => [ // phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_exclude -- Elementor control option, not WP_Query.
+					'custom'
+				]
+			]
+		);
+
+		$this->add_control(
+			'image_mask_popover',
+			[ 
+				'label'        => esc_html__( 'Image Mask', 'bdthemes-element-pack-lite' ) . BDTEP_NC,
+				'type'         => Controls_Manager::POPOVER_TOGGLE,
+				'render_type'  => 'template',
+				'return_value' => 'yes',
+			]
+		);
+
+		//Global Image Mask Controls
+		$this->register_image_mask_controls();
+
+		$this->add_responsive_control(
+			'height',
+			[ 
+				'label'      => __( 'Item Height', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::SLIDER,
+				'size_units' => [ 'px' ],
+				'range'      => [ 
+					'px' => [ 
+						'max' => 500,
+						'min' => 100,
+					]
+				],
+				'selectors'  => [ 
+					'{{WRAPPER}} .bdt-item' => 'height: {{SIZE}}{{UNIT}};'
+				],
+			]
+		);
+
+		$this->add_control(
+			'grid_animation_type',
+			[ 
+				'label'     => esc_html__( 'Grid Entrance Animation', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::SELECT,
+				'default'   => '',
+				'options'   => element_pack_transition_options(),
+				'separator' => 'before',
+			]
+		);
+
+		$this->add_control(
+			'grid_anim_delay',
+			[ 
+				'label'      => esc_html__( 'Animation delay', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::SLIDER,
+				'size_units' => [ 'ms', '' ],
+				'range'      => [ 
+					'ms' => [ 
+						'min'  => 0,
+						'max'  => 1000,
+						'step' => 5,
+					],
+				],
+				'default'    => [ 
+					'unit' => 'ms',
+					'size' => 300,
+				],
+				'condition'  => [ 
+					'grid_animation_type!' => '',
+				],
+			]
+		);
+
+		$this->add_control(
+			'logo_size_cover',
+			[ 
+				'label'        => esc_html__( 'Enable Logo Size Cover ', 'bdthemes-element-pack-lite' ) . BDTEP_NC,
+				'type'         => Controls_Manager::SWITCHER,
+				'prefix_class' => 'ep-logo-grid-cover-',
+				'separator'    => 'before',
+			]
+		);
+
+		$this->end_controls_section();
+
+		$this->register_logo_tooltip_settings_controls();
+
+		//Style
+		$this->start_controls_section(
+			'ep_section_style_grid',
+			[ 
+				'label' => __( 'Logo Grid', 'bdthemes-element-pack-lite' ),
+				'tab'   => Controls_Manager::TAB_STYLE,
+			]
+		);
+
+		$this->start_controls_tabs( 'ep_image_effects' );
+
+		$this->start_controls_tab(
+			'ep_tab_image_effects_normal',
+			[ 
+				'label' => __( 'Normal', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'grid_bg_color',
+			[ 
+				'label'     => __( 'Background Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-logo-grid-figure' => 'background-color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'grid_border_type',
+			[ 
+				'label'     => __( 'Border Type', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::SELECT,
+				'options'   => [ 
+					'none'   => __( 'None', 'bdthemes-element-pack-lite' ),
+					'solid'  => __( 'Solid', 'bdthemes-element-pack-lite' ),
+					'double' => __( 'Double', 'bdthemes-element-pack-lite' ),
+					'dotted' => __( 'Dotted', 'bdthemes-element-pack-lite' ),
+					'dashed' => __( 'Dashed', 'bdthemes-element-pack-lite' ),
+					'groove' => __( 'Groove', 'bdthemes-element-pack-lite' ),
+				],
+				'default'   => 'solid',
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-item' => 'border-style: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'grid_border_width',
+			[ 
+				'label'          => __( 'Border Width', 'bdthemes-element-pack-lite' ),
+				'type'           => Controls_Manager::SLIDER,
+				'default'        => [ 
+					'size' => 2,
+				],
+				'tablet_default' => [ 
+					'size' => 2,
+				],
+				'mobile_default' => [ 
+					'size' => 2,
+				],
+				'range'          => [ 
+					'px' => [ 
+						'min' => 0,
+						'max' => 50,
+					],
+				],
+				'selectors'      => [ 
+					'{{WRAPPER}}'                                                                             => '--ep-grid-border-width: {{SIZE}}{{UNIT}};',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border .bdt-item'                                    => 'border-right-width: var(--ep-grid-border-width, 2px); border-bottom-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border .bdt-item'                                     => 'border-right-width: var(--ep-grid-border-width, 2px); border-bottom-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border .bdt-item'                                     => 'border-right-width: var(--ep-grid-border-width, 2px); border-bottom-width: var(--ep-grid-border-width, 2px);',
+
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-2 .bdt-item:nth-child(2n+1)'       => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-3 .bdt-item:nth-child(3n+1)'       => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-4 .bdt-item:nth-child(4n+1)'       => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-5 .bdt-item:nth-child(5n+1)'       => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-6 .bdt-item:nth-child(6n+1)'       => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-2 .bdt-item:nth-child(-n+2)'       => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-3 .bdt-item:nth-child(-n+3)'       => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-4 .bdt-item:nth-child(-n+4)'       => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-5 .bdt-item:nth-child(-n+5)'       => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-6 .bdt-item:nth-child(-n+6)'       => 'border-top-width: var(--ep-grid-border-width, 2px);',
+
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet2 .bdt-item:nth-child(2n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet3 .bdt-item:nth-child(3n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet4 .bdt-item:nth-child(4n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet5 .bdt-item:nth-child(5n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet6 .bdt-item:nth-child(6n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet2 .bdt-item:nth-child(-n+2)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet3 .bdt-item:nth-child(-n+3)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet4 .bdt-item:nth-child(-n+4)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet5 .bdt-item:nth-child(-n+5)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet6 .bdt-item:nth-child(-n+6)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile2 .bdt-item:nth-child(2n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile3 .bdt-item:nth-child(3n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile4 .bdt-item:nth-child(4n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile5 .bdt-item:nth-child(5n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile6 .bdt-item:nth-child(6n+1)' => 'border-left-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile2 .bdt-item:nth-child(-n+2)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile3 .bdt-item:nth-child(-n+3)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile4 .bdt-item:nth-child(-n+4)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile5 .bdt-item:nth-child(-n+5)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile6 .bdt-item:nth-child(-n+6)' => 'border-top-width: var(--ep-grid-border-width, 2px);',
+
+					'{{WRAPPER}}.bdt-logo-grid--tictactoe .bdt-item'                                          => 'border-inline-start-width: 0; border-block-end-width: 0 !important; border-bottom-width: 0 !important; border-inline-end-width: var(--ep-grid-border-width, 2px); border-block-start-width: var(--ep-grid-border-width, 2px);',
+
+					'{{WRAPPER}}.bdt-logo-grid--box .bdt-item'                                                => 'border-width: {{SIZE}}{{UNIT}};',
+				],
+				'condition'      => [ 
+					'grid_border_type!' => 'none',
+				]
+			]
+		);
+
+		$this->add_control(
+			'grid_border_color',
+			[ 
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-item' => 'border-color: {{VALUE}};',
+				],
+				'condition' => [ 
+					'grid_border_type!' => 'none',
+				]
+			]
+		);
+
+		$this->add_responsive_control(
+			'grid_border_radius',
+			[ 
+				'label'      => __( 'Border Radius', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', '%' ],
+				'selectors'  => [ 
+					'{{WRAPPER}}'                                                                                        => '--ep-grid-border-radius-left: {{LEFT}}{{UNIT}}; --ep-grid-border-radius-right: {{RIGHT}}{{UNIT}};',
+					'{{WRAPPER}}.bdt-logo-grid--border .bdt-logo-grid-wrapper, {{WRAPPER}}.bdt-logo-grid--box .bdt-item' => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+					'{{WRAPPER}}.bdt-logo-grid--border .bdt-item:first-child'                                            => 'border-top-left-radius: {{TOP}}{{UNIT}};',
+					'{{WRAPPER}}.bdt-logo-grid--border .bdt-item:last-child'                                             => 'border-bottom-right-radius: {{BOTTOM}}{{UNIT}};',
+
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-2 .bdt-item:nth-child(2)'                     => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-2 .bdt-item:nth-last-child(2)'                => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-3 .bdt-item:nth-child(3)'                     => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-3 .bdt-item:nth-last-child(3)'                => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-4 .bdt-item:nth-child(4)'                     => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-4 .bdt-item:nth-last-child(4)'                => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-5 .bdt-item:nth-child(5)'                     => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-5 .bdt-item:nth-last-child(5)'                => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-6 .bdt-item:nth-child(6)'                     => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col-6 .bdt-item:nth-last-child(6)'                => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet2 .bdt-item:nth-child(2)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet2 .bdt-item:nth-last-child(2)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet3 .bdt-item:nth-child(3)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet3 .bdt-item:nth-last-child(3)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet4 .bdt-item:nth-child(4)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet4 .bdt-item:nth-last-child(4)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet5 .bdt-item:nth-child(5)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet5 .bdt-item:nth-last-child(5)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet6 .bdt-item:nth-child(6)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--tablet6 .bdt-item:nth-last-child(6)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile2 .bdt-item:nth-child(2)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile2 .bdt-item:nth-last-child(2)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile3 .bdt-item:nth-child(3)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile3 .bdt-item:nth-last-child(3)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile4 .bdt-item:nth-child(4)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile4 .bdt-item:nth-last-child(4)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile5 .bdt-item:nth-child(5)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile5 .bdt-item:nth-last-child(5)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile6 .bdt-item:nth-child(6)'               => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--border.bdt-lg-col--mobile6 .bdt-item:nth-last-child(6)'          => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+
+					// Tictactoe
+					'{{WRAPPER}}.bdt-logo-grid--tictactoe .bdt-logo-grid-wrapper'                                        => 'border-radius: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+					'{{WRAPPER}}.bdt-logo-grid--tictactoe .bdt-item:first-child'                                         => 'border-top-left-radius: {{TOP}}{{UNIT}};',
+					'{{WRAPPER}}.bdt-logo-grid--tictactoe .bdt-item:last-child'                                          => 'border-bottom-right-radius: {{BOTTOM}}{{UNIT}};',
+
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-2 .bdt-item:nth-child(2)'                  => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-2 .bdt-item:nth-last-child(2)'             => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-3 .bdt-item:nth-child(3)'                  => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-3 .bdt-item:nth-last-child(3)'             => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-4 .bdt-item:nth-child(4)'                  => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-4 .bdt-item:nth-last-child(4)'             => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-5 .bdt-item:nth-child(5)'                  => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-5 .bdt-item:nth-last-child(5)'             => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-6 .bdt-item:nth-child(6)'                  => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(desktop){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col-6 .bdt-item:nth-last-child(6)'             => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet2 .bdt-item:nth-child(2)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet2 .bdt-item:nth-last-child(2)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet3 .bdt-item:nth-child(3)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet3 .bdt-item:nth-last-child(3)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet4 .bdt-item:nth-child(4)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet4 .bdt-item:nth-last-child(4)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet5 .bdt-item:nth-child(5)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet5 .bdt-item:nth-last-child(5)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet6 .bdt-item:nth-child(6)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(tablet){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--tablet6 .bdt-item:nth-last-child(6)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile2 .bdt-item:nth-child(2)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile2 .bdt-item:nth-last-child(2)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile3 .bdt-item:nth-child(3)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile3 .bdt-item:nth-last-child(3)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile4 .bdt-item:nth-child(4)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile4 .bdt-item:nth-last-child(4)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile5 .bdt-item:nth-child(5)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile5 .bdt-item:nth-last-child(5)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile6 .bdt-item:nth-child(6)'            => 'border-top-right-radius: var(--ep-grid-border-radius-right, 0);',
+					'(mobile){{WRAPPER}}.bdt-logo-grid--tictactoe.bdt-lg-col--mobile6 .bdt-item:nth-last-child(6)'       => 'border-bottom-left-radius: var(--ep-grid-border-radius-left, 0);',
+				],
+			]
+		);
+
+		$this->add_responsive_control(
+			'padding',
+			[ 
+				'label'      => __( 'Padding', 'bdthemes-element-pack-lite' ),
+				'type'       => Controls_Manager::DIMENSIONS,
+				'size_units' => [ 'px', 'em', '%' ],
+				'selectors'  => [ 
+					'{{WRAPPER}} .bdt-logo-grid-figure' => 'padding: {{TOP}}{{UNIT}} {{RIGHT}}{{UNIT}} {{BOTTOM}}{{UNIT}} {{LEFT}}{{UNIT}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Box_Shadow::get_type(),
+			[ 
+				'name'     => 'grid_box_shadow',
+				'exclude'  => [ // phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_exclude -- Elementor control option, not WP_Query.
+					'box_shadow_position',
+				],
+				'selector' => '{{WRAPPER}}.bdt-logo-grid--tictactoe .bdt-logo-grid-wrapper, {{WRAPPER}}.bdt-logo-grid--border .bdt-logo-grid-wrapper, {{WRAPPER}}.bdt-logo-grid--box .bdt-item'
+			]
+		);
+
+		$this->add_control(
+			'image_opacity',
+			[ 
+				'label'     => __( 'Opacity', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::SLIDER,
+				'range'     => [ 
+					'px' => [ 
+						'max'  => 1,
+						'min'  => 0.10,
+						'step' => 0.01,
+					],
+				],
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-logo-grid-figure img' => 'opacity: {{SIZE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Css_Filter::get_type(),
+			[ 
+				'name'     => 'image_css_filters',
+				'selector' => '{{WRAPPER}} .bdt-logo-grid-figure img',
+			]
+		);
+
+		$this->add_responsive_control(
+			'image_size',
+			[ 
+				'label'      => __( 'Image Size', 'bdthemes-element-pack-lite' ) . BDTEP_NC,
+				'type'       => Controls_Manager::SLIDER,
+				'size_units' => [ 'px', '%' ],
+				'range'      => [ 
+					'px' => [ 
+						'min' => 10,
+						'max' => 500,
+					],
+					'%'  => [ 
+						'min' => 0,
+						'max' => 100,
+					],
+				],
+				'selectors'  => [ 
+					'{{WRAPPER}} .bdt-logo-grid-img' => 'height: {{SIZE}}{{UNIT}}; width: {{SIZE}}{{UNIT}}; object-fit: contain;'
+				],
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->start_controls_tab(
+			'hover',
+			[ 
+				'label' => __( 'Hover', 'bdthemes-element-pack-lite' ),
+			]
+		);
+
+		$this->add_control(
+			'grid_bg_hover_color',
+			[ 
+				'label'     => __( 'Background Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-item:hover .bdt-logo-grid-figure' => 'background-color: {{VALUE}};',
+				],
+			]
+		);
+
+		$this->add_control(
+			'grid_border_hover_color',
+			[ 
+				'label'     => __( 'Border Color', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::COLOR,
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-item:hover' => 'border-color: {{VALUE}};',
+				],
+				'condition' => [ 
+					'grid_border_type!' => 'none',
+					'layout'            => 'box',
+				]
+			]
+		);
+
+		$this->add_control(
+			'image_opacity_hover',
+			[ 
+				'label'     => __( 'Opacity', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::SLIDER,
+				'range'     => [ 
+					'px' => [ 
+						'max'  => 1,
+						'min'  => 0.10,
+						'step' => 0.01,
+					],
+				],
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-logo-grid-figure:hover img' => 'opacity: {{SIZE}};',
+				],
+			]
+		);
+
+		$this->add_group_control(
+			Group_Control_Css_Filter::get_type(),
+			[ 
+				'name'     => 'image_css_filters_hover',
+				'selector' => '{{WRAPPER}} .bdt-logo-grid-figure:hover img',
+			]
+		);
+
+		$this->add_control(
+			'image_bg_hover_transition',
+			[ 
+				'label'     => __( 'Transition Duration', 'bdthemes-element-pack-lite' ),
+				'type'      => Controls_Manager::SLIDER,
+				'range'     => [ 
+					'px' => [ 
+						'max'  => 3,
+						'step' => 0.1,
+					],
+				],
+				'selectors' => [ 
+					'{{WRAPPER}} .bdt-logo-grid-figure:hover img' => 'transition-duration: {{SIZE}}s;',
+				],
+			]
+		);
+
+		$this->add_control(
+			'hover_animation',
+			[ 
+				'label' => __( 'Hover Animation', 'bdthemes-element-pack-lite' ),
+				'type'  => Controls_Manager::HOVER_ANIMATION,
+			]
+		);
+
+		$this->end_controls_tab();
+
+		$this->end_controls_tabs();
+
+		$this->end_controls_section();
+
+		$this->register_logo_tooltip_style_controls( [ 'widget_type' => 'grid' ] );
+
+	}
+
+	protected function render() {
+		$settings = $this->get_settings_for_display();
+
+		$this->add_render_attribute( 'logo-grid', 'class', 'bdt-logo-grid-wrapper' );
+
+		$grid_animation_type = isset( $settings['grid_animation_type'] ) ? $settings['grid_animation_type'] : '';
+		if ( $grid_animation_type !== '' ) {
+			$this->add_render_attribute( 'logo-grid', 'bdt-scrollspy', 'cls: bdt-animation-' . sanitize_html_class( $grid_animation_type ) . ';' );
+			$grid_anim_delay = isset( $settings['grid_anim_delay']['size'] ) ? (int) $settings['grid_anim_delay']['size'] : 300;
+			$this->add_render_attribute( 'logo-grid', 'bdt-scrollspy', 'delay: ' . $grid_anim_delay . ';' );
+			$this->add_render_attribute( 'logo-grid', 'bdt-scrollspy', 'target: > .bdt-item;' );
+		}
+
+		$logo_list = isset( $settings['logo_list'] ) ? $settings['logo_list'] : [];
+		if ( empty( $logo_list ) ) {
+			return;
+		}
+
+		$thumbnail_size = isset( $settings['thumbnail_size'] ) ? $settings['thumbnail_size'] : 'full';
+		$hover_animation = isset( $settings['hover_animation'] ) ? sanitize_html_class( $settings['hover_animation'] ) : '';
+		$image_mask_popover = ! empty( $settings['image_mask_popover'] ) && $settings['image_mask_popover'] === 'yes';
+		$image_mask_class = $image_mask_popover ? ' bdt-image-mask' : '';
+
+		?>
+		<div <?php $this->print_render_attribute_string( 'logo-grid' ); ?>>
+			<?php
+			foreach ( $logo_list as $index => $item ) :
+				$item_image_id = isset( $item['image']['id'] ) ? $item['image']['id'] : 0;
+				$item_link_url = isset( $item['link']['url'] ) ? $item['link']['url'] : '';
+
+				$image = $item_image_id ? wp_get_attachment_image_url( $item_image_id, $thumbnail_size ) : false;
+				$repeater_key = 'grid_item' . $index;
+				$item_tag = ! empty( $item_link_url ) ? 'a' : 'div';
+				$image_alt = $this->get_logo_image_alt( $item );
+
+				$this->add_render_attribute( $repeater_key, 'class', 'bdt-item' );
+				$this->add_logo_tooltip_attributes( $repeater_key, $item, $settings, [ 'format' => 'grid' ] );
+
+				if ( ! empty( $item_link_url ) ) {
+					$this->add_render_attribute( $repeater_key, 'class', 'bdt-logo-grid-link' );
+					$this->add_link_attributes( $repeater_key, $item['link'] );
+				}
+
+				$this->add_render_attribute( 'image-wrap', 'class', 'bdt-logo-grid-figure' . $image_mask_class );
+
+				?>
+				<<?php echo esc_attr( $item_tag ); ?> <?php $this->print_render_attribute_string( $repeater_key ); ?>>
+					<figure <?php $this->print_render_attribute_string( 'image-wrap' ); ?>>
+						<?php
+						if ( $image && $item_image_id ) {
+							echo wp_get_attachment_image(
+								$item_image_id,
+								$thumbnail_size,
+								false,
+								[
+									'class' => 'bdt-logo-grid-img elementor-animation-' . esc_attr( $hover_animation ),
+									'alt'   => esc_attr( $image_alt ),
+								]
+							);
+						} else {
+							printf(
+								'<img class="bdt-logo-grid-img elementor-animation-%s" src="%s" alt="%s">',
+								esc_attr( $hover_animation ),
+								esc_url( Utils::get_placeholder_image_src() ),
+								esc_attr( $image_alt )
+							);
+						}
+						?>
+					</figure>
+				</<?php echo esc_attr( $item_tag ); ?>>
+			<?php endforeach; ?>
+		</div>
+		<?php
+	}
+
+	protected function content_template() {
+		?>
+		<#
+		var logoList = settings.logo_list || [];
+		var hoverAnim = settings.hover_animation || '';
+		var imageMask = settings.image_mask_popover === 'yes';
+		var logoTooltipAnimation = settings.logo_tooltip_animation || '';
+		var logoTooltipX = ( settings.logo_tooltip_x_offset && settings.logo_tooltip_x_offset.size !== undefined ) ? parseInt( settings.logo_tooltip_x_offset.size, 10 ) : 0;
+		var logoTooltipY = ( settings.logo_tooltip_y_offset && settings.logo_tooltip_y_offset.size !== undefined ) ? parseInt( settings.logo_tooltip_y_offset.size, 10 ) : 0;
+		var logoTooltipArrow = settings.logo_tooltip_arrow === 'yes';
+		var logoTooltipTrigger = settings.logo_tooltip_trigger === 'yes';
+		var tippyArrowStr = logoTooltipArrow ? 'true' : 'false';
+
+		var scrollspyAttr = '';
+		if ( settings.grid_animation_type ) {
+			var gsDelay = ( settings.grid_anim_delay && settings.grid_anim_delay.size !== undefined ) ? parseInt( settings.grid_anim_delay.size, 10 ) : 300;
+			scrollspyAttr = 'cls: bdt-animation-' + settings.grid_animation_type + '; delay: ' + gsDelay + '; target: > .bdt-item;';
+		}
+
+		var placeholderUrl = '<?php echo esc_url( Utils::get_placeholder_image_src() ); ?>';
+		#>
+		<div class="bdt-logo-grid-wrapper"<# if ( scrollspyAttr ) { #> bdt-scrollspy="{{ scrollspyAttr }}"<# } #>>
+			<# _.each( logoList, function( item ) {
+				var itemName = item.name || '';
+				var itemDesc = item.description || '';
+				var imageAlt = itemName + ' : ' + itemDesc;
+				var itemLinkUrl = ( item.link && item.link.url ) ? item.link.url : '';
+				var linkTarget = ( item.link && item.link.is_external ) ? '_blank' : '_self';
+				var linkRel = '';
+				if ( item.link && item.link.is_external ) {
+					linkRel = 'noopener noreferrer';
+				}
+				if ( item.link && item.link.nofollow ) {
+					linkRel = linkRel ? linkRel + ' nofollow' : 'nofollow';
+				}
+				var hasTooltip = itemName && itemDesc && item.logo_tooltip === 'yes';
+				var tooltipHtml = '<span class="bdt-title">' + _.escape( itemName ) + '</span>' + _.escape( itemDesc );
+				var tooltipAttr = tooltipHtml.replace( /"/g, '&quot;' );
+				var itemClasses = 'bdt-item';
+				if ( itemLinkUrl ) {
+					itemClasses += ' bdt-logo-grid-link';
+				}
+				if ( hasTooltip ) {
+					itemClasses += ' bdt-tippy-tooltip';
+				}
+				var figureClass = 'bdt-logo-grid-figure';
+				if ( imageMask ) {
+					figureClass += ' bdt-image-mask';
+				}
+				var imgClass = 'bdt-logo-grid-img';
+				if ( hoverAnim ) {
+					imgClass += ' elementor-animation-' + hoverAnim;
+				}
+			#>
+				<# if ( itemLinkUrl ) { #>
+				<a class="{{ itemClasses }}" data-tippy-content="<# print( tooltipAttr ); #>"<# if ( hasTooltip ) { #> data-tippy=""<# if ( item.logo_tooltip_placement ) { #> data-tippy-placement="{{ item.logo_tooltip_placement }}"<# } #><# if ( logoTooltipAnimation ) { #> data-tippy-animation="{{ logoTooltipAnimation }}"<# } #><# if ( logoTooltipX !== 0 || logoTooltipY !== 0 ) { #> data-tippy-offset="[{{ logoTooltipX }},{{ logoTooltipY }}]"<# } #> data-tippy-arrow="{{ tippyArrowStr }}"<# if ( logoTooltipTrigger ) { #> data-tippy-trigger="click"<# } #><# } #> href="{{ itemLinkUrl }}" target="{{ linkTarget }}"<# if ( linkRel ) { #> rel="{{ linkRel }}"<# } #>>
+					<figure class="{{ figureClass }}">
+						<# if ( item.image && item.image.url ) { #>
+							<img class="{{ imgClass }}" src="{{ item.image.url }}" alt="{{ imageAlt }}">
+						<# } else { #>
+							<img class="{{ imgClass }}" src="{{ placeholderUrl }}" alt="{{ imageAlt }}">
+						<# } #>
+					</figure>
+				</a>
+				<# } else { #>
+				<div class="{{ itemClasses }}" data-tippy-content="<# print( tooltipAttr ); #>"<# if ( hasTooltip ) { #> data-tippy=""<# if ( item.logo_tooltip_placement ) { #> data-tippy-placement="{{ item.logo_tooltip_placement }}"<# } #><# if ( logoTooltipAnimation ) { #> data-tippy-animation="{{ logoTooltipAnimation }}"<# } #><# if ( logoTooltipX !== 0 || logoTooltipY !== 0 ) { #> data-tippy-offset="[{{ logoTooltipX }},{{ logoTooltipY }}]"<# } #> data-tippy-arrow="{{ tippyArrowStr }}"<# if ( logoTooltipTrigger ) { #> data-tippy-trigger="click"<# } #><# } #>>
+					<figure class="{{ figureClass }}">
+						<# if ( item.image && item.image.url ) { #>
+							<img class="{{ imgClass }}" src="{{ item.image.url }}" alt="{{ imageAlt }}">
+						<# } else { #>
+							<img class="{{ imgClass }}" src="{{ placeholderUrl }}" alt="{{ imageAlt }}">
+						<# } #>
+					</figure>
+				</div>
+				<# } #>
+			<# } ); #>
+		</div>
+		<?php
+	}
+}

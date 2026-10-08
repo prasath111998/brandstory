@@ -1,0 +1,585 @@
+<?php
+
+/**
+ * Plugin Name: ThinkRank
+ * Plugin URI: https://thinkrank.ai/
+ * Description: AI-native SEO plugin for WordPress. Automate and enhance your SEO with cutting-edge AI while maintaining editorial control.
+ * Version: 2.14.1
+ * Author: WPDeveloper
+ * Author URI: https://wpdeveloper.com/
+ * License: GPL v2 or later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: thinkrank
+ * Domain Path: /languages
+ * Requires at least: 6.0
+ * Requires PHP: 7.4
+ * 
+ * @package ThinkRank
+ * @version 2.14.1
+ * @since 1.0.0
+ */
+
+declare(strict_types=1);
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// Define plugin constants
+define('THINKRANK_VERSION', '2.14.1');
+define('THINKRANK_PLUGIN_FILE', __FILE__);
+define('THINKRANK_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('THINKRANK_PLUGIN_URL', plugin_dir_url(__FILE__));
+define('THINKRANK_PLUGIN_BASENAME', plugin_basename(__FILE__));
+
+// Minimum requirements check
+if (version_compare(PHP_VERSION, '7.4', '<')) {
+    add_action('admin_notices', function () {
+        echo '<div class="notice notice-error"><p>';
+        echo esc_html__('ThinkRank requires PHP 7.4 or higher. Please upgrade your PHP version.', 'thinkrank');
+        echo '</p></div>';
+    });
+    return;
+}
+
+if (version_compare(get_bloginfo('version'), '6.0', '<')) {
+    add_action('admin_notices', function () {
+        echo '<div class="notice notice-error"><p>';
+        echo esc_html__('ThinkRank requires WordPress 6.0 or higher. Please upgrade your WordPress installation.', 'thinkrank');
+        echo '</p></div>';
+    });
+    return;
+}
+
+// Autoloader
+require_once THINKRANK_PLUGIN_DIR . 'includes/class-autoloader.php';
+
+/**
+ * Bundled AI Building Blocks (Abilities API + MCP Adapter).
+ *
+ * Loaded through the Jetpack Autoloader so that if the same libraries are also
+ * shipped by another plugin — or land in WordPress core — the newest copy wins
+ * and loads once, with no fatal class collisions. This lets ThinkRank serve its
+ * MCP endpoint out of the box, without requiring the standalone MCP Adapter and
+ * Abilities API plugins. See docs/mcp-server.md for the update procedure.
+ */
+$thinkrank_mcp_runtime = THINKRANK_PLUGIN_DIR . 'dependencies/vendor/autoload_packages.php';
+if (is_readable($thinkrank_mcp_runtime)) {
+    require_once $thinkrank_mcp_runtime;
+}
+unset($thinkrank_mcp_runtime);
+
+/**
+ * Main ThinkRank Plugin Class
+ * 
+ * Follows Single Responsibility Principle - only handles plugin initialization
+ * 
+ * @since 1.0.0
+ */
+final class ThinkRank {
+
+    /**
+     * Plugin instance (Singleton Pattern)
+     * 
+     * @var ThinkRank|null
+     */
+    private static ?ThinkRank $instance = null;
+
+    /**
+     * Plugin components
+     * 
+     * @var array
+     */
+    private array $components = [];
+
+    /**
+     * Get plugin instance (Singleton Pattern)
+     * 
+     * @return ThinkRank
+     */
+    public static function get_instance(): ThinkRank {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * Private constructor to prevent direct instantiation
+     */
+    private function __construct() {
+        $this->init_autoloader();
+        $this->init_hooks();
+    }
+
+    /**
+     * Prevent cloning
+     */
+    private function __clone() {
+    }
+
+    /**
+     * Prevent unserialization
+     *
+     * @throws \Exception On failure.
+     */
+    public function __wakeup() {
+        throw new \Exception('Cannot unserialize singleton');
+    }
+
+    /**
+     * Initialize autoloader
+     * 
+     * @return void
+     */
+    private function init_autoloader(): void {
+        ThinkRank\Core\Autoloader::register();
+    }
+
+    /**
+     * Initialize WordPress hooks
+     * 
+     * @return void
+     */
+    private function init_hooks(): void {
+        register_activation_hook(__FILE__, [$this, 'activate']);
+        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+
+        add_action('plugins_loaded', [$this, 'init']);
+        add_filter('plugin_action_links_' . THINKRANK_PLUGIN_BASENAME, [$this, 'add_action_links']);
+    }
+
+    /**
+     * Add a "Dashboard" link to the plugin action links on the Plugins page.
+     *
+     * @param array $links Existing plugin action links.
+     * @return array
+     */
+    public function add_action_links(array $links): array {
+        $dashboard_link = sprintf(
+            '<a href="%s">%s</a>',
+            esc_url(admin_url('admin.php?page=thinkrank')),
+            esc_html__('Dashboard', 'thinkrank')
+        );
+
+        array_unshift($links, $dashboard_link);
+
+        return $links;
+    }
+
+    /**
+     * Initialize plugin components
+     * 
+     * @return void
+     */
+    public function init(): void {
+        try {
+            $this->maybe_update_database();
+            $this->register_sitemap_cron_listeners();
+            $this->clear_retired_brand_visibility_cron();
+            $this->load_components();
+            $this->init_components();
+            $this->load_template_functions();
+
+            do_action('thinkrank_loaded');
+        } catch (\Exception $e) {
+            $this->handle_error($e);
+        }
+    }
+
+    /**
+     * Register the sitemap regeneration WP-Cron listeners, and the
+     * content-change listeners that queue them.
+     *
+     * Runs on plugins_loaded (via init()), so the callbacks exist on every
+     * request — including WP-Cron, which never fires rest_api_init and therefore
+     * never builds the Sitemap REST endpoint (whose constructor would otherwise
+     * be the only place the scheduled regeneration hooks get a listener). The
+     * generator is built lazily inside the callback so this stays cheap on the
+     * vast majority of requests where no regeneration is due.
+     *
+     * The content-change listeners need the same treatment for the same
+     * reason: WP-Cron publishes scheduled posts, and Quick Edit, the classic
+     * editor and WP-CLI change content without REST either (#824).
+     *
+     * @return void
+     */
+    private function register_sitemap_cron_listeners(): void {
+        ThinkRank\SEO\Sitemap_Generator::register_content_listeners();
+
+        add_action('thinkrank_regenerate_sitemap', static function () {
+            (new ThinkRank\SEO\Sitemap_Generator())->auto_regenerate_sitemap();
+        });
+        add_action('thinkrank_regenerate_sitemap_settings', static function () {
+            (new ThinkRank\SEO\Sitemap_Generator())->regenerate_sitemap_from_settings();
+        });
+
+        add_action('shutdown', [$this, 'maybe_take_over_sitemap_regeneration'], 100);
+    }
+
+    /**
+     * Rebuild the sitemap in-request when WP-Cron has not delivered.
+     *
+     * WP-Cron only runs when a request arrives, so with DISABLE_WP_CRON set, a
+     * host blocking loopback requests, or very little traffic, the scheduled
+     * regeneration never fires and the sitemap silently stops updating (#629).
+     * Once the event is overdue by the generator's grace period, an admin, REST
+     * or WP-CLI request takes the work over so the site converges on its own.
+     *
+     * Front-end requests are deliberately excluded: this runs on `shutdown`,
+     * after the response, but generation on a large site is not free and a
+     * visitor should never pay for it. Admin traffic is what a site with broken
+     * cron reliably still has — the sitemap goes stale right after someone
+     * publishes something, and that someone is in wp-admin.
+     *
+     * @since 2.2.1
+     * @return void
+     */
+    public function maybe_take_over_sitemap_regeneration(): void {
+        // is_admin() is true for admin-ajax.php and REST_REQUEST for public
+        // core routes, both of which anonymous front-end traffic reaches — so
+        // without the logged-in test a visitor could still pay for the rebuild
+        // this method documents as never being theirs to pay for. WP-CLI has no
+        // user, and is trusted by definition. A cron run is the process this
+        // work belongs to in the first place: a scheduled event that was
+        // consumed while another request held the generation lock is never
+        // re-queued, so without this a site whose admins see only failures
+        // could not recover through a (often memory-unlimited) system cron.
+        //
+        // An MCP call counts too. It is an admin-equivalent action, but it is
+        // dispatched from `parse_request` on the pretty /thinkrank/mcp route,
+        // so it is neither is_admin() nor REST_REQUEST and never qualified —
+        // which meant an agent could change sitemap settings on a site with no
+        // working cron and leave the served file stale indefinitely, having
+        // already reported success (#764). The logged-in test still applies:
+        // Mcp_Server sets the current user only after a credential validates,
+        // so an anonymous POST to that route is not eligible.
+        $is_mcp_request = class_exists('ThinkRank\Mcp\Mcp_Manager')
+            && ThinkRank\Mcp\Mcp_Manager::is_serving_request();
+
+        $eligible = (defined('WP_CLI') && WP_CLI)
+            || wp_doing_cron()
+            || (
+                is_user_logged_in()
+                && (
+                    is_admin()
+                    || (defined('REST_REQUEST') && REST_REQUEST)
+                    || $is_mcp_request
+                )
+            );
+
+        if (!$eligible) {
+            return;
+        }
+
+        // Cheap autoloaded-option read, so the vast majority of requests stop
+        // here without building the generator.
+        if (!ThinkRank\SEO\Sitemap_Generator::has_overdue_regeneration()) {
+            return;
+        }
+
+        // `shutdown` runs after the output buffers are flushed, but flushed is
+        // not delivered: on FPM the connection stays open until the process
+        // ends, so without this the browser — or the REST call the sitemap
+        // screen just made — waits out the whole generation. Hand the response
+        // back first, then rebuild.
+        $this->close_request();
+
+        // Read-only construction: the auto-generation hooks are pointless this
+        // late in the request and would only add duplicate callbacks.
+        (new ThinkRank\SEO\Sitemap_Generator(false))->run_overdue_regeneration();
+    }
+
+    /**
+     * Deliver the response and let the request keep working without the client.
+     *
+     * A no-op on SAPIs that cannot do it, where the caller simply pays for the
+     * work as before.
+     *
+     * @since 2.2.1
+     * @return void
+     */
+    private function close_request(): void {
+        if (defined('WP_CLI') && WP_CLI) {
+            return;
+        }
+
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+            return;
+        }
+
+        if (function_exists('litespeed_finish_request')) {
+            litespeed_finish_request();
+        }
+    }
+
+    /**
+     * Unschedule the cron events left behind by the removed Brand Visibility
+     * feature.
+     *
+     * A site that ran a Brand Visibility check can still carry its drain tick
+     * and watchdog. Their callbacks, and the watchdog's custom recurrence, no
+     * longer exist, so the events would only fire into nothing.
+     * wp_unschedule_hook() walks the autoloaded cron array and writes nothing
+     * when the hook is absent, so this costs nothing once they are gone.
+     * Deactivation and uninstall clear the same hooks (cleanup-manifest.php).
+     *
+     * @return void
+     */
+    private function clear_retired_brand_visibility_cron(): void {
+        foreach (['thinkrank_bv_tick', 'thinkrank_bv_watchdog'] as $hook) {
+            wp_unschedule_hook($hook);
+        }
+    }
+
+    /**
+     * Check if database schema needs updating and run migrations
+     * 
+     * Standard WordPress pattern: compare stored db_version against current,
+     * run dbDelta if stale. This handles schema changes (new tables, new columns)
+     * without requiring plugin deactivation/reactivation.
+     *
+     * @since 1.10.0
+     * @return void
+     */
+    private function maybe_update_database(): void {
+        $schema = new ThinkRank\Database\Database_Schema();
+        if ($schema->needs_update()) {
+            $schema->create_tables();
+        }
+    }
+
+    /**
+     * Load plugin components (Dependency Injection Container pattern)
+     * 
+     * @return void
+     */
+    private function load_components(): void {
+        $this->components = [
+            'database' => new ThinkRank\Core\Database(),
+            // Settings::instance() rather than a fresh object: the container
+            // and the singleton were otherwise two different Settings, each
+            // with its own memo, because instance() resolves the container and
+            // this array is assigned only after every constructor above has
+            // run. Anything resolving the singleton during that window got a
+            // standalone instance that outlived the request, so a hook
+            // registered from the component's init() ran against an object no
+            // consumer read through (#516).
+            'settings' => ThinkRank\Core\Settings::instance(),
+            'role_manager' => new ThinkRank\Core\Role_Manager(),
+            'security_headers' => new ThinkRank\Core\Security_Headers(),
+            'asset_optimizer' => new ThinkRank\Core\Asset_Optimizer(),
+            'usage_tracker' => new ThinkRank\Core\Usage_Tracker_Manager(),
+            'api' => new ThinkRank\API\Manager(),
+            'admin' => new ThinkRank\Admin\Manager(),
+            'blocks' => new ThinkRank\Editor\Blocks_Manager(),
+            'elementor' => new ThinkRank\Editor\Elementor_Manager(),
+            'bricks_elements' => new ThinkRank\Editor\Bricks_Elements_Manager(),
+            'beaver_modules' => new ThinkRank\Editor\Beaver_Modules_Manager(),
+            'ai' => new ThinkRank\AI\Manager(),
+            'frontend_seo' => new ThinkRank\Frontend\SEO_Manager(),
+            'seo_notice' => new ThinkRank\Admin\SEO_Notice(),
+            'search_visibility_notice' => new ThinkRank\Admin\Search_Visibility_Notice(),
+            'webroot_writable_notice' => new ThinkRank\Admin\Webroot_Writable_Notice(),
+            'performance_collector' => new ThinkRank\SEO\Performance_Data_Collector(),
+            'query_guard' => new ThinkRank\SEO\Query_Guard(),
+            'feeds' => new ThinkRank\SEO\Feed_Manager(),
+            'sitemap_stylesheet' => new ThinkRank\SEO\Sitemap_Stylesheet(),
+            'oembed' => new ThinkRank\SEO\Oembed_Manager(),
+            'content_visibility' => new ThinkRank\SEO\Content_Visibility(),
+            'instant_indexing' => new ThinkRank\SEO\Instant_Indexing_Manager(),
+            'instant_indexing_reconciler' => new ThinkRank\SEO\Instant_Indexing_Reconciler(),
+            'author_archives' => new ThinkRank\SEO\Author_Archives_Manager(),
+            'seo_analyzer' => new ThinkRank\SEO\SEO_Analyzer(),
+            // Bulk Snippets' persisted issue index: invalidation hooks must run
+            // on every request, since posts are edited everywhere but there.
+            'snippet_index' => new ThinkRank\SEO\Snippet_Index(),
+            // The thin content report's word counts: same reason, and a
+            // separate index because a word count and a snippet verdict go
+            // stale for different reasons (#565).
+            'word_count_index' => new ThinkRank\SEO\Word_Count_Index(),
+            'email_report' => new ThinkRank\SEO\Email_Report_Manager(),
+            'google_oauth' => new ThinkRank\Integrations\Google_OAuth_Proxy(),
+            'multilingual' => new ThinkRank\Integrations\Multilingual_Manager(),
+            'ai_traffic' => new ThinkRank\SEO\Ai_Traffic_Tracker(),
+            'analytics' => new ThinkRank\SEO\Analytics_Manager(),
+            'schema_conflict_health_check' => new ThinkRank\Diagnostics\Schema_Conflict_Health_Check(),
+            'abilities' => new ThinkRank\Abilities\Abilities_Registrar(),
+            'mcp' => new ThinkRank\Mcp\Mcp_Manager(),
+        ];
+    }
+
+    /**
+     * Initialize all components
+     *
+     * @return void
+     */
+    private function init_components(): void {
+        foreach ($this->components as $component) {
+            if (method_exists($component, 'init')) {
+                $component->init();
+            }
+        }
+    }
+
+    /**
+     * Load template functions for themes
+     *
+     * @return void
+     */
+    private function load_template_functions(): void {
+        require_once THINKRANK_PLUGIN_DIR . 'includes/frontend/template-functions.php';
+    }
+
+    /**
+     * Get component instance
+     *
+     * @param string $component Component name
+     * @return object|null
+     */
+    public function get_component(string $component): ?object {
+        return $this->components[$component] ?? null;
+    }
+
+    /**
+     * Shared Analytics Manager instance (lazy)
+     *
+     * @var ThinkRank\SEO\Analytics_Manager|null
+     */
+    private ?ThinkRank\SEO\Analytics_Manager $analytics_manager = null;
+
+    /**
+     * Get the shared Analytics Manager, with Google clients initialized.
+     *
+     * Consumers (including the Pro plugin, which probes for this accessor)
+     * should use this instead of constructing their own Analytics_Manager:
+     * each fresh construction re-reads/decrypts settings and re-initializes
+     * the Google API clients.
+     *
+     * @since 1.18.0
+     * @return ThinkRank\SEO\Analytics_Manager
+     */
+    public function get_analytics_manager(): ThinkRank\SEO\Analytics_Manager {
+        if ($this->analytics_manager === null) {
+            // Reuse the registered component. Constructing a second instance
+            // here would work, but only the registered one has had init() run
+            // on it, so the token-refresh cron would be scheduled against a
+            // different object than the one callers actually use.
+            $component = $this->components['analytics'] ?? null;
+
+            $this->analytics_manager = $component instanceof ThinkRank\SEO\Analytics_Manager
+                ? $component
+                : new ThinkRank\SEO\Analytics_Manager();
+
+            // init() defers initialize_clients() to the `init` hook; callers
+            // that arrive earlier still need working clients.
+            $this->analytics_manager->initialize_clients();
+        }
+        return $this->analytics_manager;
+    }
+
+    /**
+     * Plugin activation
+     * 
+     * @return void
+     */
+    public function activate(): void {
+        try {
+            $activator = new ThinkRank\Core\Activator();
+            $activator->activate();
+
+            // Flush rewrite rules
+            flush_rewrite_rules();
+        } catch (\Exception $e) {
+            $this->handle_error($e);
+            wp_die(
+                esc_html__('ThinkRank activation failed. Please check your server logs.', 'thinkrank'),
+                esc_html__('Plugin Activation Error', 'thinkrank'),
+                ['back_link' => true]
+            );
+        }
+    }
+
+    /**
+     * Plugin deactivation
+     * 
+     * @return void
+     */
+    public function deactivate(): void {
+        try {
+            $deactivator = new ThinkRank\Core\Deactivator();
+            $deactivator->deactivate();
+
+            // Flush rewrite rules
+            flush_rewrite_rules();
+        } catch (\Exception $e) {
+            $this->handle_error($e);
+        }
+    }
+
+    /**
+     * Handle errors consistently
+     * 
+     * Logs errors and surfaces them via _doing_it_wrong() when
+     * WP_DEBUG is enabled, helping developers diagnose issues.
+     * 
+     * @param \Exception $e Exception to handle
+     * @return void
+     */
+    private function handle_error(\Exception $e): void {
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+            error_log('ThinkRank: ' . $e->getMessage());
+        }
+
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            _doing_it_wrong(
+                __METHOD__,
+                esc_html($e->getMessage()),
+                esc_html(THINKRANK_VERSION)
+            );
+        }
+    }
+
+    /**
+     * Get plugin version
+     * 
+     * @return string
+     */
+    public function get_version(): string {
+        return THINKRANK_VERSION;
+    }
+
+    /**
+     * Get plugin directory path
+     * 
+     * @return string
+     */
+    public function get_plugin_dir(): string {
+        return THINKRANK_PLUGIN_DIR;
+    }
+
+    /**
+     * Get plugin URL
+     * 
+     * @return string
+     */
+    public function get_plugin_url(): string {
+        return THINKRANK_PLUGIN_URL;
+    }
+}
+
+/**
+ * Initialize the plugin
+ * 
+ * @return ThinkRank
+ */
+// phpcs:ignore Universal.Files.SeparateFunctionsFromOO.Mixed -- plugin bootstrap: the accessor belongs next to the class it returns.
+function thinkrank(): ThinkRank {
+    return ThinkRank::get_instance();
+}
+
+// Start the plugin
+thinkrank();
